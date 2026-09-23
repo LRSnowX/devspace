@@ -27,6 +27,28 @@ assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents
 assert.deepEqual(loadConfig(baseEnv).subagents, { enabled: false, providers: [] });
 assert.equal(loadConfig(baseEnv).artifactsEnabled, false);
 assert.equal(loadConfig(baseEnv).artifactMaxFileBytes, 100 * 1024 * 1024);
+assert.deepEqual(loadConfig(baseEnv).memory, {
+  enabled: false,
+  command: undefined,
+  dataHome: undefined,
+});
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_MEMORY_ENABLED: "1" }),
+  /DEVSPACE_MEMORY_MCP_COMMAND is required/,
+);
+assert.deepEqual(
+  loadConfig({
+    ...baseEnv,
+    DEVSPACE_MEMORY_ENABLED: "1",
+    DEVSPACE_MEMORY_MCP_COMMAND: "/bin/echo",
+    DEVSPACE_MEMORY_DATA_HOME: emptyConfigDir,
+  }).memory,
+  {
+    enabled: true,
+    command: "/bin/echo",
+    dataHome: emptyConfigDir,
+  },
+);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_ARTIFACTS: "1" }).artifactsEnabled, true);
 assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_MAX_FILE_BYTES: "123" }).artifactMaxFileBytes,
@@ -163,6 +185,11 @@ writeFileSync(
     subagents: true,
     artifactsEnabled: true,
     artifactMaxFileBytes: 321,
+    memory: {
+      enabled: true,
+      command: "/bin/echo",
+      dataHome: emptyConfigDir,
+    },
   }),
 );
 writeFileSync(
@@ -180,6 +207,11 @@ assert.equal(fileConfig.subagents.enabled, true);
 assert.equal(fileConfig.subagents.providers.length, 7);
 assert.equal(fileConfig.artifactsEnabled, true);
 assert.equal(fileConfig.artifactMaxFileBytes, 321);
+assert.deepEqual(fileConfig.memory, {
+  enabled: true,
+  command: "/bin/echo",
+  dataHome: emptyConfigDir,
+});
 assert.deepEqual(fileConfig.allowedHosts, [
   "localhost",
   "127.0.0.1",

@@ -19,6 +19,34 @@ import { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
 
+test("memory tools are opt-in and read-only", async (t) => {
+  const disabled = await fixture(t);
+  const disabledTools = await disabled.client.listTools();
+  assert.equal(
+    disabledTools.tools.some((tool) => tool.name.startsWith("memory_")),
+    false,
+  );
+
+  const enabled = await fixture(t, {
+    memory: { enabled: true, command: "/bin/false" },
+  });
+  const enabledTools = await enabled.client.listTools();
+  const memoryTools = enabledTools.tools
+    .filter((tool) => tool.name.startsWith("memory_"))
+    .sort((left, right) => left.name.localeCompare(right.name));
+  assert.deepEqual(
+    memoryTools.map((tool) => tool.name),
+    ["memory_get_thread", "memory_project_context", "memory_recent", "memory_search"],
+  );
+  for (const tool of memoryTools) {
+    assert.equal(tool.annotations?.readOnlyHint, true);
+    assert.ok(
+      (tool.inputSchema.properties as Record<string, unknown> | undefined)?.workspaceId,
+      `${tool.name} should require workspaceId`,
+    );
+  }
+});
+
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
   const providerNote = "available";
   const context = await fixture(t, {
@@ -247,6 +275,7 @@ async function fixture(
     git?: boolean;
     localAgentProviders?: LocalAgentProviderAvailability[] | (() => LocalAgentProviderAvailability[]);
     subagents?: SubagentsConfig;
+    memory?: ServerConfig["memory"];
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -290,18 +319,21 @@ async function fixture(
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
-  const config: ServerConfig = options.localAgentProviders
-    ? {
-        ...loadedConfig,
-        subagents: options.subagents ?? {
-          enabled: true,
-          providers: initialProviderAvailability.map((provider) => ({
-            id: provider.name,
+  const config: ServerConfig = {
+    ...loadedConfig,
+    ...(options.memory ? { memory: options.memory } : {}),
+    ...(options.localAgentProviders
+      ? {
+          subagents: options.subagents ?? {
             enabled: true,
-          })),
-        },
-      }
-    : loadedConfig;
+            providers: initialProviderAvailability.map((provider) => ({
+              id: provider.name,
+              enabled: true,
+            })),
+          },
+        }
+      : {}),
+  };
   const resolveProviderAvailability: () => LocalAgentProviderAvailability[] =
     typeof options.localAgentProviders === "function"
       ? options.localAgentProviders
