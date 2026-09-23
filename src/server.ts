@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
+import { basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -64,6 +65,7 @@ import {
   formatLocalAgentProviderStatusSummary,
   type LocalAgentProviderStatus,
 } from "./local-agent-catalog.js";
+import { MemoryAdapter } from "./memory-adapter.js";
 
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
@@ -724,6 +726,7 @@ export function createMcpServer(
       instructions: serverInstructions(config),
     },
   );
+  const memory = new MemoryAdapter(config.memory);
 
   registerAppResource(
     server,
@@ -957,6 +960,103 @@ export function createMcpServer(
       };
     },
   );
+
+  if (memory.enabled) {
+    server.registerTool(
+      "memory_search",
+      {
+        title: "Search project memory",
+        description:
+          "Search long-term AI conversation memory for the current workspace. Uses project-scoped multilingual hybrid retrieval; use the returned evidence conversation id with memory_get_thread to expand original evidence.",
+        inputSchema: {
+          workspaceId: z.string().describe(workspaceIdDescription),
+          query: z.string().trim().min(1).describe("Natural-language memory query."),
+          limit: z.number().int().positive().max(20).optional().describe("Maximum hits. Defaults to 8."),
+        },
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, query, limit }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        return memory.call("memory_search", {
+          query,
+          project: basename(workspace.root),
+          limit,
+        });
+      },
+    );
+
+    server.registerTool(
+      "memory_recent",
+      {
+        title: "Recent project memory",
+        description:
+          "List recent indexed AI conversations associated with the current workspace project without invoking semantic retrieval.",
+        inputSchema: {
+          workspaceId: z.string().describe(workspaceIdDescription),
+          since: z.number().optional().describe("Optional Unix timestamp lower bound."),
+          limit: z.number().int().positive().max(50).optional().describe("Maximum hits. Defaults to 10."),
+        },
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, since, limit }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        return memory.call("memory_recent", {
+          project: basename(workspace.root),
+          since,
+          limit,
+        });
+      },
+    );
+
+    server.registerTool(
+      "memory_get_thread",
+      {
+        title: "Read memory thread",
+        description:
+          "Read a normalized historical conversation thread with pagination. Prefer the evidence conversation id returned by memory_search when expanding supporting evidence.",
+        inputSchema: {
+          workspaceId: z.string().describe(workspaceIdDescription),
+          conversationId: z.string().trim().min(1).describe("Indexed conversation id."),
+          messageOffset: z.number().int().nonnegative().optional().describe("0-based message offset."),
+          messageLimit: z.number().int().positive().max(250).optional().describe("Maximum messages. Defaults to 80."),
+        },
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, conversationId, messageOffset, messageLimit }) => {
+        workspaces.getWorkspace(workspaceId);
+        return memory.call("memory_get_thread", {
+          conversation_id: conversationId,
+          message_offset: messageOffset,
+          message_limit: messageLimit,
+        });
+      },
+    );
+
+    server.registerTool(
+      "memory_project_context",
+      {
+        title: "Project memory context",
+        description:
+          "Build a compact read-only memory view for the current workspace by combining relevant hybrid hits with recent project conversations.",
+        inputSchema: {
+          workspaceId: z.string().describe(workspaceIdDescription),
+          query: z.string().trim().min(1).optional().describe("Optional focus query. Defaults to the project name."),
+          relevantLimit: z.number().int().positive().max(20).optional().describe("Maximum relevant hits. Defaults to 8."),
+          recentLimit: z.number().int().positive().max(20).optional().describe("Maximum recent hits. Defaults to 6."),
+        },
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, query, relevantLimit, recentLimit }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        return memory.call("memory_project_context", {
+          project: basename(workspace.root),
+          query,
+          relevant_limit: relevantLimit,
+          recent_limit: recentLimit,
+        });
+      },
+    );
+  }
 
   registerAppTool(
     server,

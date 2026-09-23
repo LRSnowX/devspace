@@ -12,6 +12,12 @@ const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 
+export interface MemoryAdapterConfig {
+  enabled: boolean;
+  command?: string;
+  dataHome?: string;
+}
+
 export interface ServerConfig {
   host: string;
   port: number;
@@ -31,6 +37,7 @@ export interface ServerConfig {
   devspaceAgentsDir: string;
   subagents: SubagentsConfig;
   agentDir: string;
+  memory: MemoryAdapterConfig;
   logging: LoggingConfig;
 }
 
@@ -208,6 +215,32 @@ function defaultAgentDir(): string {
   return join(homedir(), ".codex");
 }
 
+function parseMemoryConfig(
+  env: NodeJS.ProcessEnv,
+  stored?: { enabled?: boolean; command?: string; dataHome?: string },
+): MemoryAdapterConfig {
+  const enabled = env.DEVSPACE_MEMORY_ENABLED === undefined
+    ? stored?.enabled === true
+    : parseBoolean(env.DEVSPACE_MEMORY_ENABLED);
+  const rawCommand = (env.DEVSPACE_MEMORY_MCP_COMMAND ?? stored?.command)?.trim();
+  if (enabled && !rawCommand) {
+    throw new Error(
+      "DEVSPACE_MEMORY_MCP_COMMAND is required when DEVSPACE_MEMORY_ENABLED is enabled",
+    );
+  }
+  const command = rawCommand
+    ? rawCommand.includes("/") || rawCommand.startsWith("~")
+      ? resolve(expandHomePath(rawCommand))
+      : rawCommand
+    : undefined;
+  const rawDataHome = (env.DEVSPACE_MEMORY_DATA_HOME ?? stored?.dataHome)?.trim();
+  return {
+    enabled,
+    command,
+    dataHome: rawDataHome ? resolve(expandHomePath(rawDataHome)) : undefined,
+  };
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const files = loadDevspaceFiles(env);
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
@@ -250,6 +283,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     devspaceAgentsDir: devspaceAgentsDir(env),
     subagents: resolveSubagentsConfig(files.config.subagents, env),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
+    memory: parseMemoryConfig(env, files.config.memory),
     logging: parseLoggingConfig(env),
   };
 }

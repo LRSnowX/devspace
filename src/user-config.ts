@@ -22,6 +22,11 @@ export interface DevspaceUserConfig {
   artifactMaxFileBytes?: number;
   agentDir?: string;
   subagents?: StoredSubagentsConfig;
+  memory?: {
+    enabled?: boolean;
+    command?: string;
+    dataHome?: string;
+  };
 }
 
 export interface DevspaceAuthConfig {
