@@ -67,9 +67,15 @@ Callers should send the revision returned by `read` whenever a patch depends on
 that earlier read. Add-only paths that were never read do not require an
 expectation.
 
-This phase does not add an "absent path" precondition. That remains a known
-gap for add/overwrite workflows and is tracked separately from content
-revisions.
+Absence is not encoded as a synthetic revision token. Codex `apply_patch`
+instead exposes a separate `expected_absent_paths` precondition for
+intended-new paths and move destinations. This keeps content identity and path
+state as distinct contracts while closing the equivalent stale-creation race.
+
+When an expected-absent path exists at first touch, the patch returns
+`PATH_STATE_CONFLICT` before publication. If it is absent at first touch but
+appears before commit, the existing in-call baseline check reports a concurrent
+modification and still prevents overwrite.
 
 ## Relationship to transactional publication
 
@@ -95,5 +101,5 @@ This phase does not:
 - make shell/write/edit tools revision-aware;
 - introduce a new model-facing tool;
 - bind revisions to Git commits;
-- provide path-absence revisions;
+- encode path absence as a content revision;
 - provide distributed locking across multiple DevSpace processes.

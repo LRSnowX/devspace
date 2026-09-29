@@ -81,6 +81,9 @@ the corresponding regression coverage in the same change.
 - A patch may provide per-path `expected_revisions` returned by prior
   `read` calls. A mismatch is rejected before publication, even when the
   patch's hunk context would otherwise still match.
+- A patch may provide `expected_absent_paths` for intended-new paths or move
+  destinations. If one of those paths already exists when first touched, the
+  patch is rejected before publication rather than overwriting it.
 - Existing file mode and line-ending behavior are preserved where the current
   implementation supports them.
 - Results report affected files and aggregate addition/removal counts.
@@ -95,8 +98,9 @@ the corresponding regression coverage in the same change.
   the rollback failure; unused recovery files are retained where possible.
 - `expected_revisions` is optional for compatibility. A caller that omits a
   revision does not receive stale-read protection for that earlier read.
-- There is currently no revision token for proving that a path was absent at
-  an earlier point in time.
+- `expected_absent_paths` is also optional for compatibility. Existing
+  Add File overwrite behavior remains available unless the caller explicitly
+  requires absence.
 
 ## File revisions
 
@@ -109,7 +113,12 @@ the corresponding regression coverage in the same change.
   share the same full-file revision.
 - Codex `apply_patch` accepts optional per-path
   `expected_revisions: [{ path, revision }]`.
+- Codex `apply_patch` accepts optional
+  `expected_absent_paths: ["relative/path"]` for paths that must still be
+  absent when first touched.
 - Every supplied expected-revision path must be touched by the patch.
+- Every supplied expected-absence path must be touched by the patch.
+- The same path may not require both a content revision and absence.
 - Revision validation happens while building the staged logical view, before
   destructive publication.
 
@@ -119,6 +128,8 @@ the corresponding regression coverage in the same change.
   `write`, `edit`, or shell commands revision-aware.
 - Revisions represent content identity, not Git commits, mtimes, inode
   identity, or a workspace-wide version.
+- Absence is represented as a separate precondition, not as a synthetic
+  SHA-256 revision.
 
 ## Process lifecycle
 
@@ -155,7 +166,7 @@ the corresponding regression coverage in the same change.
   `structuredContent.error` payload. Successful application reports
   `status: "applied"`. This avoids current ChatGPT host behavior that converts
   MCP `isError: true` results into string exceptions and discards structured
-  content. Current codes cover invalid patches, revision/concurrent conflicts,
+  content. Current codes cover invalid patches, revision/path-state/concurrent conflicts,
   rollback failure, path scope, unavailable/invalidated workspaces, and
   repeated identical failures.
 - Codex `apply_patch` blocks the fourth and later identical request after three

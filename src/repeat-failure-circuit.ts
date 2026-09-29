@@ -14,6 +14,7 @@ interface FailureEntry {
 export interface RepeatFailureRequest {
   patch: string;
   expectedRevisions?: readonly ExpectedFileRevision[];
+  expectedAbsentPaths?: readonly string[];
 }
 
 export class RepeatFailureCircuitBreaker {
@@ -39,7 +40,7 @@ export class RepeatFailureCircuitBreaker {
       code: "REPEATED_FAILURE",
       category: "state",
       message:
-        `Repeated identical apply_patch request blocked after ${entry.failures} consecutive failures. Change the patch or expected revisions, or re-read the relevant files before retrying.`,
+        `Repeated identical apply_patch request blocked after ${entry.failures} consecutive failures. Change the patch or preconditions, or re-read the relevant files before retrying.`,
       retryable: false,
       repeat_count: entry.failures,
       previous_error_code: entry.lastErrorCode,
@@ -99,10 +100,12 @@ function requestFingerprint(request: RepeatFailureRequest): string {
     .sort((left, right) =>
       left.path.localeCompare(right.path) || left.revision.localeCompare(right.revision),
     );
+  const expectedAbsentPaths = [...(request.expectedAbsentPaths ?? [])].sort();
   return createHash("sha256")
     .update(JSON.stringify({
       patch: request.patch,
       expected_revisions: expectedRevisions,
+      expected_absent_paths: expectedAbsentPaths,
     }))
     .digest("hex");
 }

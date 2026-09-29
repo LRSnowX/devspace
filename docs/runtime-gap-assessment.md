@@ -5,7 +5,7 @@ file revisions, structured patch errors, and repeat-failure circuit breaker.
 It records the remaining gaps by value rather than treating every limitation as
 the next feature.
 
-## Priority 1: absence precondition for add/overwrite paths
+## Completed after this assessment: absence precondition for add/overwrite paths
 
 Current Codex patch semantics intentionally allow `*** Add File:` to overwrite
 an existing file. Content revisions protect files that were successfully read,
@@ -18,10 +18,12 @@ That leaves a real race:
 3. the later `Add File` patch can overwrite the new file unless the caller has
    another explicit precondition.
 
-The next runtime-hardening phase should add an optional, explicit absence
-precondition without changing existing Add File overwrite compatibility.
+DevSpace now exposes optional `expected_absent_paths`. It preserves existing
+Add File overwrite compatibility for callers that omit the precondition while
+allowing intended-new paths and move destinations to fail closed when another
+writer creates the path first.
 
-## Priority 2: crash-safe patch recovery
+## Priority 1: crash-safe patch recovery
 
 Transactional publication currently restores changes after catchable failures
 while DevSpace remains alive. It is not crash-safe.
@@ -32,7 +34,7 @@ persistent transaction journal, recovery protocol, startup reconciliation, and
 cross-platform tests. This is materially larger than ordinary patch hardening
 and should not be implemented without a separate design review.
 
-## Priority 3: structured errors for the remaining coding surface
+## Priority 2: structured errors for the remaining coding surface
 
 Codex `apply_patch` has a host-compatible structured domain-error contract.
 Other tools still use legacy thrown errors for many expected failures, such as
@@ -43,7 +45,7 @@ Extending the taxonomy would improve model self-correction, but it is primarily
 an ergonomics and reliability improvement rather than a current data-integrity
 gap.
 
-## Priority 4: persistent metadata retention
+## Priority 3: persistent metadata retention
 
 Workspace sessions, conversation bindings, and review refs do not yet have a
 general retention policy. Their persistent stores can grow over long-lived

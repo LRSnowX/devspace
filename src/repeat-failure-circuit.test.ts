@@ -11,6 +11,7 @@ const request = {
     { path: "b.txt", revision: `sha256:${"b".repeat(64)}` },
     { path: "a.txt", revision: `sha256:${"a".repeat(64)}` },
   ],
+  expectedAbsentPaths: ["z.txt", "c.txt"],
 };
 
 test("repeat failure circuit opens only after the configured failure threshold", () => {
@@ -29,7 +30,7 @@ test("repeat failure circuit opens only after the configured failure threshold",
     code: "REPEATED_FAILURE",
     category: "state",
     message:
-      "Repeated identical apply_patch request blocked after 3 consecutive failures. Change the patch or expected revisions, or re-read the relevant files before retrying.",
+      "Repeated identical apply_patch request blocked after 3 consecutive failures. Change the patch or preconditions, or re-read the relevant files before retrying.",
     retryable: false,
     repeat_count: 3,
     previous_error_code: "REVISION_CONFLICT",
@@ -46,6 +47,7 @@ test("expected revision order does not bypass the repeat failure circuit", () =>
   const reordered = {
     ...request,
     expectedRevisions: [...request.expectedRevisions].reverse(),
+    expectedAbsentPaths: [...request.expectedAbsentPaths].reverse(),
   };
   assert.equal(circuit.beforeAttempt(workspaceId, reordered)?.code, "REPEATED_FAILURE");
 });

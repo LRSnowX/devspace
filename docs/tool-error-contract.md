@@ -24,6 +24,8 @@ error: {
   path?,
   expected_revision?,
   current_revision?,
+  expected_state?,
+  current_state?,
   recovery_files?,
   repeat_count?,
   previous_error_code?
@@ -50,6 +52,12 @@ The Codex `apply_patch` tool currently exposes:
   - retryable: true
   - an `expected_revisions` value no longer matches the file.
   - may include `path`, `expected_revision`, and `current_revision`.
+- `PATH_STATE_CONFLICT`
+  - category: `conflict`
+  - retryable: true
+  - a path state precondition no longer holds, currently used when an
+    `expected_absent_paths` entry exists.
+  - may include `path`, `expected_state`, and `current_state`.
 - `CONCURRENT_MODIFICATION`
   - category: `conflict`
   - retryable: true
@@ -85,14 +93,15 @@ The Codex `apply_patch` tool currently exposes:
 The Codex `apply_patch` surface has a deliberately narrow process-local
 circuit breaker:
 
-- identity is the workspace id plus the exact patch text plus the set of
-  `expected_revisions`;
+- identity is the workspace id plus the exact patch text plus the sets of
+  `expected_revisions` and `expected_absent_paths`;
 - expected-revision ordering is normalized, so reordering the same expectations
   does not bypass the breaker;
+- expected-absence ordering is normalized for the same reason;
 - the first three identical known domain failures are returned normally;
 - the fourth identical attempt and later identical attempts are blocked before
   the patch engine runs and return `REPEATED_FAILURE`;
-- changing the patch or expected revisions clears the streak immediately;
+- changing the patch or either precondition set clears the streak immediately;
 - a successful patch clears the streak;
 - an unexpected/unclassified internal exception clears the streak and is still
   thrown normally;

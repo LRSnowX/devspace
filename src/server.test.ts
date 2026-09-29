@@ -99,7 +99,7 @@ test("Codex read and apply_patch expose the stale-read revision contract", async
 
   assert.deepEqual(
     Object.keys(patchInputProperties).sort(),
-    ["expected_revisions", "patch", "workspace_id"],
+    ["expected_absent_paths", "expected_revisions", "patch", "workspace_id"],
   );
   assert.equal("revision" in readOutputProperties, true);
 
@@ -112,6 +112,56 @@ test("Codex read and apply_patch expose the stale-read revision contract", async
     Object.keys(expectedRevisions?.items?.properties ?? {}).sort(),
     ["path", "revision"],
   );
+});
+
+test("Codex apply_patch absence preconditions protect intended-new paths", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
+  const workspaceId = structuredContent(
+    await callOpen(context.client, context.project, "absence-precondition"),
+  ).workspace_id;
+  assert.equal(typeof workspaceId, "string");
+
+  const created = structuredContent(await context.client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspace_id: workspaceId,
+      patch: [
+        "*** Begin Patch",
+        "*** Add File: new.txt",
+        "+created",
+        "*** End Patch",
+      ].join("\n"),
+      expected_absent_paths: ["new.txt"],
+    },
+  }));
+  assert.equal(created.status, "applied");
+  assert.equal(await readFile(join(context.project, "new.txt"), "utf8"), "created\n");
+
+  await writeFile(join(context.project, "occupied.txt"), "external\n");
+  const conflict = structuredContent(await context.client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspace_id: workspaceId,
+      patch: [
+        "*** Begin Patch",
+        "*** Add File: occupied.txt",
+        "+ours",
+        "*** End Patch",
+      ].join("\n"),
+      expected_absent_paths: ["occupied.txt"],
+    },
+  }));
+  assert.equal(conflict.status, "error");
+  assert.deepEqual(conflict.error, {
+    code: "PATH_STATE_CONFLICT",
+    category: "conflict",
+    message: "Invalid patch: path was expected to be absent but exists: occupied.txt",
+    retryable: true,
+    path: "occupied.txt",
+    expected_state: "absent",
+    current_state: "present",
+  });
+  assert.equal(await readFile(join(context.project, "occupied.txt"), "utf8"), "external\n");
 });
 
 test("read revisions reject stale Codex patches before publication", async (t) => {
@@ -324,7 +374,7 @@ test("Codex apply_patch blocks a fourth identical domain failure and resets on a
     code: "REPEATED_FAILURE",
     category: "state",
     message:
-      "Repeated identical apply_patch request blocked after 3 consecutive failures. Change the patch or expected revisions, or re-read the relevant files before retrying.",
+      "Repeated identical apply_patch request blocked after 3 consecutive failures. Change the patch or preconditions, or re-read the relevant files before retrying.",
     retryable: false,
     repeat_count: 3,
     previous_error_code: "REVISION_CONFLICT",

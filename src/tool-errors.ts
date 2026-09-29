@@ -3,6 +3,7 @@ import * as z from "zod/v4";
 export const TOOL_ERROR_CODES = [
   "PATCH_INVALID",
   "REVISION_CONFLICT",
+  "PATH_STATE_CONFLICT",
   "CONCURRENT_MODIFICATION",
   "ROLLBACK_FAILED",
   "PATH_SCOPE_VIOLATION",
@@ -32,6 +33,8 @@ export interface ToolErrorPayload {
   path?: string;
   expected_revision?: string;
   current_revision?: string;
+  expected_state?: "absent" | "present";
+  current_state?: "absent" | "present";
   recovery_files?: string[];
   repeat_count?: number;
   previous_error_code?: ToolErrorCode;
@@ -45,6 +48,8 @@ export const toolErrorPayloadSchema = z.object({
   path: z.string().optional(),
   expected_revision: z.string().optional(),
   current_revision: z.string().optional(),
+  expected_state: z.enum(["absent", "present"]).optional(),
+  current_state: z.enum(["absent", "present"]).optional(),
   recovery_files: z.array(z.string()).optional(),
   repeat_count: z.number().int().positive().optional(),
   previous_error_code: z.enum(TOOL_ERROR_CODES).optional(),

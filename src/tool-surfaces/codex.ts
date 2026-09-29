@@ -93,7 +93,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
     {
       title: "Apply patch",
       description:
-        "Apply one Codex-style patch to add, overwrite, update, delete, or move workspace files. Paths must be relative to the workspace. When a patch relies on a prior read, pass that read's revision in expected_revisions so stale files are rejected before publication.",
+        "Apply one Codex-style patch to add, overwrite, update, delete, or move workspace files. Paths must be relative to the workspace. When a patch relies on a prior read, pass that read's revision in expected_revisions. For paths intended to be newly created, use expected_absent_paths to prevent overwriting a file created by another writer before publication.",
       inputSchema: {
         workspace_id: z.string().describe(workspaceIdDescription),
         patch: z
@@ -117,6 +117,16 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
           .describe(
             "Prior read revisions to require before publication. Every supplied path must be touched by this patch.",
           ),
+        expected_absent_paths: z
+          .array(
+            z.string().describe(
+              "Workspace-relative path that must still be absent when this patch first touches it.",
+            ),
+          )
+          .optional()
+          .describe(
+            "Absence preconditions for intended-new paths or move destinations. Every supplied path must be touched by this patch.",
+          ),
       },
       outputSchema: resultOutputSchema({
         status: z.enum(["applied", "error"]),
@@ -133,12 +143,13 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
       }),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspace_id, patch, expected_revisions }) => {
+    async ({ workspace_id, patch, expected_revisions, expected_absent_paths }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
       const request = {
         patch,
         expectedRevisions: expected_revisions,
+        expectedAbsentPaths: expected_absent_paths,
       };
       const blocked = repeatFailures.beforeAttempt(workspaceId, request);
       if (blocked) {
@@ -162,6 +173,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
             const workspace = await workspaces.getWorkspace(workspaceId);
             return applyPatch(workspace.root, patch, {
               expectedRevisions: expected_revisions,
+              expectedAbsentPaths: expected_absent_paths,
             });
           },
         );

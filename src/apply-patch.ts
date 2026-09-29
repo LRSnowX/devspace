@@ -33,6 +33,7 @@ export interface ExpectedFileRevision {
 
 export interface ApplyPatchOptions {
   expectedRevisions?: readonly ExpectedFileRevision[];
+  expectedAbsentPaths?: readonly string[];
   beforeCommit?: (input: {
     paths: readonly string[];
     files: readonly AppliedPatchFile[];
@@ -88,7 +89,9 @@ function patchError(
   options: ErrorOptions = {},
 ): ToolOperationError {
   const category =
-    code === "REVISION_CONFLICT" || code === "CONCURRENT_MODIFICATION"
+    code === "REVISION_CONFLICT"
+      || code === "PATH_STATE_CONFLICT"
+      || code === "CONCURRENT_MODIFICATION"
       ? "conflict"
       : code === "ROLLBACK_FAILED"
         ? "recovery"
@@ -96,7 +99,9 @@ function patchError(
           ? "scope"
           : "invalid_request";
   const retryable =
-    code === "REVISION_CONFLICT" || code === "CONCURRENT_MODIFICATION";
+    code === "REVISION_CONFLICT"
+    || code === "PATH_STATE_CONFLICT"
+    || code === "CONCURRENT_MODIFICATION";
   return new ToolOperationError(
     {
       code,
@@ -431,7 +436,19 @@ async function applyPatchUnlocked(
     root,
     options.expectedRevisions ?? [],
   );
+  const expectedAbsentPaths = await resolveExpectedAbsentPaths(
+    root,
+    options.expectedAbsentPaths ?? [],
+  );
+  for (const [absolute, expectation] of expectedRevisions) {
+    if (expectedAbsentPaths.has(absolute)) {
+      throw patchError(
+        `path cannot require both a content revision and absence: ${expectation.path}`,
+      );
+    }
+  }
   const checkedExpectedRevisions = new Set<string>();
+  const checkedExpectedAbsentPaths = new Set<string>();
   const results: AppliedPatchFile[] = [];
   const patches: string[] = [];
   const staged = new Map<string, StagedTextFile>();
@@ -463,10 +480,32 @@ async function applyPatchUnlocked(
     }
   };
 
+  const validateExpectedAbsence = (
+    absolute: string,
+    file: StagedTextFile,
+    displayPath: string,
+  ): void => {
+    const expectation = expectedAbsentPaths.get(absolute);
+    if (!expectation) return;
+    checkedExpectedAbsentPaths.add(absolute);
+    if (file !== null) {
+      throw patchError(
+        `path was expected to be absent but exists: ${expectation || displayPath}`,
+        "PATH_STATE_CONFLICT",
+        {
+          path: expectation || displayPath,
+          expected_state: "absent",
+          current_state: "present",
+        },
+      );
+    }
+  };
+
   const readStagedOptional = async (absolute: string, displayPath: string): Promise<StagedTextFile> => {
     if (staged.has(absolute)) return staged.get(absolute) ?? null;
     const file = await readOptionalTextFile(absolute, displayPath);
     validateExpectedRevision(absolute, file, displayPath);
+    validateExpectedAbsence(absolute, file, displayPath);
     originals.set(absolute, file);
     displayPaths.set(absolute, displayPath);
     staged.set(absolute, file);
@@ -506,6 +545,7 @@ async function applyPatchUnlocked(
       if (!samePatchFile) await readStagedOptional(destination, action.moveTo);
       else if (!originals.has(destination)) {
         validateExpectedRevision(destination, file, action.moveTo);
+        validateExpectedAbsence(destination, file, action.moveTo);
         originals.set(destination, originals.get(absolute) ?? file);
         displayPaths.set(destination, action.moveTo);
       }
@@ -525,6 +565,14 @@ async function applyPatchUnlocked(
     if (!checkedExpectedRevisions.has(absolute)) {
       throw patchError(
         `expected revision path is not touched by patch: ${expectation.path}`,
+      );
+    }
+  }
+
+  for (const [absolute, expectation] of expectedAbsentPaths) {
+    if (!checkedExpectedAbsentPaths.has(absolute)) {
+      throw patchError(
+        `expected absent path is not touched by patch: ${expectation}`,
       );
     }
   }
@@ -551,6 +599,18 @@ async function resolveExpectedRevisions(
       throw patchError(`conflicting expected revisions for ${entry.path}`);
     }
     resolved.set(absolute, entry);
+  }
+  return resolved;
+}
+
+async function resolveExpectedAbsentPaths(
+  root: string,
+  expected: readonly string[],
+): Promise<Map<string, string>> {
+  const resolved = new Map<string, string>();
+  for (const path of expected) {
+    const absolute = await resolveConfinedPath(root, path);
+    resolved.set(absolute, path);
   }
   return resolved;
 }

@@ -168,6 +168,114 @@ await assert.rejects(
 );
 assert.equal(await readFile(join(multiRevisionRoot, "first.txt"), "utf8"), "first old\n");
 
+const absenceRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-absence-"));
+await applyPatch(
+  absenceRoot,
+  `*** Begin Patch
+*** Add File: new.txt
++created
+*** End Patch`,
+  { expectedAbsentPaths: ["new.txt"] },
+);
+assert.equal(await readFile(join(absenceRoot, "new.txt"), "utf8"), "created\n");
+
+await writeFile(join(absenceRoot, "occupied.txt"), "external\n");
+await assert.rejects(
+  applyPatch(
+    absenceRoot,
+    `*** Begin Patch
+*** Add File: occupied.txt
++ours
+*** End Patch`,
+    { expectedAbsentPaths: ["occupied.txt"] },
+  ),
+  (error: unknown) => {
+    assert.ok(isToolOperationError(error));
+    assert.equal(error.payload.code, "PATH_STATE_CONFLICT");
+    assert.equal(error.payload.category, "conflict");
+    assert.equal(error.payload.retryable, true);
+    assert.equal(error.payload.path, "occupied.txt");
+    assert.equal(error.payload.expected_state, "absent");
+    assert.equal(error.payload.current_state, "present");
+    return true;
+  },
+);
+assert.equal(await readFile(join(absenceRoot, "occupied.txt"), "utf8"), "external\n");
+
+await writeFile(join(absenceRoot, "source.txt"), "source\n");
+await writeFile(join(absenceRoot, "destination.txt"), "destination\n");
+await assert.rejects(
+  applyPatch(
+    absenceRoot,
+    `*** Begin Patch
+*** Update File: source.txt
+*** Move to: destination.txt
+@@
+-source
++moved
+*** End Patch`,
+    { expectedAbsentPaths: ["destination.txt"] },
+  ),
+  /path was expected to be absent but exists: destination\.txt/,
+);
+assert.equal(await readFile(join(absenceRoot, "source.txt"), "utf8"), "source\n");
+assert.equal(
+  await readFile(join(absenceRoot, "destination.txt"), "utf8"),
+  "destination\n",
+);
+
+await assert.rejects(
+  applyPatch(
+    absenceRoot,
+    `*** Begin Patch
+*** Add File: untouched-precondition-result.txt
++should not publish
+*** End Patch`,
+    { expectedAbsentPaths: ["other.txt"] },
+  ),
+  /expected absent path is not touched by patch: other\.txt/,
+);
+await assert.rejects(
+  readFile(join(absenceRoot, "untouched-precondition-result.txt"), "utf8"),
+  /ENOENT/,
+);
+
+const occupiedRevision = fileRevision(Buffer.from("external\n"));
+await assert.rejects(
+  applyPatch(
+    absenceRoot,
+    `*** Begin Patch
+*** Add File: occupied.txt
++ours
+*** End Patch`,
+    {
+      expectedRevisions: [{ path: "occupied.txt", revision: occupiedRevision }],
+      expectedAbsentPaths: ["occupied.txt"],
+    },
+  ),
+  /path cannot require both a content revision and absence: occupied\.txt/,
+);
+assert.equal(await readFile(join(absenceRoot, "occupied.txt"), "utf8"), "external\n");
+
+const absentRaceRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-absence-race-"));
+await assert.rejects(
+  applyPatch(
+    absentRaceRoot,
+    `*** Begin Patch
+*** Add File: raced.txt
++ours
+*** End Patch`,
+    {
+      expectedAbsentPaths: ["raced.txt"],
+      beforeCommit: async () => {
+        await writeFile(join(absentRaceRoot, "raced.txt"), "external\n");
+      },
+    },
+  ),
+  /file changed during patch application: raced\.txt/,
+);
+assert.equal(await readFile(join(absentRaceRoot, "raced.txt"), "utf8"), "external\n");
+
 await assert.rejects(
   applyPatch(
     multiRevisionRoot,
