@@ -86,6 +86,20 @@ test("Codex process tools bound model-facing yield windows to 12 seconds", async
   }
 });
 
+test("Codex apply_patch has no stale-read revision contract yet", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
+  const tools = await context.client.listTools();
+  const tool = tools.tools.find(({ name }) => name === "apply_patch");
+  const inputProperties = tool?.inputSchema?.properties ?? {};
+  const outputProperties = (tool?.outputSchema as {
+    properties?: Record<string, unknown>;
+  } | undefined)?.properties ?? {};
+
+  assert.deepEqual(Object.keys(inputProperties).sort(), ["patch", "workspace_id"]);
+  assert.equal("expected_revision" in inputProperties, false);
+  assert.equal("revision" in outputProperties, false);
+});
+
 test("Claude edit and bash tools accept snake_case runtime inputs", async (t) => {
   const context = await fixture(t, { toolMode: "claude", uiEnabled: false });
   const workspaceId = structuredContent(

@@ -62,6 +62,29 @@ assert.equal(await readFile(join(root, "alpha.txt"), "utf8"), "one\nchanged\nthr
 assert.equal(await readFile(join(root, "windows.txt"), "utf8"), "first\r\nupdated\r\n");
 await assert.rejects(readFile(join(root, "remove.txt"), "utf8"), /ENOENT/);
 
+const stagedViewRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-staged-view-"));
+await writeFile(join(stagedViewRoot, "source.txt"), "one\n");
+const stagedViewResult = await applyPatch(
+  stagedViewRoot,
+  `*** Begin Patch
+*** Update File: source.txt
+*** Move to: destination.txt
+@@
+-one
++two
+*** Update File: destination.txt
+@@
+-two
++three
+*** End Patch`,
+);
+assert.deepEqual(stagedViewResult.files, [
+  { path: "destination.txt", previousPath: "source.txt", operation: "move" },
+  { path: "destination.txt", operation: "update" },
+]);
+assert.equal(await readFile(join(stagedViewRoot, "destination.txt"), "utf8"), "three\n");
+await assert.rejects(readFile(join(stagedViewRoot, "source.txt"), "utf8"), /ENOENT/);
+
 if (process.platform !== "win32") await chmod(join(root, "alpha.txt"), 0o755);
 const moveResult = await applyPatch(
   root,
