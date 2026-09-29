@@ -4,6 +4,18 @@ DevSpace brings a Codex-style coding-agent loop to ChatGPT and other MCP hosts:
 inspect the repo, follow local instructions, make scoped edits, run
 verification, and show the user what changed.
 
+## Continue a Named Project
+
+With the optional long-term memory adapter enabled, a short request such as `继续 Jack` is a project
+handoff. Pass `Jack` directly to `open_workspace`: it resolves canonical registry names, aliases, or
+a unique exact top-level directory name under an allowed root. Absolute paths remain supported.
+
+The first open automatically requests a small, bounded project context from the memory adapter.
+That bootstrap contains only compact recent/relevant evidence metadata and anchors, never a full
+thread. It is fail-open: an unavailable, slow, or malformed memory backend does not prevent coding.
+Use `memory_search` for an explicit historical question, then `memory_get_thread` to page through a
+selected evidence thread. Cross-check recovered memory against the current repository before editing.
+
 ## Open One Workspace
 
 ChatGPT should call `open_workspace` once for a project folder:
@@ -157,6 +169,10 @@ DevSpace exposes these tool names:
 - `write`
 - `edit`
 - `bash`
+
+When the optional CHIM adapter is enabled, the only additional model-facing
+memory tools are `memory_search` and `memory_get_thread`. Recent/context
+retrieval used for workspace bootstrap remains internal to DevSpace.
 
 By default, DevSpace also runs in `DEVSPACE_TOOL_MODE=minimal`, so dedicated
 `grep`, `glob`, and `ls` tools are hidden. Use `bash` with command-line tools

@@ -51,9 +51,10 @@ import {
   type DevspaceUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
+import { ProjectRegistry } from "./project-registry.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "agents" | "help" | "version";
+type Command = "serve" | "init" | "doctor" | "config" | "projects" | "agents" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -77,6 +78,9 @@ async function main(argv: string[]): Promise<void> {
     case "config":
       runConfigCommand(args);
       return;
+    case "projects":
+      runProjectsCommand(args);
+      return;
     case "agents":
       await runAgentsCommand(args);
       return;
@@ -91,7 +95,7 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "init" || command === "doctor" || command === "config" || command === "agents") return command;
+  if (command === "init" || command === "doctor" || command === "config" || command === "projects" || command === "agents") return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -376,6 +380,32 @@ function runConfigCommand(args: string[]): void {
   console.log(`Updated ${files.configPath}`);
 }
 
+function runProjectsCommand(args: string[]): void {
+  const [subcommand, ...rest] = args;
+  const config = loadConfig();
+  const registry = new ProjectRegistry(config.projectRegistryPath, config.allowedRoots);
+  if (!subcommand || subcommand === "list" || subcommand === "ls") {
+    if (rest.length > 0) throw new Error("Usage: devspace projects list");
+    console.log(JSON.stringify(registry.list(), null, 2));
+    return;
+  }
+  if (subcommand !== "register") {
+    throw new Error(`Unknown projects command: ${subcommand}`);
+  }
+  const [name, path, ...aliasArgs] = rest;
+  if (!name || !path) {
+    throw new Error("Usage: devspace projects register <name> <path> [--alias <alias>]...");
+  }
+  const aliases: string[] = [];
+  for (let index = 0; index < aliasArgs.length; index += 2) {
+    if (aliasArgs[index] !== "--alias" || !aliasArgs[index + 1]) {
+      throw new Error("Usage: devspace projects register <name> <path> [--alias <alias>]...");
+    }
+    aliases.push(aliasArgs[index + 1]!);
+  }
+  console.log(JSON.stringify(registry.register({ name, path, aliases }), null, 2));
+}
+
 function printHelp(): void {
   console.log(
     [
@@ -388,6 +418,8 @@ function printHelp(): void {
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
+      "  devspace projects list   List canonical project registrations",
+      "  devspace projects register <name> <path> [--alias <alias>]...",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] <prompt>",
       "  devspace agents continue <id> [--model <model>] [--effort <level>] <prompt>",

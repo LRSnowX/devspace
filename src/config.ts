@@ -3,7 +3,12 @@ import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
-import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-config.js";
+import {
+  devspaceAgentsDir,
+  devspaceConfigDir,
+  devspaceSkillsDir,
+  loadDevspaceFiles,
+} from "./user-config.js";
 import { resolveSubagentsConfig, type SubagentsConfig } from "./local-agent-config.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
@@ -16,6 +21,8 @@ export interface MemoryAdapterConfig {
   enabled: boolean;
   command?: string;
   dataHome?: string;
+  bootstrapTimeoutMs: number;
+  bootstrapByteBudget: number;
 }
 
 export interface ServerConfig {
@@ -35,6 +42,7 @@ export interface ServerConfig {
   skillPaths: string[];
   devspaceSkillsDir: string;
   devspaceAgentsDir: string;
+  projectRegistryPath: string;
   subagents: SubagentsConfig;
   agentDir: string;
   memory: MemoryAdapterConfig;
@@ -238,6 +246,18 @@ function parseMemoryConfig(
     enabled,
     command,
     dataHome: rawDataHome ? resolve(expandHomePath(rawDataHome)) : undefined,
+    bootstrapTimeoutMs: parsePositiveInteger(
+      env.DEVSPACE_MEMORY_BOOTSTRAP_TIMEOUT_MS,
+      5_000,
+      "DEVSPACE_MEMORY_BOOTSTRAP_TIMEOUT_MS",
+      30_000,
+    ),
+    bootstrapByteBudget: parsePositiveInteger(
+      env.DEVSPACE_MEMORY_BOOTSTRAP_BYTE_BUDGET,
+      12_288,
+      "DEVSPACE_MEMORY_BOOTSTRAP_BYTE_BUDGET",
+      65_536,
+    ),
   };
 }
 
@@ -281,6 +301,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
     devspaceSkillsDir: devspaceSkillsDir(env),
     devspaceAgentsDir: devspaceAgentsDir(env),
+    projectRegistryPath: join(devspaceConfigDir(env), "projects.json"),
     subagents: resolveSubagentsConfig(files.config.subagents, env),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
     memory: parseMemoryConfig(env, files.config.memory),

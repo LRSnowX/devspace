@@ -13,6 +13,12 @@ import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
+import { ProjectRegistry } from "./project-registry.js";
+import {
+  MemoryAdapter,
+  MemoryThreadAuthorizationStore,
+  type MemoryClient,
+} from "./memory-adapter.js";
 import { createMcpServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
@@ -28,7 +34,12 @@ test("memory tools are opt-in and read-only", async (t) => {
   );
 
   const enabled = await fixture(t, {
-    memory: { enabled: true, command: "/bin/false" },
+    memory: {
+      enabled: true,
+      command: "/bin/false",
+      bootstrapTimeoutMs: 2_000,
+      bootstrapByteBudget: 12_288,
+    },
   });
   const enabledTools = await enabled.client.listTools();
   const memoryTools = enabledTools.tools
@@ -36,7 +47,7 @@ test("memory tools are opt-in and read-only", async (t) => {
     .sort((left, right) => left.name.localeCompare(right.name));
   assert.deepEqual(
     memoryTools.map((tool) => tool.name),
-    ["memory_get_thread", "memory_project_context", "memory_recent", "memory_search"],
+    ["memory_get_thread", "memory_search"],
   );
   for (const tool of memoryTools) {
     assert.equal(tool.annotations?.readOnlyHint, true);
@@ -45,6 +56,298 @@ test("memory tools are opt-in and read-only", async (t) => {
       `${tool.name} should require workspaceId`,
     );
   }
+});
+
+test("open_workspace memory bootstrap and search authorize only project-scoped evidence", async (t) => {
+  const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  const memory: MemoryClient = {
+    enabled: true,
+    async bootstrapProjectContext(project) {
+      return {
+        project,
+        sourcePolicy: "chatgpt-first-fallback-all",
+        relevant: [{
+          conversationId: "parent-1",
+          evidenceConversationId: "evidence-1",
+          source: "chatgpt",
+          title: "Current decision",
+          snippet: "Keep the adapter fail-open.",
+          topicTags: ["decision"],
+        }],
+        recent: [],
+        truncated: false,
+        byteBudget: 12_288,
+      };
+    },
+    async call(name, args) {
+      calls.push({ name, args });
+      if (name === "memory_get_thread") {
+        return {
+          content: [{ type: "text", text: "thread" }],
+          structuredContent: {
+            thread: { messages: [{ role: "user", text: "evidence" }] },
+            message_offset: args.message_offset ?? 0,
+            returned_messages: 1,
+            total_messages: 2,
+            truncated: true,
+          },
+        };
+      }
+      return {
+        content: [{ type: "text", text: "search" }],
+        structuredContent: {
+          project: args.project,
+          retrieval_mode: "hybrid",
+          hits: [{
+            result: { conversation_id: "search-parent-1" },
+            evidence_conversation_id: "search-evidence-1",
+          }],
+        },
+      };
+    },
+  };
+  const context = await fixture(t, {
+    memory: {
+      enabled: true,
+      command: "/bin/false",
+      bootstrapTimeoutMs: 50,
+      bootstrapByteBudget: 12_288,
+    },
+    memoryClient: memory,
+    projectRegistration: { name: "Jack", aliases: ["Jack助手"] },
+  });
+  const opened = structuredContent(await callOpen(context.client, "Jack助手", "chat-memory"));
+  assert.equal((opened.memoryContext as Record<string, unknown>).project, "Jack");
+  assert.ok(Buffer.byteLength(JSON.stringify(opened.memoryContext), "utf8") <= 12_288);
+
+  const foreignBeforeSearch = await context.client.callTool({
+    name: "memory_get_thread",
+    arguments: { workspaceId: opened.workspaceId, conversationId: "foreign-project-thread" },
+  });
+  assert.equal(foreignBeforeSearch.isError, true);
+  assert.match(responseText(foreignBeforeSearch), /not authorized by this project's memory discovery/);
+  assert.equal(calls.length, 0, "unauthorized thread ids must not reach the memory backend");
+
+  const bootstrapPage = await context.client.callTool({
+    name: "memory_get_thread",
+    arguments: { workspaceId: opened.workspaceId, conversationId: "evidence-1", messageOffset: 1, messageLimit: 1 },
+  });
+  assert.equal(structuredContent(bootstrapPage).truncated, true);
+
+  const search = await context.client.callTool({
+    name: "memory_search",
+    arguments: { workspaceId: opened.workspaceId, query: "旧决定", limit: 3 },
+  });
+  assert.notEqual(search.isError, true);
+  const searchPage = await context.client.callTool({
+    name: "memory_get_thread",
+    arguments: { workspaceId: opened.workspaceId, conversationId: "search-evidence-1" },
+  });
+  assert.equal(structuredContent(searchPage).truncated, true);
+
+  const foreignAfterSearch = await context.client.callTool({
+    name: "memory_get_thread",
+    arguments: { workspaceId: opened.workspaceId, conversationId: "foreign-project-thread" },
+  });
+  assert.equal(foreignAfterSearch.isError, true);
+  assert.deepEqual(calls, [
+    { name: "memory_get_thread", args: { conversation_id: "evidence-1", message_offset: 1, message_limit: 1 } },
+    { name: "memory_search", args: { query: "旧决定", project: "Jack", limit: 3 } },
+    { name: "memory_get_thread", args: { conversation_id: "search-evidence-1", message_offset: undefined, message_limit: undefined } },
+  ]);
+  const invalidWorkspace = await context.client.callTool({
+    name: "memory_search",
+    arguments: { workspaceId: "ws_missing", query: "secret" },
+  });
+  assert.equal(invalidWorkspace.isError, true);
+  assert.equal(calls.length, 3, "invalid workspace must not reach the memory backend");
+});
+
+test("memory evidence authorization survives separate MCP server sessions", async (t) => {
+  const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+  const authorizations = new MemoryThreadAuthorizationStore();
+  const memory: MemoryClient = {
+    enabled: true,
+    async bootstrapProjectContext(project) {
+      return {
+        project,
+        sourcePolicy: "chatgpt-first-fallback-all",
+        relevant: [],
+        recent: [],
+        truncated: false,
+        byteBudget: 12_288,
+      };
+    },
+    async call(name, args) {
+      calls.push({ name, args });
+      if (name === "memory_search") {
+        return {
+          content: [{ type: "text", text: "search" }],
+          structuredContent: {
+            project: args.project,
+            retrieval_mode: "hybrid",
+            hits: [{
+              result: { conversation_id: "search-parent" },
+              evidence_conversation_id: "search-evidence",
+            }],
+          },
+        };
+      }
+      if (name === "memory_get_thread") {
+        return {
+          content: [{ type: "text", text: "thread" }],
+          structuredContent: {
+            thread: { messages: [{ role: "user", text: "evidence" }] },
+            message_offset: 0,
+            returned_messages: 1,
+            total_messages: 1,
+            truncated: false,
+          },
+        };
+      }
+      throw new Error(`unexpected memory tool: ${name}`);
+    },
+  };
+  const context = await fixture(t, {
+    memory: {
+      enabled: true,
+      command: "/bin/false",
+      bootstrapTimeoutMs: 50,
+      bootstrapByteBudget: 12_288,
+    },
+    memoryClient: memory,
+    memoryThreadAuthorizations: authorizations,
+    projectRegistration: { name: "Jack" },
+  });
+  const opened = structuredContent(await callOpen(context.client, "Jack", "chat-memory-session-1"));
+  const workspaceId = opened.workspaceId as string;
+
+  const search = await context.client.callTool({
+    name: "memory_search",
+    arguments: { workspaceId, query: "decision", limit: 3 },
+  });
+  assert.notEqual(search.isError, true);
+
+  const secondServer = createMcpServer(
+    context.config,
+    context.workspaces,
+    createReviewCheckpointManager(),
+    new ProcessSessionManager(),
+    () => [],
+    [],
+    memory,
+    authorizations,
+  );
+  const [secondClientTransport, secondServerTransport] = InMemoryTransport.createLinkedPair();
+  const secondClient = new Client({ name: "devspace-second-session", version: "1.0.0" });
+  await Promise.all([
+    secondClient.connect(secondClientTransport),
+    secondServer.connect(secondServerTransport),
+  ]);
+  try {
+    const page = await secondClient.callTool({
+      name: "memory_get_thread",
+      arguments: { workspaceId, conversationId: "search-evidence" },
+    });
+    assert.notEqual(page.isError, true);
+
+    const denied = await secondClient.callTool({
+      name: "memory_get_thread",
+      arguments: { workspaceId, conversationId: "foreign-evidence" },
+    });
+    assert.equal(denied.isError, true);
+  } finally {
+    await secondClient.close();
+    await secondServer.close();
+  }
+});
+
+test("open_workspace fails open when memory bootstrap is unavailable", async (t) => {
+  const memory: MemoryClient = {
+    enabled: true,
+    async bootstrapProjectContext() {
+      throw new Error("CHIM unavailable");
+    },
+    async call() {
+      throw new Error("not called");
+    },
+  };
+  const context = await fixture(t, {
+    memory: {
+      enabled: true,
+      command: "/bin/false",
+      bootstrapTimeoutMs: 50,
+      bootstrapByteBudget: 12_288,
+    },
+    memoryClient: memory,
+  });
+  const opened = await callOpen(context.client, context.project, "chat-memory-fail-open");
+  assert.notEqual(opened.isError, true);
+  assert.equal(structuredContent(opened).memoryContext, undefined);
+});
+
+test("open_workspace fails open on memory timeout and malformed responses", async (t) => {
+  for (const scenario of ["timeout", "malformed"] as const) {
+    await t.test(scenario, async (subtest) => {
+      const memoryConfig = {
+        enabled: true,
+        command: "/bin/false",
+        bootstrapTimeoutMs: 10,
+        bootstrapByteBudget: 12_288,
+      };
+      const memory = new MemoryAdapter(memoryConfig);
+      memory.call = scenario === "timeout"
+        ? async () => new Promise(() => undefined)
+        : async () => ({
+            content: [{ type: "text", text: "malformed" }],
+            structuredContent: { project: "wrong-shape" },
+          });
+      const context = await fixture(subtest, { memory: memoryConfig, memoryClient: memory });
+      const opened = await callOpen(context.client, context.project, `chat-${scenario}`);
+      assert.notEqual(opened.isError, true);
+      assert.equal(structuredContent(opened).memoryContext, undefined);
+    });
+  }
+});
+
+test("open_workspace is the only project-entry tool and resolves canonical names and aliases", async (t) => {
+  const context = await fixture(t, { projectRegistration: { name: "Jack", aliases: ["Jack助手"] } });
+  const tools = await context.client.listTools();
+  assert.equal(tools.tools.some((tool) => tool.name === "resolve_project"), false);
+  assert.equal(tools.tools.some((tool) => tool.name === "register_project"), false);
+
+  const canonical = structuredContent(await callOpen(context.client, "Jack", "chat-1"));
+  const alias = structuredContent(await callOpen(context.client, "Jack助手", "chat-1"));
+  const absolute = structuredContent(await callOpen(context.client, context.project, "chat-1"));
+  assert.equal(canonical.root, context.project);
+  assert.equal(canonical.projectName, "Jack");
+  assert.equal(alias.workspaceId, canonical.workspaceId);
+  assert.equal(alias.projectName, "Jack");
+  assert.equal(absolute.workspaceId, canonical.workspaceId);
+  assert.equal(absolute.projectName, "Jack");
+});
+
+test("open_workspace discovers unique directory names and rejects unknown or ambiguous projects", async (t) => {
+  const context = await fixture(t);
+  const discovered = structuredContent(await callOpen(context.client, "project", "chat-1"));
+  assert.equal(discovered.root, context.project);
+
+  const otherRoot = await mkdtemp(join(tmpdir(), "devspace-server-other-root-"));
+  t.after(() => rm(otherRoot, { recursive: true, force: true }));
+  await mkdir(join(otherRoot, "project"));
+  context.config.allowedRoots.push(otherRoot);
+
+  const ambiguous = await callOpen(context.client, "project", "chat-2");
+  assert.equal(ambiguous.isError, true);
+  assert.match(responseText(ambiguous), /ambiguous across allowed roots/);
+  const unknown = await callOpen(context.client, "missing", "chat-2");
+  assert.equal(unknown.isError, true);
+  assert.match(responseText(unknown), /Unknown project 'missing'/);
+  const outside = await mkdtemp(join(tmpdir(), "devspace-server-outside-"));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  const denied = await callOpen(context.client, outside, "chat-2");
+  assert.equal(denied.isError, true);
+  assert.match(responseText(denied), /outside allowed roots/);
 });
 
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
@@ -266,6 +569,7 @@ interface ServerFixture {
   project: string;
   config: ServerConfig;
   stateDir: string;
+  workspaces: WorkspaceRegistry;
   close: () => Promise<void>;
 }
 
@@ -276,6 +580,9 @@ async function fixture(
     localAgentProviders?: LocalAgentProviderAvailability[] | (() => LocalAgentProviderAvailability[]);
     subagents?: SubagentsConfig;
     memory?: ServerConfig["memory"];
+    memoryClient?: MemoryClient;
+    memoryThreadAuthorizations?: MemoryThreadAuthorizationStore;
+    projectRegistration?: { name: string; aliases?: string[] };
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -342,6 +649,12 @@ async function fixture(
     config.subagents,
     resolveProviderAvailability(),
   );
+  if (options.projectRegistration) {
+    new ProjectRegistry(config.projectRegistryPath, config.allowedRoots).register({
+      ...options.projectRegistration,
+      path: project,
+    });
+  }
   const store = new SqliteWorkspaceStore(stateDir);
   const workspaces = new WorkspaceRegistry(config, store);
   const server = createMcpServer(
@@ -351,6 +664,8 @@ async function fixture(
     new ProcessSessionManager(),
     resolveLocalAgentProviders,
     [],
+    options.memoryClient,
+    options.memoryThreadAuthorizations,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -373,7 +688,7 @@ async function fixture(
     await rm(root, { recursive: true, force: true });
   });
 
-  return { client, project, config, stateDir, close };
+  return { client, project, config, stateDir, workspaces, close };
 }
 
 async function git(cwd: string, args: string[]): Promise<void> {

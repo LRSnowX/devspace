@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -16,6 +16,7 @@ const workspacePath = process.env.DEVSPACE_MEMORY_TEST_WORKSPACE;
 const memoryCommand = process.env.DEVSPACE_MEMORY_MCP_COMMAND;
 const dataHome = process.env.DEVSPACE_MEMORY_DATA_HOME;
 const expectedAnchor = process.env.DEVSPACE_MEMORY_EXPECTED_ANCHOR;
+const foreignConversationId = process.env.DEVSPACE_MEMORY_FOREIGN_CONVERSATION_ID;
 const searchQuery = process.env.DEVSPACE_MEMORY_TEST_QUERY
   ?? "为什么旧的数据库迁移记录不能重写";
 
@@ -65,7 +66,7 @@ test(
           .filter((tool) => tool.name.startsWith("memory_"))
           .map((tool) => tool.name)
           .sort(),
-        ["memory_get_thread", "memory_project_context", "memory_recent", "memory_search"],
+        ["memory_get_thread", "memory_search"],
       );
 
       const opened = await client.callTool({
@@ -74,6 +75,22 @@ test(
       });
       const workspaceId = readString(opened.structuredContent, "workspaceId");
       assert.ok(workspaceId);
+      const bootstrap = readRecord(readRecord(opened.structuredContent)?.memoryContext);
+      assert.ok(bootstrap);
+      assert.equal(readString(bootstrap, "project"), readString(opened.structuredContent, "projectName"));
+      assert.ok(Buffer.byteLength(JSON.stringify(bootstrap), "utf8") <= 12_288);
+
+      if (foreignConversationId) {
+        const denied = await client.callTool({
+          name: "memory_get_thread",
+          arguments: {
+            workspaceId,
+            conversationId: foreignConversationId,
+            messageLimit: 1,
+          },
+        });
+        assert.equal(denied.isError, true);
+      }
 
       const search = await client.callTool({
         name: "memory_search",
@@ -90,13 +107,6 @@ test(
         assert.equal(topAnchor, expectedAnchor);
       }
 
-      const recent = await client.callTool({
-        name: "memory_recent",
-        arguments: { workspaceId, limit: 3 },
-      });
-      assert.notEqual(recent.isError, true);
-      assert.ok(readArray(recent.structuredContent, "hits").length > 0);
-
       const thread = await client.callTool({
         name: "memory_get_thread",
         arguments: {
@@ -108,22 +118,6 @@ test(
       assert.notEqual(thread.isError, true);
       assert.ok(readNumber(thread.structuredContent, "returned_messages") > 0);
 
-      const context = await client.callTool({
-        name: "memory_project_context",
-        arguments: {
-          workspaceId,
-          query: "为什么不能修改已经存在的数据库迁移文件",
-          relevantLimit: 3,
-          recentLimit: 2,
-        },
-      });
-      assert.notEqual(context.isError, true);
-      assert.equal(readString(context.structuredContent, "project"), basename(workspacePath));
-      const relevant = readArray(context.structuredContent, "relevant");
-      assert.ok(relevant.length > 0);
-      if (expectedAnchor) {
-        assert.equal(readNestedString(relevant[0], ["result", "conversation_id"]), expectedAnchor);
-      }
     } finally {
       await client.close();
       await server.close();

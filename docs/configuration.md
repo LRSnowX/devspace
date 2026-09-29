@@ -71,6 +71,34 @@ There is no artifact root, total quota, TTL, pinning, persistent database record
 or background artifact cleanup service. See [Native File Download](artifact-exchange.md)
 for the supported connector shape and security boundaries.
 
+## Project Registry
+
+DevSpace stores optional project-name mappings in `~/.devspace/projects.json`. `open_workspace`
+resolves canonical names and aliases from this registry, then falls back to an exact, unique
+top-level directory-name match under the configured allowed roots. Registry administration is a
+local runtime/configuration concern and is not exposed as a coding MCP tool.
+Manage it locally with `devspace projects list` and
+`devspace projects register <name> <path> [--alias <alias>]...`. Restart a running DevSpace server
+after changing registrations so its runtime registry reloads the persisted file.
+
+The registry is not a filesystem search index and does not broaden `allowedRoots`. Registered paths
+must remain inside an allowed root. When the memory adapter is enabled, a registered canonical name
+also becomes the project identity used by the `memory_*` tools, which allows a repository directory
+such as `jack-ios-app` to use the memory project name `Jack`.
+
+Memory bootstrap defaults to a 5-second timeout and a 12,288-byte response budget. Override these
+bounded values with `DEVSPACE_MEMORY_BOOTSTRAP_TIMEOUT_MS` (maximum 30 seconds) and
+`DEVSPACE_MEMORY_BOOTSTRAP_BYTE_BUDGET` (maximum 65,536 bytes). Bootstrap failures are logged and
+ignored so `open_workspace` remains available when CHIM is unavailable.
+
+`memory_get_thread` only expands conversation/evidence IDs that the current project has already
+received from workspace memory bootstrap or `memory_search`. This authorization cache is bounded
+and process-local; after restarting DevSpace, repeat `memory_search` before expanding older
+evidence. This keeps thread expansion fail-closed without duplicating CHIM's project-matching logic.
+It prevents arbitrary conversation-ID expansion; it does not turn CHIM's project matching into a
+security boundary. CHIM project search remains a relevance filter and may intentionally match
+conversations whose early messages mention the project even when the title/path is generic.
+
 ## OAuth
 
 DevSpace uses a single-user OAuth approval flow.

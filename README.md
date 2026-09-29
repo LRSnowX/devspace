@@ -145,6 +145,8 @@ DevSpace gives ChatGPT tools to:
 - follow project instructions from `AGENTS.md` and `CLAUDE.md`
 - discover local agent skills from your skill folders
 - show tool cards and optional change summaries in ChatGPT Apps-compatible hosts
+- open registered, aliased, or uniquely named projects directly, so a short request such as
+  `继续 Jack` does not expose project-resolution mechanics to the model
 
 ## Mental Model
 

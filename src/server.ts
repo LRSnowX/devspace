@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
-import { basename } from "node:path";
+import { basename, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -65,7 +65,15 @@ import {
   formatLocalAgentProviderStatusSummary,
   type LocalAgentProviderStatus,
 } from "./local-agent-catalog.js";
-import { MemoryAdapter } from "./memory-adapter.js";
+import {
+  MemoryAdapter,
+  MemoryThreadAuthorizationStore,
+  memoryEvidenceIdsFromBootstrapContext,
+  memoryEvidenceIdsFromSearchResult,
+  type MemoryBootstrapContext,
+  type MemoryClient,
+} from "./memory-adapter.js";
+import { ProjectRegistry } from "./project-registry.js";
 
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
@@ -203,9 +211,12 @@ function serverInstructions(config: ServerConfig): string {
     config.widgets === "changes"
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
+  const handoffInstruction = config.memory.enabled
+    ? " A short continuation request such as '继续 <project>' can be opened directly by passing the project name or alias to open_workspace. It returns bounded project memory context when available. Use memory_search for explicit historical questions and memory_get_thread only to expand selected evidence. Cross-check recovered memory against the current repository before implementation."
+    : " A project may be opened by absolute path, canonical project name, alias, or a unique top-level directory name under an allowed root.";
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
+    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${handoffInstruction}${artifactInstruction}${showChangesInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -218,7 +229,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
+  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${handoffInstruction}${artifactInstruction}${showChangesInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -299,6 +310,25 @@ const reviewSummaryOutputSchema = z.object({
   files: z.number(),
   additions: z.number(),
   removals: z.number(),
+});
+
+const memoryBootstrapHitOutputSchema = z.object({
+  conversationId: z.string(),
+  evidenceConversationId: z.string().optional(),
+  source: z.string(),
+  title: z.string(),
+  updateTime: z.number().optional(),
+  snippet: z.string().optional(),
+  topicTags: z.array(z.string()),
+});
+
+const memoryBootstrapContextOutputSchema = z.object({
+  project: z.string(),
+  sourcePolicy: z.string(),
+  relevant: z.array(memoryBootstrapHitOutputSchema),
+  recent: z.array(memoryBootstrapHitOutputSchema),
+  truncated: z.boolean(),
+  byteBudget: z.number().int().positive(),
 });
 
 function sendJsonRpcError(
@@ -713,6 +743,8 @@ export function createMcpServer(
   processSessions: ProcessSessionManager,
   resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  memoryClient?: MemoryClient,
+  memoryThreadAuthorizations = new MemoryThreadAuthorizationStore(),
 ): McpServer {
   const server = new McpServer(
     {
@@ -726,7 +758,12 @@ export function createMcpServer(
       instructions: serverInstructions(config),
     },
   );
-  const memory = new MemoryAdapter(config.memory);
+  const memory = memoryClient ?? new MemoryAdapter(config.memory);
+  const projects = new ProjectRegistry(config.projectRegistryPath, config.allowedRoots);
+  const memoryAuthorizationKey = (workspaceId: string): string => {
+    const workspace = workspaces.getWorkspace(workspaceId);
+    return workspace.sourceRoot ?? workspace.root;
+  };
 
   registerAppResource(
     server,
@@ -765,12 +802,12 @@ export function createMcpServer(
     {
       title: "Open workspace",
       description:
-        "Start work in a project directory or isolated worktree when no usable workspaceId exists for it. During continued work, reuse the existing workspaceId instead of calling this tool again. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work.",
+        "Start work in a project when no usable workspaceId exists for it. Accepts an absolute path, canonical project name, registered alias, or unique top-level directory name under an allowed root. During continued work, reuse the existing workspaceId. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work.",
       inputSchema: {
         path: z
           .string()
           .describe(
-            "Absolute path, or a leading-tilde home path such as ~/project, to a project directory inside an allowed root.",
+            "Absolute/~/ path, canonical project name, registered alias, or unique top-level directory name under an allowed root.",
           ),
         mode: z
           .enum(["checkout", "worktree"])
@@ -804,6 +841,8 @@ export function createMcpServer(
         agentProviders: z.array(workspaceLocalAgentProviderOutputSchema).optional(),
         agents: z.array(workspaceLocalAgentOutputSchema).optional(),
         skillDiagnostics: z.array(z.unknown()).optional(),
+        projectName: z.string(),
+        memoryContext: memoryBootstrapContextOutputSchema.optional(),
         instruction: z.string(),
       },
       ...toolWidgetDescriptorMeta(config, "workspace"),
@@ -811,6 +850,25 @@ export function createMcpServer(
     },
     async ({ path, mode, baseRef }, { _meta }) => {
       const startedAt = performance.now();
+      let resolvedPath = path;
+      let projectName: string;
+      if (isAbsolute(path) || path === "~" || path.startsWith("~/") || path.startsWith("~\\")) {
+        projectName = projects.projectNameForPath(path) ?? basename(path);
+      } else {
+        const lookup = projects.lookup(path);
+        if (lookup.status === "unknown") {
+          throw new Error(
+            `Unknown project '${path}'. Pass an absolute path inside an allowed root or register the project in ${config.projectRegistryPath}.`,
+          );
+        }
+        if (lookup.status === "ambiguous") {
+          throw new Error(
+            `Project '${path}' is ambiguous across allowed roots: ${lookup.paths.join(", ")}. Pass an absolute path or add a canonical registry entry.`,
+          );
+        }
+        resolvedPath = lookup.resolution.project.path;
+        projectName = lookup.resolution.project.name;
+      }
       const {
         workspace,
         agentsFiles,
@@ -818,7 +876,7 @@ export function createMcpServer(
         workspaceReused,
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
-        { path, mode, baseRef },
+        { path: resolvedPath, mode, baseRef },
         { conversationScopeId: openAiConversationScopeId(_meta) },
       );
       if (config.widgets === "changes") {
@@ -860,6 +918,21 @@ export function createMcpServer(
       const visibleAgents = includeBootstrapContext ? cardAgents : [];
       const loadedAgentsFiles = includeBootstrapContext ? cardAgentsFiles : [];
       const availableAgentsFileOutputs = includeBootstrapContext ? cardAvailableAgentsFiles : [];
+      let memoryContext: MemoryBootstrapContext | undefined;
+      if (memory.enabled && includeBootstrapContext) {
+        try {
+          memoryContext = await memory.bootstrapProjectContext(projectName);
+          memoryThreadAuthorizations.authorize(
+            workspace.sourceRoot ?? workspace.root,
+            memoryEvidenceIdsFromBootstrapContext(memoryContext),
+          );
+        } catch (error) {
+          logEvent(config.logging, "warn", "memory_bootstrap_failed", {
+            project: projectName,
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       const cardInstruction = config.skillsEnabled
         ? "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
         : "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.";
@@ -897,6 +970,9 @@ export function createMcpServer(
               : undefined,
             visibleAgents.length > 0
               ? `Available subagent profiles: ${visibleAgents.map(formatVisibleAgent).join(", ")}`
+              : undefined,
+            memoryContext
+              ? "Bounded project memory context is available in structuredContent.memoryContext."
               : undefined,
             instruction,
           ].filter(Boolean).join("\n"),
@@ -943,6 +1019,8 @@ export function createMcpServer(
           workspaceId: workspace.id,
           root: workspace.root,
           mode: workspace.mode,
+          projectName,
+          memoryContext,
           sourceRoot: workspace.sourceRoot,
           worktree: workspace.worktree,
           ...(includeBootstrapContext
@@ -962,6 +1040,11 @@ export function createMcpServer(
   );
 
   if (memory.enabled) {
+    const projectNameForWorkspace = (workspaceId: string): string => {
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const identityPath = workspace.sourceRoot ?? workspace.root;
+      return projects.projectNameForPath(identityPath) ?? basename(identityPath);
+    };
     server.registerTool(
       "memory_search",
       {
@@ -976,35 +1059,16 @@ export function createMcpServer(
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, query, limit }) => {
-        const workspace = workspaces.getWorkspace(workspaceId);
-        return memory.call("memory_search", {
+        const result = await memory.call("memory_search", {
           query,
-          project: basename(workspace.root),
+          project: projectNameForWorkspace(workspaceId),
           limit,
         });
-      },
-    );
-
-    server.registerTool(
-      "memory_recent",
-      {
-        title: "Recent project memory",
-        description:
-          "List recent indexed AI conversations associated with the current workspace project without invoking semantic retrieval.",
-        inputSchema: {
-          workspaceId: z.string().describe(workspaceIdDescription),
-          since: z.number().optional().describe("Optional Unix timestamp lower bound."),
-          limit: z.number().int().positive().max(50).optional().describe("Maximum hits. Defaults to 10."),
-        },
-        annotations: { readOnlyHint: true },
-      },
-      async ({ workspaceId, since, limit }) => {
-        const workspace = workspaces.getWorkspace(workspaceId);
-        return memory.call("memory_recent", {
-          project: basename(workspace.root),
-          since,
-          limit,
-        });
+        memoryThreadAuthorizations.authorize(
+          memoryAuthorizationKey(workspaceId),
+          memoryEvidenceIdsFromSearchResult(result),
+        );
+        return result;
       },
     );
 
@@ -1013,7 +1077,7 @@ export function createMcpServer(
       {
         title: "Read memory thread",
         description:
-          "Read a normalized historical conversation thread with pagination. Prefer the evidence conversation id returned by memory_search when expanding supporting evidence.",
+          "Read a normalized historical conversation thread with pagination. The conversation must have been returned for this project by open_workspace memory bootstrap or memory_search. After a DevSpace server restart, repeat memory_search before expanding older evidence.",
         inputSchema: {
           workspaceId: z.string().describe(workspaceIdDescription),
           conversationId: z.string().trim().min(1).describe("Indexed conversation id."),
@@ -1023,7 +1087,12 @@ export function createMcpServer(
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, conversationId, messageOffset, messageLimit }) => {
-        workspaces.getWorkspace(workspaceId);
+        const authorizationKey = memoryAuthorizationKey(workspaceId);
+        if (!memoryThreadAuthorizations.isAuthorized(authorizationKey, conversationId)) {
+          throw new Error(
+            "Memory thread is not authorized by this project's memory discovery. Expand evidence returned by open_workspace memory context or memory_search; repeat memory_search after a server restart.",
+          );
+        }
         return memory.call("memory_get_thread", {
           conversation_id: conversationId,
           message_offset: messageOffset,
@@ -1032,30 +1101,6 @@ export function createMcpServer(
       },
     );
 
-    server.registerTool(
-      "memory_project_context",
-      {
-        title: "Project memory context",
-        description:
-          "Build a compact read-only memory view for the current workspace by combining relevant hybrid hits with recent project conversations.",
-        inputSchema: {
-          workspaceId: z.string().describe(workspaceIdDescription),
-          query: z.string().trim().min(1).optional().describe("Optional focus query. Defaults to the project name."),
-          relevantLimit: z.number().int().positive().max(20).optional().describe("Maximum relevant hits. Defaults to 8."),
-          recentLimit: z.number().int().positive().max(20).optional().describe("Maximum recent hits. Defaults to 6."),
-        },
-        annotations: { readOnlyHint: true },
-      },
-      async ({ workspaceId, query, relevantLimit, recentLimit }) => {
-        const workspace = workspaces.getWorkspace(workspaceId);
-        return memory.call("memory_project_context", {
-          project: basename(workspace.root),
-          query,
-          relevant_limit: relevantLimit,
-          recent_limit: recentLimit,
-        });
-      },
-    );
   }
 
   registerAppTool(
@@ -1799,6 +1844,7 @@ export function createServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
+  const memoryThreadAuthorizations = new MemoryThreadAuthorizationStore();
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
@@ -1968,6 +2014,8 @@ export function createServer(
           processSessions,
           resolveLocalAgentProviders,
           incomingArtifactAdapters,
+          undefined,
+          memoryThreadAuthorizations,
         );
         await server.connect(transport);
       } else {

@@ -24,6 +24,7 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "1" }).toolMode, "
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.equal(loadConfig(baseEnv).devspaceSkillsDir, join(emptyConfigDir, "skills"));
 assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents"));
+assert.equal(loadConfig(baseEnv).projectRegistryPath, join(emptyConfigDir, "projects.json"));
 assert.deepEqual(loadConfig(baseEnv).subagents, { enabled: false, providers: [] });
 assert.equal(loadConfig(baseEnv).artifactsEnabled, false);
 assert.equal(loadConfig(baseEnv).artifactMaxFileBytes, 100 * 1024 * 1024);
@@ -31,6 +32,8 @@ assert.deepEqual(loadConfig(baseEnv).memory, {
   enabled: false,
   command: undefined,
   dataHome: undefined,
+  bootstrapTimeoutMs: 5_000,
+  bootstrapByteBudget: 12_288,
 });
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_MEMORY_ENABLED: "1" }),
@@ -47,7 +50,21 @@ assert.deepEqual(
     enabled: true,
     command: "/bin/echo",
     dataHome: emptyConfigDir,
+    bootstrapTimeoutMs: 5_000,
+    bootstrapByteBudget: 12_288,
   },
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_MEMORY_BOOTSTRAP_TIMEOUT_MS: "250" }).memory.bootstrapTimeoutMs,
+  250,
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_MEMORY_BOOTSTRAP_BYTE_BUDGET: "4096" }).memory.bootstrapByteBudget,
+  4_096,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_MEMORY_BOOTSTRAP_BYTE_BUDGET: "65537" }),
+  /DEVSPACE_MEMORY_BOOTSTRAP_BYTE_BUDGET/,
 );
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_ARTIFACTS: "1" }).artifactsEnabled, true);
 assert.equal(
@@ -211,6 +228,8 @@ assert.deepEqual(fileConfig.memory, {
   enabled: true,
   command: "/bin/echo",
   dataHome: emptyConfigDir,
+  bootstrapTimeoutMs: 5_000,
+  bootstrapByteBudget: 12_288,
 });
 assert.deepEqual(fileConfig.allowedHosts, [
   "localhost",
