@@ -35,6 +35,7 @@ import {
   loadLocalAgentProfiles,
   type LocalAgentProfile,
 } from "./local-agent-profiles.js";
+import { ToolOperationError } from "./tool-errors.js";
 
 export interface LoadedAgentsFile {
   path: string;
@@ -574,10 +575,22 @@ export class WorkspaceRegistry {
     try {
       currentRoot = await realpath(workspace.root);
     } catch {
-      throw new AccessDeniedError(`Workspace root is no longer accessible: ${workspace.root}`);
+      throw new ToolOperationError({
+        code: "WORKSPACE_INVALIDATED",
+        category: "state",
+        message: `Workspace root is no longer accessible: ${workspace.root}`,
+        retryable: true,
+        path: workspace.root,
+      });
     }
     if (currentRoot !== workspace.canonicalRoot) {
-      throw new AccessDeniedError(`Workspace root changed after it was opened: ${workspace.root}`);
+      throw new ToolOperationError({
+        code: "WORKSPACE_INVALIDATED",
+        category: "state",
+        message: `Workspace root changed after it was opened: ${workspace.root}`,
+        retryable: true,
+        path: workspace.root,
+      });
     }
   }
 
@@ -634,9 +647,13 @@ export class WorkspaceRegistry {
 }
 
 function unavailableWorkspaceError(workspaceId: string): Error {
-  return new Error(
-    `Unknown workspaceId: ${workspaceId}. Open the target project or worktree again and continue with the new workspaceId.`,
-  );
+  return new ToolOperationError({
+    code: "WORKSPACE_NOT_FOUND",
+    category: "not_found",
+    message:
+      `Unknown workspaceId: ${workspaceId}. Open the target project or worktree again and continue with the new workspaceId.`,
+    retryable: true,
+  });
 }
 
 export async function ensureCheckoutWorkspaceRoot(

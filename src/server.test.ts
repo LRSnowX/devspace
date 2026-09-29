@@ -12,6 +12,7 @@ import { loadConfig, type ServerConfig, type ToolMode } from "./config.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
+import { fileRevision } from "./file-revision.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createMcpServer, createServer } from "./server.js";
@@ -162,7 +163,21 @@ test("read revisions reject stale Codex patches before publication", async (t) =
       }],
     },
   });
-  assert.equal(stale.isError, true);
+  assert.notEqual(stale.isError, true);
+  const staleStructured = structuredContent(stale);
+  assert.equal(staleStructured.status, "error");
+  assert.deepEqual(staleStructured.error, {
+    code: "REVISION_CONFLICT",
+    category: "conflict",
+    message: `Invalid patch: stale file revision for note.txt: expected ${firstPage.revision}: current ${fileRevision(Buffer.from("external\nshared\n"))}`,
+    retryable: true,
+    path: "note.txt",
+    expected_revision: firstPage.revision,
+    current_revision: fileRevision(Buffer.from("external\nshared\n")),
+  });
+  assert.equal(staleStructured.additions, 0);
+  assert.equal(staleStructured.removals, 0);
+  assert.deepEqual(staleStructured.files, []);
   const staleContent = stale.content as Array<{
     type: string;
     text?: string;
@@ -211,6 +226,59 @@ test("read revisions reject stale Codex patches before publication", async (t) =
     await readFile(join(context.project, "note.txt"), "utf8"),
     "external\npatched\n",
   );
+});
+
+test("Codex apply_patch exposes structured workspace and path errors", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
+
+  const missingWorkspace = await context.client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspace_id: "ws_missing",
+      patch: [
+        "*** Begin Patch",
+        "*** Add File: note.txt",
+        "+hello",
+        "*** End Patch",
+      ].join("\n"),
+    },
+  });
+  assert.notEqual(missingWorkspace.isError, true);
+  assert.equal(structuredContent(missingWorkspace).status, "error");
+  assert.deepEqual(structuredContent(missingWorkspace).error, {
+    code: "WORKSPACE_NOT_FOUND",
+    category: "not_found",
+    message:
+      "Unknown workspaceId: ws_missing. Open the target project or worktree again and continue with the new workspaceId.",
+    retryable: true,
+  });
+
+  const workspaceId = structuredContent(
+    await callOpen(context.client, context.project, "structured-path-error"),
+  ).workspace_id;
+  assert.equal(typeof workspaceId, "string");
+
+  const escapedPath = await context.client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspace_id: workspaceId,
+      patch: [
+        "*** Begin Patch",
+        "*** Add File: ../outside.txt",
+        "+hello",
+        "*** End Patch",
+      ].join("\n"),
+    },
+  });
+  assert.notEqual(escapedPath.isError, true);
+  assert.equal(structuredContent(escapedPath).status, "error");
+  assert.deepEqual(structuredContent(escapedPath).error, {
+    code: "PATH_SCOPE_VIOLATION",
+    category: "scope",
+    message: "Invalid patch: path escapes the workspace: ../outside.txt",
+    retryable: false,
+    path: "../outside.txt",
+  });
 });
 
 test("Claude edit and bash tools accept snake_case runtime inputs", async (t) => {

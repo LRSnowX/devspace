@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyPatch, isSamePatchFile, parsePatch, replaceFile } from "./apply-patch.js";
 import { fileRevision } from "./file-revision.js";
+import { isToolOperationError } from "./tool-errors.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-apply-patch-"));
 const replacement = join(root, "replacement.txt");
@@ -80,7 +81,19 @@ await assert.rejects(
       expectedRevisions: [{ path: "file.txt", revision: originalRevision }],
     },
   ),
-  /stale file revision for file\.txt/,
+  (error: unknown) => {
+    assert.ok(isToolOperationError(error));
+    assert.equal(error.payload.code, "REVISION_CONFLICT");
+    assert.equal(error.payload.category, "conflict");
+    assert.equal(error.payload.retryable, true);
+    assert.equal(error.payload.path, "file.txt");
+    assert.equal(error.payload.expected_revision, originalRevision);
+    assert.equal(
+      error.payload.current_revision,
+      fileRevision(Buffer.from("external\nshared\n")),
+    );
+    return true;
+  },
 );
 assert.equal(
   await readFile(join(revisionRoot, "file.txt"), "utf8"),
@@ -154,6 +167,26 @@ await assert.rejects(
   /expected revision path is not touched by patch: second\.txt/,
 );
 assert.equal(await readFile(join(multiRevisionRoot, "first.txt"), "utf8"), "first old\n");
+
+await assert.rejects(
+  applyPatch(
+    multiRevisionRoot,
+    `*** Begin Patch
+*** Update File: ../outside.txt
+@@
+-old
++new
+*** End Patch`,
+  ),
+  (error: unknown) => {
+    assert.ok(isToolOperationError(error));
+    assert.equal(error.payload.code, "PATH_SCOPE_VIOLATION");
+    assert.equal(error.payload.category, "scope");
+    assert.equal(error.payload.retryable, false);
+    assert.equal(error.payload.path, "../outside.txt");
+    return true;
+  },
+);
 
 const rollbackRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-rollback-"));
 await writeFile(join(rollbackRoot, "first.txt"), "first old\n");
@@ -290,7 +323,11 @@ await assert.rejects(
     },
   ),
   (error: unknown) => {
-    assert.ok(error instanceof Error);
+    assert.ok(isToolOperationError(error));
+    assert.equal(error.payload.code, "ROLLBACK_FAILED");
+    assert.equal(error.payload.category, "recovery");
+    assert.equal(error.payload.retryable, false);
+    assert.ok(error.payload.recovery_files?.length);
     assert.match(
       error.message,
       /rollback failed: first\.txt: Invalid patch: published file changed before rollback/,

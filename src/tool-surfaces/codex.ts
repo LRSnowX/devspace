@@ -2,6 +2,10 @@ import * as z from "zod/v4";
 import { applyPatch } from "../apply-patch.js";
 import { FILE_REVISION_PATTERN } from "../file-revision.js";
 import {
+  toolErrorPayload,
+  toolErrorPayloadSchema,
+} from "../tool-errors.js";
+import {
   MAX_PROCESS_YIELD_MS,
   type ProcessSnapshot,
 } from "../process-sessions.js";
@@ -112,6 +116,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
           ),
       },
       outputSchema: resultOutputSchema({
+        status: z.enum(["applied", "error"]),
         additions: z.number(),
         removals: z.number(),
         files: z.array(
@@ -121,23 +126,42 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
             operation: z.enum(["add", "update", "delete", "move"]),
           }),
         ),
+        error: toolErrorPayloadSchema.optional(),
       }),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
     async ({ workspace_id, patch, expected_revisions }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
-      const applied = await runLoggedToolOperation(
-        config,
-        { tool: "apply_patch", workspaceId },
-        startedAt,
-        async () => {
-          const workspace = await workspaces.getWorkspace(workspaceId);
-          return applyPatch(workspace.root, patch, {
-            expectedRevisions: expected_revisions,
-          });
-        },
-      );
+      let applied;
+      try {
+        applied = await runLoggedToolOperation(
+          config,
+          { tool: "apply_patch", workspaceId },
+          startedAt,
+          async () => {
+            const workspace = await workspaces.getWorkspace(workspaceId);
+            return applyPatch(workspace.root, patch, {
+              expectedRevisions: expected_revisions,
+            });
+          },
+        );
+      } catch (error) {
+        const payload = toolErrorPayload(error);
+        if (!payload) throw error;
+        const content = [textBlock(payload.message)];
+        return {
+          content,
+          structuredContent: {
+            result: payload.message,
+            status: "error",
+            additions: 0,
+            removals: 0,
+            files: [],
+            error: payload,
+          },
+        };
+      }
       const paths = applied.files.map((file) => file.path).join(", ");
       const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
       const content = [textBlock(result)];
@@ -146,6 +170,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
         content,
         structuredContent: {
           result,
+          status: "applied",
           additions: applied.additions,
           removals: applied.removals,
           files: applied.files.map(({ previousPath, ...file }) => ({

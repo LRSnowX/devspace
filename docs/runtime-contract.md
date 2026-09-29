@@ -150,11 +150,22 @@ the corresponding regression coverage in the same change.
 - Tool calls preserve their real success/failure boundary in logging.
 - Errors are returned or thrown at the layer that detects them rather than
   being silently converted into successful results.
+- Expected Codex `apply_patch` failures return a host-visible domain result
+  with `status: "error"` and a stable machine-readable
+  `structuredContent.error` payload. Successful application reports
+  `status: "applied"`. This avoids current ChatGPT host behavior that converts
+  MCP `isError: true` results into string exceptions and discards structured
+  content. Current codes cover invalid patches, revision/concurrent conflicts,
+  rollback failure, path scope, and unavailable/invalidated workspaces.
+- A process that starts successfully and exits non-zero remains a completed
+  process result with its non-zero `exit_code`; it is not reclassified as a
+  tool protocol error.
 
 ### Current limitation
 
-- DevSpace does not yet expose one uniform structured error taxonomy across all
-  tools and adapters.
+- The structured coding-tool error taxonomy is currently guaranteed for Codex
+  `apply_patch`. Other tools and adapters still have legacy or domain-specific
+  error contracts and may migrate incrementally.
 
 ## Review
 
@@ -222,4 +233,5 @@ When Memory is configured:
 - [Development and manual QA](development.md)
 - [Transactional apply_patch design](apply-patch-transaction-design.md)
 - [File revision design](file-revision-design.md)
+- [Tool error contract](tool-error-contract.md)
 

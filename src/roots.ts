@@ -1,10 +1,17 @@
 import { homedir } from "node:os";
 import { lstat, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { ToolOperationError } from "./tool-errors.js";
 
-export class AccessDeniedError extends Error {
-  constructor(message: string) {
-    super(message);
+export class AccessDeniedError extends ToolOperationError {
+  constructor(message: string, path?: string) {
+    super({
+      code: "PATH_SCOPE_VIOLATION",
+      category: "scope",
+      message,
+      retryable: false,
+      path,
+    });
     this.name = "AccessDeniedError";
   }
 }
@@ -38,7 +45,7 @@ export function assertAllowedPath(path: string, allowedRoots: string[]): string 
     return resolvedPath;
   }
 
-  throw new AccessDeniedError(`Path is outside allowed roots: ${path}`);
+  throw new AccessDeniedError(`Path is outside allowed roots: ${path}`, path);
 }
 
 export function resolveAllowedPath(inputPath: string, cwd: string, allowedRoots: string[]): string {
@@ -65,7 +72,7 @@ export async function resolveCanonicalAllowedPath(
     if (isPathInsideRoot(canonicalPath, canonicalRoot)) return canonicalPath;
   }
 
-  throw new AccessDeniedError(`Path is outside allowed roots: ${inputPath}`);
+  throw new AccessDeniedError(`Path is outside allowed roots: ${inputPath}`, inputPath);
 }
 
 export async function resolvePathInsideCanonicalRoot(
@@ -77,7 +84,7 @@ export async function resolvePathInsideCanonicalRoot(
   const absolutePath = resolveAllowedPath(inputPath, cwd, [logicalRoot]);
   const canonicalPath = await canonicalizePath(absolutePath);
   if (isPathInsideRoot(canonicalPath, canonicalRoot)) return canonicalPath;
-  throw new AccessDeniedError(`Path is outside allowed roots: ${inputPath}`);
+  throw new AccessDeniedError(`Path is outside allowed roots: ${inputPath}`, inputPath);
 }
 
 async function canonicalizePath(path: string): Promise<string> {
@@ -95,7 +102,7 @@ async function canonicalizePath(path: string): Promise<string> {
       try {
         const stats = await lstat(candidate);
         if (stats.isSymbolicLink()) {
-          throw new AccessDeniedError(`Cannot resolve symbolic link: ${path}`);
+          throw new AccessDeniedError(`Cannot resolve symbolic link: ${path}`, path);
         }
       } catch (lstatError) {
         if (!isMissingPathError(lstatError)) throw lstatError;

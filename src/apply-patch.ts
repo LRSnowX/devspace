@@ -5,6 +5,11 @@ import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { TextDecoder } from "node:util";
 import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
 import { FILE_REVISION_PATTERN, fileRevision } from "./file-revision.js";
+import {
+  ToolOperationError,
+  type ToolErrorCode,
+  type ToolErrorPayload,
+} from "./tool-errors.js";
 
 export type PatchOperation = "add" | "update" | "delete" | "move";
 
@@ -76,8 +81,32 @@ type FileIdentity = Pick<Stats, "dev" | "ino">;
 type FileIdentityReader = (path: string) => Promise<FileIdentity>;
 const patchLocks = new Map<string, Promise<void>>();
 
-function patchError(message: string): Error {
-  return new Error(`Invalid patch: ${message}`);
+function patchError(
+  message: string,
+  code: ToolErrorCode = "PATCH_INVALID",
+  fields: Omit<ToolErrorPayload, "code" | "category" | "message" | "retryable"> = {},
+  options: ErrorOptions = {},
+): ToolOperationError {
+  const category =
+    code === "REVISION_CONFLICT" || code === "CONCURRENT_MODIFICATION"
+      ? "conflict"
+      : code === "ROLLBACK_FAILED"
+        ? "recovery"
+        : code === "PATH_SCOPE_VIOLATION"
+          ? "scope"
+          : "invalid_request";
+  const retryable =
+    code === "REVISION_CONFLICT" || code === "CONCURRENT_MODIFICATION";
+  return new ToolOperationError(
+    {
+      code,
+      category,
+      message: `Invalid patch: ${message}`,
+      retryable,
+      ...fields,
+    },
+    options,
+  );
 }
 
 export function parsePatch(patch: string): PatchAction[] {
@@ -223,13 +252,21 @@ function isInside(root: string, path: string): boolean {
 
 async function resolveConfinedPath(root: string, input: string): Promise<string> {
   if (!input || input.includes("\0") || isAbsolute(input)) {
-    throw patchError(`path must be relative to the workspace: ${input}`);
+    throw patchError(
+      `path must be relative to the workspace: ${input}`,
+      "PATH_SCOPE_VIOLATION",
+      { path: input },
+    );
   }
 
   const rootPath = await realpath(root);
   const target = resolve(rootPath, input);
   if (!isInside(rootPath, target)) {
-    throw patchError(`path escapes the workspace: ${input}`);
+    throw patchError(
+      `path escapes the workspace: ${input}`,
+      "PATH_SCOPE_VIOLATION",
+      { path: input },
+    );
   }
 
   let existing = target;
@@ -237,7 +274,11 @@ async function resolveConfinedPath(root: string, input: string): Promise<string>
     try {
       const resolved = await realpath(existing);
       if (!isInside(rootPath, resolved)) {
-        throw patchError(`path resolves outside the workspace: ${input}`);
+        throw patchError(
+          `path resolves outside the workspace: ${input}`,
+          "PATH_SCOPE_VIOLATION",
+          { path: input },
+        );
       }
       break;
     } catch (error) {
@@ -412,6 +453,12 @@ async function applyPatchUnlocked(
           `expected ${expectation.revision}`,
           `current ${file?.revision ?? "<missing>"}`,
         ].join(": "),
+        "REVISION_CONFLICT",
+        {
+          path: expectation.path || displayPath,
+          expected_revision: expectation.revision,
+          current_revision: file?.revision,
+        },
       );
     }
   };
@@ -636,7 +683,7 @@ async function publishStagedPatch(
     const originalMessage = error instanceof Error ? error.message : String(error);
     if (rollbackErrors.length > 0) {
       const recoveryFiles = [...preparedOriginals.values()].map(({ path }) => path);
-      throw new Error(
+      throw patchError(
         [
           originalMessage,
           `rollback failed: ${rollbackErrors.join("; ")}`,
@@ -647,12 +694,18 @@ async function publishStagedPatch(
             ? `cleanup failed: ${cleanupErrors.join("; ")}`
             : undefined,
         ].filter(Boolean).join("; "),
+        "ROLLBACK_FAILED",
+        {
+          recovery_files: recoveryFiles.length > 0 ? recoveryFiles : undefined,
+        },
         { cause: error },
       );
     }
     if (cleanupErrors.length > 0) {
-      throw new Error(
+      throw patchError(
         `${originalMessage}; cleanup failed after rollback: ${cleanupErrors.join("; ")}`,
+        "ROLLBACK_FAILED",
+        {},
         { cause: error },
       );
     }
@@ -713,7 +766,11 @@ async function assertPatchBaseline(
 ): Promise<void> {
   const actual = await readOptionalTextFile(absolute, displayPath);
   if (!sameTextFile(actual, expected)) {
-    throw patchError(`file changed during patch application: ${displayPath}`);
+    throw patchError(
+      `file changed during patch application: ${displayPath}`,
+      "CONCURRENT_MODIFICATION",
+      { path: displayPath },
+    );
   }
 }
 
@@ -732,7 +789,11 @@ async function shouldRestorePublishedPath(
   if (!completed && actual === null) {
     return original !== null;
   }
-  throw patchError(`published file changed before rollback: ${displayPath}`);
+  throw patchError(
+    `published file changed before rollback: ${displayPath}`,
+    "CONCURRENT_MODIFICATION",
+    { path: displayPath },
+  );
 }
 
 function sameTextFile(
