@@ -253,4 +253,5 @@ When Memory is configured:
 - [File revision design](file-revision-design.md)
 - [Tool error contract](tool-error-contract.md)
 - [Runtime gap assessment](runtime-gap-assessment.md)
+- [Patch crash recovery design](patch-crash-recovery-design.md)
 

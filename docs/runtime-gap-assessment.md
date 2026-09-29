@@ -34,6 +34,11 @@ persistent transaction journal, recovery protocol, startup reconciliation, and
 cross-platform tests. This is materially larger than ordinary patch hardening
 and should not be implemented without a separate design review.
 
+The design review is now captured in
+[Patch crash recovery design](patch-crash-recovery-design.md). The first
+implementation should target process-crash/service-restart recovery only, not
+power-loss durability.
+
 ## Priority 2: structured errors for the remaining coding surface
 
 Codex `apply_patch` has a host-compatible structured domain-error contract.
