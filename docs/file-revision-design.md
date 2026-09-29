@@ -67,7 +67,9 @@ Callers should send the revision returned by `read` whenever a patch depends on
 that earlier read. Add-only paths that were never read do not require an
 expectation.
 
-This phase does not add an "absent path" revision token.
+This phase does not add an "absent path" precondition. That remains a known
+gap for add/overwrite workflows and is tracked separately from content
+revisions.
 
 ## Relationship to transactional publication
 
@@ -82,8 +84,9 @@ All three remain necessary.
 
 ## Errors
 
-Revision conflicts use the current tool error channel. A unified structured
-error taxonomy remains a later concern.
+Revision conflicts now use the structured Codex `apply_patch` error contract:
+`status: "error"` with `error.code: "REVISION_CONFLICT"`, including
+`expected_revision` and `current_revision` when available.
 
 ## Non-goals
 

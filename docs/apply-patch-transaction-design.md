@@ -1,8 +1,8 @@
 # Transactional apply_patch design
 
-This document is the implementation preflight for strengthening DevSpace's
+This document records the design that led to DevSpace's transactional
 `apply_patch` publication semantics. It separates in-call transaction safety
-from a future model-visible stale-read contract.
+from the model-visible stale-read contract implemented later.
 
 ## Goal
 
@@ -17,11 +17,12 @@ mode, and line-ending behavior must remain compatible.
 
 ## Non-goals
 
-This phase does not add:
+This transaction phase did not itself add:
 
-- a model-facing revision or `expected_revision` field;
+- the model-facing revision contract;
 - protection against a file changing after an earlier `read` but before the
-  later `apply_patch` call begins;
+  later `apply_patch` call begins; that is now provided separately by
+  `read.revision` plus `apply_patch.expected_revisions`;
 - process-crash or power-loss recovery;
 - isolation from other processes observing temporary commit-state changes;
 - a new model-facing tool or structured error taxonomy.
@@ -43,8 +44,9 @@ Publication may fail because of permissions, filesystem errors, locks, full
 storage, or another process changing a touched path.
 
 Before replacing originals, DevSpace re-checks the first-touch baseline for all
-touched paths. This only detects changes that happen during the current
-`apply_patch` call; it is not the future stale-read contract.
+touched paths. This detects changes that happen during the current
+`apply_patch` call; the separate revision contract covers changes between an
+earlier model read and the later patch call.
 
 For publication, DevSpace prepares same-directory rollback copies from each
 first-touch baseline and same-directory temporary files for final content.
@@ -95,20 +97,16 @@ checked again immediately before its mutation, so a conflict detected after
 earlier paths were published triggers rollback.
 
 This closes the race between staging and publication within one
-`apply_patch` invocation.
+`apply_patch` invocation. The later file-revision contract closes the
+`read -> user/tool changes file -> later apply_patch` race when the caller
+supplies the returned revision.
 
-It does **not** close this race:
+## Stale-read contract added later
 
-`read -> user/tool changes file -> later apply_patch`.
+The later revision phase made stale-read protection explicit rather than
+inferring it from patch context.
 
-That requires a model-visible revision contract.
-
-## Future stale-read contract
-
-A later phase should make stale-read protection explicit rather than infer it
-from patch context.
-
-The intended shape is:
+The implemented shape is:
 
 - successful `read` exposes a stable content revision token in structured
   output;
@@ -121,8 +119,7 @@ Multi-file patches require per-path expected revisions rather than one global
 workspace revision.
 
 The existing accepted-but-ignored Codex `*** Environment ID:` patch header is
-not a revision contract and should remain unrelated unless a real host
-compatibility requirement establishes otherwise.
+not part of this revision contract.
 
 ## Cross-platform publication
 

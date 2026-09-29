@@ -241,4 +241,5 @@ When Memory is configured:
 - [Transactional apply_patch design](apply-patch-transaction-design.md)
 - [File revision design](file-revision-design.md)
 - [Tool error contract](tool-error-contract.md)
+- [Runtime gap assessment](runtime-gap-assessment.md)
 
