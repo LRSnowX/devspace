@@ -1,5 +1,6 @@
 import * as z from "zod/v4";
 import { applyPatch } from "../apply-patch.js";
+import { FILE_REVISION_PATTERN } from "../file-revision.js";
 import {
   MAX_PROCESS_YIELD_MS,
   type ProcessSnapshot,
@@ -85,13 +86,29 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
     {
       title: "Apply patch",
       description:
-        "Apply one Codex-style patch to add, overwrite, update, delete, or move workspace files. Paths must be relative to the workspace.",
+        "Apply one Codex-style patch to add, overwrite, update, delete, or move workspace files. Paths must be relative to the workspace. When a patch relies on a prior read, pass that read's revision in expected_revisions so stale files are rejected before publication.",
       inputSchema: {
         workspace_id: z.string().describe(workspaceIdDescription),
         patch: z
           .string()
           .describe(
             "Patch text enclosed by *** Begin Patch and *** End Patch markers.",
+          ),
+        expected_revisions: z
+          .array(
+            z.object({
+              path: z
+                .string()
+                .describe("Workspace-relative file path whose prior read the patch relies on."),
+              revision: z
+                .string()
+                .regex(FILE_REVISION_PATTERN)
+                .describe("Revision returned by read for this file."),
+            }),
+          )
+          .optional()
+          .describe(
+            "Prior read revisions to require before publication. Every supplied path must be touched by this patch.",
           ),
       },
       outputSchema: resultOutputSchema({
@@ -107,7 +124,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
       }),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspace_id, patch }) => {
+    async ({ workspace_id, patch, expected_revisions }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
       const applied = await runLoggedToolOperation(
@@ -116,7 +133,9 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
         startedAt,
         async () => {
           const workspace = await workspaces.getWorkspace(workspaceId);
-          return applyPatch(workspace.root, patch);
+          return applyPatch(workspace.root, patch, {
+            expectedRevisions: expected_revisions,
+          });
         },
       );
       const paths = applied.files.map((file) => file.path).join(", ");

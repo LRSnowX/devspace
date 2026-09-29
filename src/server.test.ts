@@ -86,18 +86,131 @@ test("Codex process tools bound model-facing yield windows to 12 seconds", async
   }
 });
 
-test("Codex apply_patch has no stale-read revision contract yet", async (t) => {
+test("Codex read and apply_patch expose the stale-read revision contract", async (t) => {
   const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
   const tools = await context.client.listTools();
-  const tool = tools.tools.find(({ name }) => name === "apply_patch");
-  const inputProperties = tool?.inputSchema?.properties ?? {};
-  const outputProperties = (tool?.outputSchema as {
+  const readTool = tools.tools.find(({ name }) => name === "read");
+  const patchTool = tools.tools.find(({ name }) => name === "apply_patch");
+  const patchInputProperties = patchTool?.inputSchema?.properties ?? {};
+  const readOutputProperties = (readTool?.outputSchema as {
     properties?: Record<string, unknown>;
   } | undefined)?.properties ?? {};
 
-  assert.deepEqual(Object.keys(inputProperties).sort(), ["patch", "workspace_id"]);
-  assert.equal("expected_revision" in inputProperties, false);
-  assert.equal("revision" in outputProperties, false);
+  assert.deepEqual(
+    Object.keys(patchInputProperties).sort(),
+    ["expected_revisions", "patch", "workspace_id"],
+  );
+  assert.equal("revision" in readOutputProperties, true);
+
+  const expectedRevisions = patchInputProperties.expected_revisions as {
+    items?: {
+      properties?: Record<string, unknown>;
+    };
+  } | undefined;
+  assert.deepEqual(
+    Object.keys(expectedRevisions?.items?.properties ?? {}).sort(),
+    ["path", "revision"],
+  );
+});
+
+test("read revisions reject stale Codex patches before publication", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
+  const workspaceId = structuredContent(
+    await callOpen(context.client, context.project, "revision-protection"),
+  ).workspace_id;
+  assert.equal(typeof workspaceId, "string");
+
+  await writeFile(join(context.project, "note.txt"), "original\nshared\n");
+
+  const firstPage = structuredContent(await context.client.callTool({
+    name: "read",
+    arguments: {
+      workspace_id: workspaceId,
+      path: "note.txt",
+      offset: 1,
+      limit: 1,
+    },
+  }));
+  const secondPage = structuredContent(await context.client.callTool({
+    name: "read",
+    arguments: {
+      workspace_id: workspaceId,
+      path: "note.txt",
+      offset: 2,
+      limit: 1,
+    },
+  }));
+  assert.match(String(firstPage.revision), /^sha256:[0-9a-f]{64}$/);
+  assert.equal(firstPage.revision, secondPage.revision);
+
+  await writeFile(join(context.project, "note.txt"), "external\nshared\n");
+  const stale = await context.client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspace_id: workspaceId,
+      patch: [
+        "*** Begin Patch",
+        "*** Update File: note.txt",
+        "@@",
+        "-shared",
+        "+patched",
+        "*** End Patch",
+      ].join("\n"),
+      expected_revisions: [{
+        path: "note.txt",
+        revision: firstPage.revision,
+      }],
+    },
+  });
+  assert.equal(stale.isError, true);
+  const staleContent = stale.content as Array<{
+    type: string;
+    text?: string;
+  }>;
+  assert.match(
+    staleContent
+      .filter((item) => item.type === "text" && typeof item.text === "string")
+      .map((item) => item.text ?? "")
+      .join("\n"),
+    /stale file revision for note\.txt/,
+  );
+  assert.equal(
+    await readFile(join(context.project, "note.txt"), "utf8"),
+    "external\nshared\n",
+  );
+
+  const refreshed = structuredContent(await context.client.callTool({
+    name: "read",
+    arguments: {
+      workspace_id: workspaceId,
+      path: "note.txt",
+    },
+  }));
+  assert.notEqual(refreshed.revision, firstPage.revision);
+
+  const applied = await context.client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspace_id: workspaceId,
+      patch: [
+        "*** Begin Patch",
+        "*** Update File: note.txt",
+        "@@",
+        "-shared",
+        "+patched",
+        "*** End Patch",
+      ].join("\n"),
+      expected_revisions: [{
+        path: "note.txt",
+        revision: refreshed.revision,
+      }],
+    },
+  });
+  assert.equal(applied.isError, undefined);
+  assert.equal(
+    await readFile(join(context.project, "note.txt"), "utf8"),
+    "external\npatched\n",
+  );
 });
 
 test("Claude edit and bash tools accept snake_case runtime inputs", async (t) => {

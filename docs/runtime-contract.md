@@ -78,6 +78,9 @@ the corresponding regression coverage in the same change.
 - If a later publication step fails while DevSpace remains alive, already
   published paths are rolled back in reverse order when their published state
   is still intact.
+- A patch may provide per-path `expected_revisions` returned by prior
+  `read` calls. A mismatch is rejected before publication, even when the
+  patch's hunk context would otherwise still match.
 - Existing file mode and line-ending behavior are preserved where the current
   implementation supports them.
 - Results report affected files and aggregate addition/removal counts.
@@ -90,9 +93,32 @@ the corresponding regression coverage in the same change.
   or rollback failure can leave recovery work. When rollback is blocked by an
   external mutation, DevSpace refuses to overwrite that newer state and reports
   the rollback failure; unused recovery files are retained where possible.
-- There is no read-version, expected-revision, or equivalent stale-read
-  contract. A patch proves that its context matches when the patch is applied;
-  it does not prove that the file is unchanged since an earlier model read.
+- `expected_revisions` is optional for compatibility. A caller that omits a
+  revision does not receive stale-read protection for that earlier read.
+- There is currently no revision token for proving that a path was absent at
+  an earlier point in time.
+
+## File revisions
+
+### Guarantees
+
+- Every successful `read` exposes `revision` in structured output.
+- A revision is `sha256:<64 lowercase hex characters>` over the complete raw
+  file bytes consumed by that read.
+- Pagination does not change revision identity: unchanged pages from one file
+  share the same full-file revision.
+- Codex `apply_patch` accepts optional per-path
+  `expected_revisions: [{ path, revision }]`.
+- Every supplied expected-revision path must be touched by the patch.
+- Revision validation happens while building the staged logical view, before
+  destructive publication.
+
+### Current limitations
+
+- Revisions protect `read -> later apply_patch`; they do not make
+  `write`, `edit`, or shell commands revision-aware.
+- Revisions represent content identity, not Git commits, mtimes, inode
+  identity, or a workspace-wide version.
 
 ## Process lifecycle
 
@@ -194,4 +220,6 @@ When Memory is configured:
 - [Configuration reference](configuration.md)
 - [ChatGPT coding workflow](chatgpt-coding-workflow.md)
 - [Development and manual QA](development.md)
+- [Transactional apply_patch design](apply-patch-transaction-design.md)
+- [File revision design](file-revision-design.md)
 

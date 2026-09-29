@@ -33,6 +33,7 @@ import {
   requestPath,
 } from "./logger.js";
 import { readFileTool } from "./pi-tools.js";
+import { FILE_REVISION_PATTERN } from "./file-revision.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import {
   compileMcpRegistrationSurface,
@@ -781,6 +782,7 @@ function registerMcpSurface(
       description:
         [
           "Read all or part of a file in a workspace.",
+          "Successful reads return a revision for the complete file; pass it to apply_patch expected_revisions when a patch relies on this read.",
           "Use this tool to inspect relevant AGENTS.md or CLAUDE.md files listed by open_workspace before working in nested directories.",
           config.skillsEnabled
             ? "If available skills were returned and a task matches one, read the returned skill path before proceeding."
@@ -812,7 +814,12 @@ function registerMcpSurface(
           .optional()
           .describe("Maximum number of lines to read."),
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: resultOutputSchema({
+        revision: z
+          .string()
+          .regex(FILE_REVISION_PATTERN)
+          .describe("SHA-256 revision of the complete file bytes read."),
+      }),
       annotations: { readOnlyHint: true },
     },
     async ({ workspace_id, ...input }) => {
@@ -834,6 +841,11 @@ function registerMcpSurface(
         return response;
       }
 
+      const revision = response.details?.revision;
+      if (!revision) {
+        throw new Error(`Read succeeded without a file revision: ${input.path}`);
+      }
+
       logToolCall(config, {
         tool: toolNames.read,
         workspaceId,
@@ -846,6 +858,7 @@ function registerMcpSurface(
         ...response,
         structuredContent: {
           result: contentText(response.content),
+          revision,
         },
       };
     },

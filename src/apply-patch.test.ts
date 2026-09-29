@@ -3,6 +3,7 @@ import { chmod, mkdtemp, readFile, readdir, stat, symlink, writeFile } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyPatch, isSamePatchFile, parsePatch, replaceFile } from "./apply-patch.js";
+import { fileRevision } from "./file-revision.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-apply-patch-"));
 const replacement = join(root, "replacement.txt");
@@ -61,6 +62,98 @@ assert.equal(await readFile(join(root, "nested/added.txt"), "utf8"), "new\nfile\
 assert.equal(await readFile(join(root, "alpha.txt"), "utf8"), "one\nchanged\nthree\n");
 assert.equal(await readFile(join(root, "windows.txt"), "utf8"), "first\r\nupdated\r\n");
 await assert.rejects(readFile(join(root, "remove.txt"), "utf8"), /ENOENT/);
+
+const revisionRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-revision-"));
+await writeFile(join(revisionRoot, "file.txt"), "original\nshared\n");
+const originalRevision = fileRevision(Buffer.from("original\nshared\n"));
+await writeFile(join(revisionRoot, "file.txt"), "external\nshared\n");
+await assert.rejects(
+  applyPatch(
+    revisionRoot,
+    `*** Begin Patch
+*** Update File: file.txt
+@@
+-shared
++patched
+*** End Patch`,
+    {
+      expectedRevisions: [{ path: "file.txt", revision: originalRevision }],
+    },
+  ),
+  /stale file revision for file\.txt/,
+);
+assert.equal(
+  await readFile(join(revisionRoot, "file.txt"), "utf8"),
+  "external\nshared\n",
+);
+
+const currentRevision = fileRevision(Buffer.from("external\nshared\n"));
+await applyPatch(
+  revisionRoot,
+  `*** Begin Patch
+*** Update File: file.txt
+@@
+-shared
++patched
+*** End Patch`,
+  {
+    expectedRevisions: [{ path: "file.txt", revision: currentRevision }],
+  },
+);
+assert.equal(
+  await readFile(join(revisionRoot, "file.txt"), "utf8"),
+  "external\npatched\n",
+);
+
+const multiRevisionRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-multi-revision-"));
+await writeFile(join(multiRevisionRoot, "first.txt"), "first old\n");
+await writeFile(join(multiRevisionRoot, "second.txt"), "second old\n");
+const firstRevision = fileRevision(Buffer.from("first old\n"));
+const staleSecondRevision = fileRevision(Buffer.from("second older\n"));
+await assert.rejects(
+  applyPatch(
+    multiRevisionRoot,
+    `*** Begin Patch
+*** Update File: first.txt
+@@
+-first old
++first new
+*** Update File: second.txt
+@@
+-second old
++second new
+*** End Patch`,
+    {
+      expectedRevisions: [
+        { path: "first.txt", revision: firstRevision },
+        { path: "second.txt", revision: staleSecondRevision },
+      ],
+    },
+  ),
+  /stale file revision for second\.txt/,
+);
+assert.equal(await readFile(join(multiRevisionRoot, "first.txt"), "utf8"), "first old\n");
+assert.equal(await readFile(join(multiRevisionRoot, "second.txt"), "utf8"), "second old\n");
+
+await assert.rejects(
+  applyPatch(
+    multiRevisionRoot,
+    `*** Begin Patch
+*** Update File: first.txt
+@@
+-first old
++first new
+*** End Patch`,
+    {
+      expectedRevisions: [{
+        path: "second.txt",
+        revision: fileRevision(Buffer.from("second old\n")),
+      }],
+    },
+  ),
+  /expected revision path is not touched by patch: second\.txt/,
+);
+assert.equal(await readFile(join(multiRevisionRoot, "first.txt"), "utf8"), "first old\n");
 
 const rollbackRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-rollback-"));
 await writeFile(join(rollbackRoot, "first.txt"), "first old\n");

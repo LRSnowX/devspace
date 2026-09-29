@@ -4,6 +4,7 @@ import { access, lstat, mkdir, readFile, realpath, rename, rm, rmdir, stat, writ
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { TextDecoder } from "node:util";
 import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
+import { FILE_REVISION_PATTERN, fileRevision } from "./file-revision.js";
 
 export type PatchOperation = "add" | "update" | "delete" | "move";
 
@@ -20,7 +21,13 @@ export interface ApplyPatchResult {
   removals: number;
 }
 
+export interface ExpectedFileRevision {
+  path: string;
+  revision: string;
+}
+
 export interface ApplyPatchOptions {
+  expectedRevisions?: readonly ExpectedFileRevision[];
   beforeCommit?: (input: {
     paths: readonly string[];
     files: readonly AppliedPatchFile[];
@@ -54,6 +61,7 @@ type PatchAction =
 interface TextFile {
   content: string;
   mode?: number;
+  revision: string;
 }
 
 type StagedTextFile = TextFile | null;
@@ -378,15 +386,40 @@ async function applyPatchUnlocked(
   options: ApplyPatchOptions,
 ): Promise<ApplyPatchResult> {
   const actions = parsePatch(patch);
+  const expectedRevisions = await resolveExpectedRevisions(
+    root,
+    options.expectedRevisions ?? [],
+  );
+  const checkedExpectedRevisions = new Set<string>();
   const results: AppliedPatchFile[] = [];
   const patches: string[] = [];
   const staged = new Map<string, StagedTextFile>();
   const originals = new Map<string, StagedTextFile>();
   const displayPaths = new Map<string, string>();
 
+  const validateExpectedRevision = (
+    absolute: string,
+    file: StagedTextFile,
+    displayPath: string,
+  ): void => {
+    const expectation = expectedRevisions.get(absolute);
+    if (!expectation) return;
+    checkedExpectedRevisions.add(absolute);
+    if (!file || file.revision !== expectation.revision) {
+      throw patchError(
+        [
+          `stale file revision for ${expectation.path || displayPath}`,
+          `expected ${expectation.revision}`,
+          `current ${file?.revision ?? "<missing>"}`,
+        ].join(": "),
+      );
+    }
+  };
+
   const readStagedOptional = async (absolute: string, displayPath: string): Promise<StagedTextFile> => {
     if (staged.has(absolute)) return staged.get(absolute) ?? null;
     const file = await readOptionalTextFile(absolute, displayPath);
+    validateExpectedRevision(absolute, file, displayPath);
     originals.set(absolute, file);
     displayPaths.set(absolute, displayPath);
     staged.set(absolute, file);
@@ -403,7 +436,7 @@ async function applyPatchUnlocked(
     if (action.kind === "add") {
       const absolute = await resolveConfinedPath(root, action.path);
       const original = await readStagedOptional(absolute, action.path);
-      staged.set(absolute, { content: action.content, mode: original?.mode });
+      staged.set(absolute, stagedTextFile(action.content, original?.mode));
       patches.push(unifiedFilePatch(action.path, action.path, original?.content ?? null, action.content));
       results.push({ path: action.path, operation: original ? "update" : "add" });
       continue;
@@ -425,18 +458,27 @@ async function applyPatchUnlocked(
       const samePatchFile = await isSamePatchFile(absolute, destination);
       if (!samePatchFile) await readStagedOptional(destination, action.moveTo);
       else if (!originals.has(destination)) {
+        validateExpectedRevision(destination, file, action.moveTo);
         originals.set(destination, originals.get(absolute) ?? file);
         displayPaths.set(destination, action.moveTo);
       }
       if (samePatchFile) staged.delete(absolute);
-      staged.set(destination, { content: updated, mode: file.mode });
+      staged.set(destination, stagedTextFile(updated, file.mode));
       if (!samePatchFile) staged.set(absolute, null);
       patches.push(unifiedFilePatch(action.path, action.moveTo, file.content, updated));
       results.push({ path: action.moveTo, previousPath: action.path, operation: "move" });
     } else {
-      staged.set(absolute, { content: updated, mode: file.mode });
+      staged.set(absolute, stagedTextFile(updated, file.mode));
       patches.push(unifiedFilePatch(action.path, action.path, file.content, updated));
       results.push({ path: action.path, operation: "update" });
+    }
+  }
+
+  for (const [absolute, expectation] of expectedRevisions) {
+    if (!checkedExpectedRevisions.has(absolute)) {
+      throw patchError(
+        `expected revision path is not touched by patch: ${expectation.path}`,
+      );
     }
   }
 
@@ -445,6 +487,33 @@ async function applyPatchUnlocked(
   const unifiedPatch = patches.filter(Boolean).join("\n");
   const stats = countPatchStats(unifiedPatch);
   return { files: results, patch: unifiedPatch, ...stats };
+}
+
+async function resolveExpectedRevisions(
+  root: string,
+  expected: readonly ExpectedFileRevision[],
+): Promise<Map<string, ExpectedFileRevision>> {
+  const resolved = new Map<string, ExpectedFileRevision>();
+  for (const entry of expected) {
+    if (!FILE_REVISION_PATTERN.test(entry.revision)) {
+      throw patchError(`invalid file revision for ${entry.path}: ${entry.revision}`);
+    }
+    const absolute = await resolveConfinedPath(root, entry.path);
+    const existing = resolved.get(absolute);
+    if (existing && existing.revision !== entry.revision) {
+      throw patchError(`conflicting expected revisions for ${entry.path}`);
+    }
+    resolved.set(absolute, entry);
+  }
+  return resolved;
+}
+
+function stagedTextFile(content: string, mode?: number): TextFile {
+  return {
+    content,
+    mode,
+    revision: fileRevision(Buffer.from(content, "utf8")),
+  };
 }
 
 async function withPatchLock<T>(
@@ -672,7 +741,7 @@ function sameTextFile(
   options: { ignoreModeWhenExpectedMissing?: boolean } = {},
 ): boolean {
   if (actual === null || expected === null) return actual === expected;
-  if (actual.content !== expected.content) return false;
+  if (actual.revision !== expected.revision) return false;
   if (expected.mode === undefined && options.ignoreModeWhenExpectedMissing) return true;
   return actual.mode === expected.mode;
 }
@@ -756,11 +825,15 @@ async function readOptionalTextFile(absolute: string, displayPath: string): Prom
   if (!(await fileExists(absolute))) return null;
   const metadata = await stat(absolute);
   if (!metadata.isFile()) throw patchError(`path is not a regular file: ${displayPath}`);
-  return { content: await readUtf8Text(absolute, displayPath), mode: metadata.mode };
+  const bytes = await readFile(absolute);
+  return {
+    content: decodeUtf8Text(bytes, displayPath),
+    mode: metadata.mode,
+    revision: fileRevision(bytes),
+  };
 }
 
-async function readUtf8Text(absolute: string, displayPath: string): Promise<string> {
-  const bytes = await readFile(absolute);
+function decodeUtf8Text(bytes: Uint8Array, displayPath: string): string {
   let content: string;
   try {
     content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
