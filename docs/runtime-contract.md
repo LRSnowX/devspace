@@ -71,16 +71,25 @@ the corresponding regression coverage in the same change.
 - Patch actions are evaluated against a staged logical view, so later actions
   in the same patch can operate on results produced by earlier actions.
 - Hunk/context failures are detected before staged changes are published.
+- Concurrent `apply_patch` calls for the same workspace root are serialized
+  inside one DevSpace process.
+- Before destructive publication, touched paths are rechecked against the
+  state first observed by that `apply_patch` call.
+- If a later publication step fails while DevSpace remains alive, already
+  published paths are rolled back in reverse order when their published state
+  is still intact.
 - Existing file mode and line-ending behavior are preserved where the current
   implementation supports them.
 - Results report affected files and aggregate addition/removal counts.
 
 ### Current limitations
 
-- Publication is not a multi-file filesystem transaction. If a later
-  publication or deletion fails after an earlier file has already been
-  published, DevSpace does not currently guarantee automatic rollback of the
-  earlier file.
+- Multi-file publication is not database-style atomic visibility. Another
+  process may observe intermediate file states while one patch is committing.
+- Transaction rollback is not crash-safe. Process termination, machine failure,
+  or rollback failure can leave recovery work. When rollback is blocked by an
+  external mutation, DevSpace refuses to overwrite that newer state and reports
+  the rollback failure; unused recovery files are retained where possible.
 - There is no read-version, expected-revision, or equivalent stale-read
   contract. A patch proves that its context matches when the patch is applied;
   it does not prove that the file is unchanged since an earlier model read.

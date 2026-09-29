@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, readdir, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { applyPatch, isSamePatchFile, parsePatch, replaceFile } from "./apply-patch.js";
@@ -61,6 +61,202 @@ assert.equal(await readFile(join(root, "nested/added.txt"), "utf8"), "new\nfile\
 assert.equal(await readFile(join(root, "alpha.txt"), "utf8"), "one\nchanged\nthree\n");
 assert.equal(await readFile(join(root, "windows.txt"), "utf8"), "first\r\nupdated\r\n");
 await assert.rejects(readFile(join(root, "remove.txt"), "utf8"), /ENOENT/);
+
+const rollbackRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-rollback-"));
+await writeFile(join(rollbackRoot, "first.txt"), "first old\n");
+await writeFile(join(rollbackRoot, "second.txt"), "second old\n");
+await assert.rejects(
+  applyPatch(
+    rollbackRoot,
+    `*** Begin Patch
+*** Update File: first.txt
+@@
+-first old
++first new
+*** Update File: second.txt
+@@
+-second old
++second new
+*** End Patch`,
+    {
+      beforePublish: ({ path }) => {
+        if (path === "second.txt") throw new Error("injected publish failure");
+      },
+    },
+  ),
+  /injected publish failure/,
+);
+assert.equal(await readFile(join(rollbackRoot, "first.txt"), "utf8"), "first old\n");
+assert.equal(await readFile(join(rollbackRoot, "second.txt"), "utf8"), "second old\n");
+assert.deepEqual(
+  (await readdir(rollbackRoot)).filter((name) => name.includes(".devspace-patch-")),
+  [],
+);
+
+const deleteRollbackRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-delete-rollback-"));
+await writeFile(join(deleteRollbackRoot, "first.txt"), "first\n");
+await writeFile(join(deleteRollbackRoot, "second.txt"), "second\n");
+await assert.rejects(
+  applyPatch(
+    deleteRollbackRoot,
+    `*** Begin Patch
+*** Delete File: first.txt
+*** Delete File: second.txt
+*** End Patch`,
+    {
+      beforePublish: ({ path }) => {
+        if (path === "second.txt") throw new Error("injected delete failure");
+      },
+    },
+  ),
+  /injected delete failure/,
+);
+assert.equal(await readFile(join(deleteRollbackRoot, "first.txt"), "utf8"), "first\n");
+assert.equal(await readFile(join(deleteRollbackRoot, "second.txt"), "utf8"), "second\n");
+
+const moveRollbackRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-move-rollback-"));
+await writeFile(join(moveRollbackRoot, "source.txt"), "source old\n");
+await writeFile(join(moveRollbackRoot, "destination.txt"), "destination old\n");
+await writeFile(join(moveRollbackRoot, "later.txt"), "later old\n");
+await assert.rejects(
+  applyPatch(
+    moveRollbackRoot,
+    `*** Begin Patch
+*** Add File: nested/new.txt
++new file
+*** Update File: source.txt
+*** Move to: destination.txt
+@@
+-source old
++source moved
+*** Update File: later.txt
+@@
+-later old
++later new
+*** End Patch`,
+    {
+      beforePublish: ({ path }) => {
+        if (path === "later.txt") throw new Error("injected move rollback failure");
+      },
+    },
+  ),
+  /injected move rollback failure/,
+);
+assert.equal(await readFile(join(moveRollbackRoot, "source.txt"), "utf8"), "source old\n");
+assert.equal(
+  await readFile(join(moveRollbackRoot, "destination.txt"), "utf8"),
+  "destination old\n",
+);
+assert.equal(await readFile(join(moveRollbackRoot, "later.txt"), "utf8"), "later old\n");
+await assert.rejects(readFile(join(moveRollbackRoot, "nested", "new.txt"), "utf8"), /ENOENT/);
+await assert.rejects(stat(join(moveRollbackRoot, "nested")), /ENOENT/);
+
+const baselineConflictRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-baseline-conflict-"));
+await writeFile(join(baselineConflictRoot, "file.txt"), "original\n");
+await assert.rejects(
+  applyPatch(
+    baselineConflictRoot,
+    `*** Begin Patch
+*** Update File: file.txt
+@@
+-original
++patched
+*** End Patch`,
+    {
+      beforeCommit: async () => {
+        await writeFile(join(baselineConflictRoot, "file.txt"), "external\n");
+      },
+    },
+  ),
+  /file changed during patch application/,
+);
+assert.equal(await readFile(join(baselineConflictRoot, "file.txt"), "utf8"), "external\n");
+
+const rollbackConflictRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-rollback-conflict-"));
+await writeFile(join(rollbackConflictRoot, "first.txt"), "first old\n");
+await writeFile(join(rollbackConflictRoot, "second.txt"), "second old\n");
+await assert.rejects(
+  applyPatch(
+    rollbackConflictRoot,
+    `*** Begin Patch
+*** Update File: first.txt
+@@
+-first old
++first new
+*** Update File: second.txt
+@@
+-second old
++second new
+*** End Patch`,
+    {
+      beforePublish: async ({ path }) => {
+        if (path !== "second.txt") return;
+        await writeFile(join(rollbackConflictRoot, "first.txt"), "external after publish\n");
+        throw new Error("trigger rollback");
+      },
+    },
+  ),
+  (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.match(
+      error.message,
+      /rollback failed: first\.txt: Invalid patch: published file changed before rollback/,
+    );
+    assert.match(error.message, /recovery files retained:/);
+    return true;
+  },
+);
+assert.equal(
+  await readFile(join(rollbackConflictRoot, "first.txt"), "utf8"),
+  "external after publish\n",
+);
+assert.equal(await readFile(join(rollbackConflictRoot, "second.txt"), "utf8"), "second old\n");
+
+const concurrentRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-concurrent-"));
+await writeFile(join(concurrentRoot, "file.txt"), "zero\n");
+let releaseFirst!: () => void;
+const firstMayFinish = new Promise<void>((resolve) => {
+  releaseFirst = resolve;
+});
+let firstEnteredCommit = false;
+let secondEnteredCommit = false;
+const firstApply = applyPatch(
+  concurrentRoot,
+  `*** Begin Patch
+*** Update File: file.txt
+@@
+-zero
++one
+*** End Patch`,
+  {
+    beforeCommit: async () => {
+      firstEnteredCommit = true;
+      await firstMayFinish;
+    },
+  },
+);
+while (!firstEnteredCommit) await new Promise((resolve) => setTimeout(resolve, 1));
+const secondApply = applyPatch(
+  concurrentRoot,
+  `*** Begin Patch
+*** Update File: file.txt
+@@
+-one
++two
+*** End Patch`,
+  {
+    beforeCommit: () => {
+      secondEnteredCommit = true;
+    },
+  },
+);
+await new Promise((resolve) => setTimeout(resolve, 10));
+assert.equal(secondEnteredCommit, false);
+releaseFirst();
+await firstApply;
+await secondApply;
+assert.equal(secondEnteredCommit, true);
+assert.equal(await readFile(join(concurrentRoot, "file.txt"), "utf8"), "two\n");
 
 const stagedViewRoot = await mkdtemp(join(tmpdir(), "devspace-apply-patch-staged-view-"));
 await writeFile(join(stagedViewRoot, "source.txt"), "one\n");

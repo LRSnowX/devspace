@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { access, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, realpath, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { TextDecoder } from "node:util";
 import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
@@ -18,6 +18,21 @@ export interface ApplyPatchResult {
   patch: string;
   additions: number;
   removals: number;
+}
+
+export interface ApplyPatchOptions {
+  beforeCommit?: (input: {
+    paths: readonly string[];
+    files: readonly AppliedPatchFile[];
+  }) => Promise<void> | void;
+  beforePublish?: (input: {
+    path: string;
+    index: number;
+  }) => Promise<void> | void;
+  beforeRollback?: (input: {
+    path: string;
+    index: number;
+  }) => Promise<void> | void;
 }
 
 interface HunkLine {
@@ -42,8 +57,16 @@ interface TextFile {
 }
 
 type StagedTextFile = TextFile | null;
+interface PreparedFile {
+  path: string;
+}
+interface PublishedMutation {
+  path: string;
+  completed: boolean;
+}
 type FileIdentity = Pick<Stats, "dev" | "ino">;
 type FileIdentityReader = (path: string) => Promise<FileIdentity>;
+const patchLocks = new Map<string, Promise<void>>();
 
 function patchError(message: string): Error {
   return new Error(`Invalid patch: ${message}`);
@@ -340,15 +363,32 @@ export async function isSamePatchFile(
   }
 }
 
-export async function applyPatch(root: string, patch: string): Promise<ApplyPatchResult> {
+export async function applyPatch(
+  root: string,
+  patch: string,
+  options: ApplyPatchOptions = {},
+): Promise<ApplyPatchResult> {
+  const lockKey = await realpath(root);
+  return withPatchLock(lockKey, () => applyPatchUnlocked(root, patch, options));
+}
+
+async function applyPatchUnlocked(
+  root: string,
+  patch: string,
+  options: ApplyPatchOptions,
+): Promise<ApplyPatchResult> {
   const actions = parsePatch(patch);
   const results: AppliedPatchFile[] = [];
   const patches: string[] = [];
   const staged = new Map<string, StagedTextFile>();
+  const originals = new Map<string, StagedTextFile>();
+  const displayPaths = new Map<string, string>();
 
   const readStagedOptional = async (absolute: string, displayPath: string): Promise<StagedTextFile> => {
     if (staged.has(absolute)) return staged.get(absolute) ?? null;
     const file = await readOptionalTextFile(absolute, displayPath);
+    originals.set(absolute, file);
+    displayPaths.set(absolute, displayPath);
     staged.set(absolute, file);
     return file;
   };
@@ -384,6 +424,10 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
       const destination = await resolveConfinedPath(root, action.moveTo);
       const samePatchFile = await isSamePatchFile(absolute, destination);
       if (!samePatchFile) await readStagedOptional(destination, action.moveTo);
+      else if (!originals.has(destination)) {
+        originals.set(destination, originals.get(absolute) ?? file);
+        displayPaths.set(destination, action.moveTo);
+      }
       if (samePatchFile) staged.delete(absolute);
       staged.set(destination, { content: updated, mode: file.mode });
       if (!samePatchFile) staged.set(absolute, null);
@@ -396,17 +440,316 @@ export async function applyPatch(root: string, patch: string): Promise<ApplyPatc
     }
   }
 
-  for (const [absolute, file] of staged) {
-    if (file) await writeTextFile(absolute, file.content, file.mode);
-  }
-
-  for (const [absolute, file] of staged) {
-    if (!file) await rm(absolute, { force: true });
-  }
+  await publishStagedPatch(staged, originals, displayPaths, results, options);
 
   const unifiedPatch = patches.filter(Boolean).join("\n");
   const stats = countPatchStats(unifiedPatch);
   return { files: results, patch: unifiedPatch, ...stats };
+}
+
+async function withPatchLock<T>(
+  key: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = patchLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolveCurrent) => {
+    release = resolveCurrent;
+  });
+  const tail = previous.then(() => current);
+  patchLocks.set(key, tail);
+
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (patchLocks.get(key) === tail) patchLocks.delete(key);
+  }
+}
+
+async function publishStagedPatch(
+  staged: ReadonlyMap<string, StagedTextFile>,
+  originals: ReadonlyMap<string, StagedTextFile>,
+  displayPaths: ReadonlyMap<string, string>,
+  files: readonly AppliedPatchFile[],
+  options: ApplyPatchOptions,
+): Promise<void> {
+  const preparedFinals = new Map<string, PreparedFile>();
+  const preparedOriginals = new Map<string, PreparedFile>();
+  const createdDirectories = new Set<string>();
+  const mutated: PublishedMutation[] = [];
+
+  try {
+    for (const [absolute, file] of staged) {
+      const displayPath = displayPaths.get(absolute) ?? absolute;
+      const original = originals.get(absolute) ?? null;
+      if (file) {
+        preparedFinals.set(
+          absolute,
+          await prepareTextFile(absolute, file, createdDirectories),
+        );
+      }
+      if (original) {
+        preparedOriginals.set(
+          absolute,
+          await prepareTextFile(absolute, original, createdDirectories),
+        );
+      }
+      if (!displayPaths.has(absolute)) {
+        throw patchError(`missing display path for staged file: ${displayPath}`);
+      }
+    }
+
+    await options.beforeCommit?.({
+      paths: [...staged.keys()],
+      files,
+    });
+
+    for (const [absolute] of staged) {
+      await assertPatchBaseline(
+        absolute,
+        originals.get(absolute) ?? null,
+        displayPaths.get(absolute) ?? absolute,
+      );
+    }
+
+    const publicationOrder = [
+      ...[...staged.entries()].filter(([, file]) => file !== null),
+      ...[...staged.entries()].filter(([, file]) => file === null),
+    ] as Array<[string, StagedTextFile]>;
+
+    for (const [index, [absolute, file]] of publicationOrder.entries()) {
+      const displayPath = displayPaths.get(absolute) ?? absolute;
+      await assertPatchBaseline(
+        absolute,
+        originals.get(absolute) ?? null,
+        displayPath,
+      );
+      await options.beforePublish?.({ path: displayPath, index });
+      await assertPatchBaseline(
+        absolute,
+        originals.get(absolute) ?? null,
+        displayPath,
+      );
+
+      if (file) {
+        const prepared = preparedFinals.get(absolute);
+        if (!prepared) throw patchError(`missing prepared file: ${displayPath}`);
+        const mutation = { path: absolute, completed: false };
+        mutated.push(mutation);
+        await replaceFile(prepared.path, absolute, await fileExists(absolute));
+        mutation.completed = true;
+        preparedFinals.delete(absolute);
+      } else {
+        const mutation = { path: absolute, completed: false };
+        mutated.push(mutation);
+        await rm(absolute, { force: true });
+        mutation.completed = true;
+      }
+    }
+  } catch (error) {
+    const rollbackErrors = await rollbackPublishedPatch(
+      mutated,
+      staged,
+      originals,
+      preparedOriginals,
+      displayPaths,
+      options,
+    );
+    const cleanupErrors = [
+      ...(await cleanupPreparedFiles(preparedFinals)),
+      ...(rollbackErrors.length === 0
+        ? await cleanupPreparedFiles(preparedOriginals)
+        : []),
+      ...(await cleanupCreatedDirectories(createdDirectories)),
+    ];
+    const originalMessage = error instanceof Error ? error.message : String(error);
+    if (rollbackErrors.length > 0) {
+      const recoveryFiles = [...preparedOriginals.values()].map(({ path }) => path);
+      throw new Error(
+        [
+          originalMessage,
+          `rollback failed: ${rollbackErrors.join("; ")}`,
+          recoveryFiles.length > 0
+            ? `recovery files retained: ${recoveryFiles.join(", ")}`
+            : undefined,
+          cleanupErrors.length > 0
+            ? `cleanup failed: ${cleanupErrors.join("; ")}`
+            : undefined,
+        ].filter(Boolean).join("; "),
+        { cause: error },
+      );
+    }
+    if (cleanupErrors.length > 0) {
+      throw new Error(
+        `${originalMessage}; cleanup failed after rollback: ${cleanupErrors.join("; ")}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+
+  await cleanupPreparedFiles(preparedOriginals);
+  await cleanupPreparedFiles(preparedFinals);
+}
+
+async function rollbackPublishedPatch(
+  mutated: readonly PublishedMutation[],
+  staged: ReadonlyMap<string, StagedTextFile>,
+  originals: ReadonlyMap<string, StagedTextFile>,
+  preparedOriginals: Map<string, PreparedFile>,
+  displayPaths: ReadonlyMap<string, string>,
+  options: ApplyPatchOptions,
+): Promise<string[]> {
+  const errors: string[] = [];
+  const reversed = [...mutated].reverse();
+
+  for (const [index, mutation] of reversed.entries()) {
+    const absolute = mutation.path;
+    const displayPath = displayPaths.get(absolute) ?? absolute;
+    try {
+      await options.beforeRollback?.({ path: displayPath, index });
+      const shouldRestore = await shouldRestorePublishedPath(
+        absolute,
+        staged.get(absolute) ?? null,
+        originals.get(absolute) ?? null,
+        displayPath,
+        mutation.completed,
+      );
+      if (!shouldRestore) continue;
+      const original = originals.get(absolute) ?? null;
+      if (original) {
+        const prepared = preparedOriginals.get(absolute);
+        if (!prepared) throw patchError(`missing rollback file: ${displayPath}`);
+        await replaceFile(prepared.path, absolute, await fileExists(absolute));
+        preparedOriginals.delete(absolute);
+      } else {
+        await rm(absolute, { force: true });
+      }
+    } catch (error) {
+      errors.push(
+        `${displayPath}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  return errors;
+}
+
+async function assertPatchBaseline(
+  absolute: string,
+  expected: StagedTextFile,
+  displayPath: string,
+): Promise<void> {
+  const actual = await readOptionalTextFile(absolute, displayPath);
+  if (!sameTextFile(actual, expected)) {
+    throw patchError(`file changed during patch application: ${displayPath}`);
+  }
+}
+
+async function shouldRestorePublishedPath(
+  absolute: string,
+  published: StagedTextFile,
+  original: StagedTextFile,
+  displayPath: string,
+  completed: boolean,
+): Promise<boolean> {
+  const actual = await readOptionalTextFile(absolute, displayPath);
+  if (sameTextFile(actual, original)) return false;
+  if (sameTextFile(actual, published, { ignoreModeWhenExpectedMissing: true })) {
+    return true;
+  }
+  if (!completed && actual === null) {
+    return original !== null;
+  }
+  throw patchError(`published file changed before rollback: ${displayPath}`);
+}
+
+function sameTextFile(
+  actual: StagedTextFile,
+  expected: StagedTextFile,
+  options: { ignoreModeWhenExpectedMissing?: boolean } = {},
+): boolean {
+  if (actual === null || expected === null) return actual === expected;
+  if (actual.content !== expected.content) return false;
+  if (expected.mode === undefined && options.ignoreModeWhenExpectedMissing) return true;
+  return actual.mode === expected.mode;
+}
+
+async function prepareTextFile(
+  destination: string,
+  file: TextFile,
+  createdDirectories: Set<string>,
+): Promise<PreparedFile> {
+  await ensureParentDirectory(destination, createdDirectories);
+  const temporary = `${destination}.devspace-patch-${process.pid}-${randomUUID()}`;
+  try {
+    await writeFile(
+      temporary,
+      file.content,
+      file.mode === undefined ? undefined : { mode: file.mode },
+    );
+    return { path: temporary };
+  } catch (error) {
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+async function ensureParentDirectory(
+  destination: string,
+  createdDirectories: Set<string>,
+): Promise<void> {
+  const parent = dirname(destination);
+  const missing: string[] = [];
+  let current = parent;
+  while (!(await fileExists(current))) {
+    missing.push(current);
+    const next = dirname(current);
+    if (next === current) break;
+    current = next;
+  }
+  await mkdir(parent, { recursive: true });
+  for (const path of missing) createdDirectories.add(path);
+}
+
+async function cleanupPreparedFiles(
+  prepared: ReadonlyMap<string, PreparedFile>,
+): Promise<string[]> {
+  const errors: string[] = [];
+  for (const { path } of prepared.values()) {
+    for (const candidate of [path, `${path}.original`]) {
+      try {
+        await rm(candidate, { force: true });
+      } catch (error) {
+        errors.push(
+          `${candidate}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+  }
+  return errors;
+}
+
+async function cleanupCreatedDirectories(
+  createdDirectories: ReadonlySet<string>,
+): Promise<string[]> {
+  const errors: string[] = [];
+  const deepestFirst = [...createdDirectories].sort(
+    (left, right) => right.length - left.length,
+  );
+  for (const path of deepestFirst) {
+    try {
+      await rmdir(path);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTEMPTY") {
+        errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+  return errors;
 }
 
 async function readOptionalTextFile(absolute: string, displayPath: string): Promise<TextFile | null> {
@@ -426,18 +769,6 @@ async function readUtf8Text(absolute: string, displayPath: string): Promise<stri
   }
   if (content.includes("\0")) throw patchError(`file appears to be binary: ${displayPath}`);
   return content;
-}
-
-async function writeTextFile(destination: string, content: string, mode?: number): Promise<void> {
-  await mkdir(dirname(destination), { recursive: true });
-  const temporary = `${destination}.devspace-patch-${process.pid}-${randomUUID()}`;
-  try {
-    await writeFile(temporary, content, mode === undefined ? undefined : { mode });
-    await replaceFile(temporary, destination, await fileExists(destination));
-  } catch (error) {
-    await rm(temporary, { force: true });
-    throw error;
-  }
 }
 
 function unifiedFilePatch(
