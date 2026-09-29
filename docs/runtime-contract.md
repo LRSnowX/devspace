@@ -156,7 +156,12 @@ the corresponding regression coverage in the same change.
   `status: "applied"`. This avoids current ChatGPT host behavior that converts
   MCP `isError: true` results into string exceptions and discards structured
   content. Current codes cover invalid patches, revision/concurrent conflicts,
-  rollback failure, path scope, and unavailable/invalidated workspaces.
+  rollback failure, path scope, unavailable/invalidated workspaces, and
+  repeated identical failures.
+- Codex `apply_patch` blocks the fourth and later identical request after three
+  consecutive known domain failures in the same workspace. Changing the patch
+  or expected revisions, succeeding, encountering an unclassified internal
+  exception, or restarting the server clears the relevant in-memory streak.
 - A process that starts successfully and exits non-zero remains a completed
   process result with its non-zero `exit_code`; it is not reclassified as a
   tool protocol error.
@@ -166,6 +171,8 @@ the corresponding regression coverage in the same change.
 - The structured coding-tool error taxonomy is currently guaranteed for Codex
   `apply_patch`. Other tools and adapters still have legacy or domain-specific
   error contracts and may migrate incrementally.
+- The repeat-failure breaker is process-local and deliberately exact-request
+  only. It is not a persistent or semantic loop detector.
 
 ## Review
 

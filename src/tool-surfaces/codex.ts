@@ -9,6 +9,7 @@ import {
   MAX_PROCESS_YIELD_MS,
   type ProcessSnapshot,
 } from "../process-sessions.js";
+import { RepeatFailureCircuitBreaker } from "../repeat-failure-circuit.js";
 import {
   EDIT_TOOL_ANNOTATIONS,
   SHELL_TOOL_ANNOTATIONS,
@@ -19,6 +20,7 @@ import {
 } from "./types.js";
 import {
   contentText,
+  logFailedToolResponse,
   resultOutputSchema,
   runLoggedToolOperation,
   textBlock,
@@ -84,6 +86,7 @@ function processToolResponse(snapshot: ProcessSnapshot) {
 
 function registerApplyPatchTool(context: ToolRegistrationContext): void {
   const { server, config, workspaces } = context;
+  const repeatFailures = new RepeatFailureCircuitBreaker();
 
   server.registerTool(
     "apply_patch",
@@ -133,6 +136,22 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
     async ({ workspace_id, patch, expected_revisions }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
+      const request = {
+        patch,
+        expectedRevisions: expected_revisions,
+      };
+      const blocked = repeatFailures.beforeAttempt(workspaceId, request);
+      if (blocked) {
+        const response = patchErrorResponse(blocked);
+        logFailedToolResponse(
+          config,
+          { tool: "apply_patch", workspaceId },
+          response.content,
+          startedAt,
+        );
+        return response;
+      }
+
       let applied;
       try {
         applied = await runLoggedToolOperation(
@@ -148,20 +167,14 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
         );
       } catch (error) {
         const payload = toolErrorPayload(error);
-        if (!payload) throw error;
-        const content = [textBlock(payload.message)];
-        return {
-          content,
-          structuredContent: {
-            result: payload.message,
-            status: "error",
-            additions: 0,
-            removals: 0,
-            files: [],
-            error: payload,
-          },
-        };
+        if (!payload) {
+          repeatFailures.reset(workspaceId);
+          throw error;
+        }
+        repeatFailures.recordFailure(workspaceId, request, payload.code);
+        return patchErrorResponse(payload);
       }
+      repeatFailures.recordSuccess(workspaceId);
       const paths = applied.files.map((file) => file.path).join(", ");
       const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
       const content = [textBlock(result)];
@@ -181,6 +194,21 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
       };
     },
   );
+}
+
+function patchErrorResponse(payload: NonNullable<ReturnType<typeof toolErrorPayload>>) {
+  const content = [textBlock(payload.message)];
+  return {
+    content,
+    structuredContent: {
+      result: payload.message,
+      status: "error" as const,
+      additions: 0,
+      removals: 0,
+      files: [],
+      error: payload,
+    },
+  };
 }
 
 function registerCodexProcessTools(context: ToolRegistrationContext): void {

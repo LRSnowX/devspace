@@ -281,6 +281,82 @@ test("Codex apply_patch exposes structured workspace and path errors", async (t)
   });
 });
 
+test("Codex apply_patch blocks a fourth identical domain failure and resets on a changed request", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
+  const workspaceId = structuredContent(
+    await callOpen(context.client, context.project, "repeat-failure-circuit"),
+  ).workspace_id;
+  assert.equal(typeof workspaceId, "string");
+
+  await writeFile(join(context.project, "note.txt"), "current\nshared\n");
+  const staleRevision = fileRevision(Buffer.from("old\nshared\n"));
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: note.txt",
+    "@@",
+    "-shared",
+    "+patched",
+    "*** End Patch",
+  ].join("\n");
+
+  for (let count = 1; count <= 3; count += 1) {
+    const failed = structuredContent(await context.client.callTool({
+      name: "apply_patch",
+      arguments: {
+        workspace_id: workspaceId,
+        patch,
+        expected_revisions: [{ path: "note.txt", revision: staleRevision }],
+      },
+    }));
+    assert.equal(failed.status, "error");
+    assert.equal((failed.error as { code?: string }).code, "REVISION_CONFLICT");
+  }
+
+  const blocked = structuredContent(await context.client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspace_id: workspaceId,
+      patch,
+      expected_revisions: [{ path: "note.txt", revision: staleRevision }],
+    },
+  }));
+  assert.deepEqual(blocked.error, {
+    code: "REPEATED_FAILURE",
+    category: "state",
+    message:
+      "Repeated identical apply_patch request blocked after 3 consecutive failures. Change the patch or expected revisions, or re-read the relevant files before retrying.",
+    retryable: false,
+    repeat_count: 3,
+    previous_error_code: "REVISION_CONFLICT",
+  });
+  assert.equal(
+    await readFile(join(context.project, "note.txt"), "utf8"),
+    "current\nshared\n",
+  );
+
+  const currentRevision = fileRevision(Buffer.from("current\nshared\n"));
+  const applied = structuredContent(await context.client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspace_id: workspaceId,
+      patch,
+      expected_revisions: [{ path: "note.txt", revision: currentRevision }],
+    },
+  }));
+  assert.equal(applied.status, "applied");
+
+  await writeFile(join(context.project, "note.txt"), "external\nshared\n");
+  const afterSuccess = structuredContent(await context.client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspace_id: workspaceId,
+      patch,
+      expected_revisions: [{ path: "note.txt", revision: currentRevision }],
+    },
+  }));
+  assert.equal((afterSuccess.error as { code?: string }).code, "REVISION_CONFLICT");
+});
+
 test("Claude edit and bash tools accept snake_case runtime inputs", async (t) => {
   const context = await fixture(t, { toolMode: "claude", uiEnabled: false });
   const workspaceId = structuredContent(

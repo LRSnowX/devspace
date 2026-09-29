@@ -8,6 +8,7 @@ export const TOOL_ERROR_CODES = [
   "PATH_SCOPE_VIOLATION",
   "WORKSPACE_NOT_FOUND",
   "WORKSPACE_INVALIDATED",
+  "REPEATED_FAILURE",
 ] as const;
 
 export type ToolErrorCode = typeof TOOL_ERROR_CODES[number];
@@ -32,6 +33,8 @@ export interface ToolErrorPayload {
   expected_revision?: string;
   current_revision?: string;
   recovery_files?: string[];
+  repeat_count?: number;
+  previous_error_code?: ToolErrorCode;
 }
 
 export const toolErrorPayloadSchema = z.object({
@@ -43,6 +46,8 @@ export const toolErrorPayloadSchema = z.object({
   expected_revision: z.string().optional(),
   current_revision: z.string().optional(),
   recovery_files: z.array(z.string()).optional(),
+  repeat_count: z.number().int().positive().optional(),
+  previous_error_code: z.enum(TOOL_ERROR_CODES).optional(),
 });
 
 export class ToolOperationError extends Error {

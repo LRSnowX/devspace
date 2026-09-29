@@ -24,7 +24,9 @@ error: {
   path?,
   expected_revision?,
   current_revision?,
-  recovery_files?
+  recovery_files?,
+  repeat_count?,
+  previous_error_code?
 }
 ```
 
@@ -71,6 +73,35 @@ The Codex `apply_patch` tool currently exposes:
   - retryable: true
   - the previously opened workspace root disappeared or changed identity;
     reopen it before continuing.
+- `REPEATED_FAILURE`
+  - category: `state`
+  - retryable: false for the identical request
+  - returned before execution when the exact same `apply_patch` request has
+    already produced three consecutive known domain failures in that workspace.
+  - includes `repeat_count` and `previous_error_code`.
+
+## Repeat-failure circuit breaker
+
+The Codex `apply_patch` surface has a deliberately narrow process-local
+circuit breaker:
+
+- identity is the workspace id plus the exact patch text plus the set of
+  `expected_revisions`;
+- expected-revision ordering is normalized, so reordering the same expectations
+  does not bypass the breaker;
+- the first three identical known domain failures are returned normally;
+- the fourth identical attempt and later identical attempts are blocked before
+  the patch engine runs and return `REPEATED_FAILURE`;
+- changing the patch or expected revisions clears the streak immediately;
+- a successful patch clears the streak;
+- an unexpected/unclassified internal exception clears the streak and is still
+  thrown normally;
+- state is in memory only and is reset when the DevSpace server restarts;
+- state is bounded to a finite number of workspace entries.
+
+The breaker intentionally does **not** group failures merely because they touch
+the same path or share an error code. Legitimate modified retries must remain
+available.
 
 ## MCP behavior
 
