@@ -40,6 +40,7 @@ const disabledProfile: LocalAgentProfile = {
 };
 const subagents: SubagentsConfig = {
   enabled: true,
+  instructions: "on-demand",
   providers: [
     { id: "codex", enabled: true, model: "gpt-default", effort: "medium" },
     { id: "claude", enabled: true },
@@ -121,7 +122,8 @@ const stale = store.create({
   profileName: "reviewer",
   provider: "codex",
 });
-store.update(stale.id, { status: "running", latestResponse: "previous response" });
+const staleTurn = store.beginTurn(stale.id, { prompt: "interrupted turn" });
+store.update(stale.id, { latestResponse: "previous response" });
 
 const manager = new LocalAgentManager({
   store,
@@ -222,6 +224,8 @@ assert.equal(getRecord(stale.id).latestResponse, "previous response");
 assert.equal(getRecord(stale.id).error, "DevSpace restarted while this agent turn was running.");
 assert.equal(getRecord(stale.id).errorCode, "DAEMON_UNAVAILABLE");
 assert.equal(getRecord(stale.id).errorRetryable, true);
+assert.equal(store.getTurnById(staleTurn.turn.id)?.status, "failed");
+assert.equal(store.getTurnById(staleTurn.turn.id)?.errorCode, "DAEMON_UNAVAILABLE");
 
 const first = unwrap(await manager.start({
   target: "reviewer",
@@ -244,6 +248,10 @@ runtimes.get(first.id)!.release();
 await waitFor(() => getRecord(first.id).status === "idle");
 assert.equal(getRecord(first.id).providerSessionId, "thread_test");
 assert.match(getRecord(first.id).latestResponse ?? "", /Task:\nhold/);
+assert.deepEqual(
+  store.listTurns(first.id).map((turn) => ({ prompt: turn.prompt, status: turn.status })),
+  [{ prompt: "hold", status: "completed" }],
+);
 
 const continued = unwrap(await manager.continue(first.id, "continue", {
   model: "gpt-run",
@@ -253,6 +261,13 @@ assert.equal(continued.status, "running");
 await waitFor(() => getRecord(first.id).status === "idle");
 assert.equal(getRecord(first.id).model, "gpt-run");
 assert.equal(getRecord(first.id).effort, "high");
+assert.deepEqual(
+  store.listTurns(first.id).map((turn) => ({ prompt: turn.prompt, status: turn.status })),
+  [
+    { prompt: "hold", status: "completed" },
+    { prompt: "continue", status: "completed" },
+  ],
+);
 
 const second = unwrap(await manager.start({
   target: "reviewer",
@@ -274,6 +289,8 @@ await waitFor(() => getRecord(failed.id).status === "error");
 assert.equal(getRecord(failed.id).error, "provider failed");
 assert.equal(getRecord(failed.id).errorCode, "PROVIDER_EXECUTION_ERROR");
 assert.equal(getRecord(failed.id).errorRetryable, false);
+assert.equal(store.getLatestTurn(failed.id)?.status, "failed");
+assert.equal(store.getLatestTurn(failed.id)?.error, "provider failed");
 const recovered = unwrap(await manager.continue(failed.id, "recovered", {}, scope));
 assert.equal(recovered.status, "running", "provider Err releases active-turn ownership");
 await waitFor(() => getRecord(failed.id).status === "idle");
@@ -286,6 +303,76 @@ const earlyFailure = unwrap(await manager.start({
 }));
 await waitFor(() => getRecord(earlyFailure.id).status === "error");
 assert.equal(getRecord(earlyFailure.id).providerSessionId, "thread_early");
+
+const waitingOne = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "hold wait one",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+const waitingTwo = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "hold wait two",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => runtimes.get(waitingOne.id)?.inputs.length === 1);
+await waitFor(() => runtimes.get(waitingTwo.id)?.inputs.length === 1);
+let multiWaitSettled = false;
+const multiWait = manager.wait([waitingOne.id, waitingTwo.id, waitingOne.id], scope)
+  .then((result) => {
+    multiWaitSettled = true;
+    return result;
+  });
+runtimes.get(waitingOne.id)!.release();
+await waitFor(() => getRecord(waitingOne.id).status === "idle");
+assert.equal(multiWaitSettled, false, "multi-agent wait must remain pending until every turn finishes");
+runtimes.get(waitingTwo.id)!.release();
+assert.deepEqual(unwrap(await multiWait).map((result) => ({ id: result.id, status: result.status })), [
+  { id: waitingOne.id, status: "completed" },
+  { id: waitingTwo.id, status: "completed" },
+]);
+
+const timedWaitAgent = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "hold timed wait",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => runtimes.get(timedWaitAgent.id)?.inputs.length === 1);
+assert.deepEqual(unwrap(await manager.wait([earlyFailure.id, timedWaitAgent.id], scope, 5)), [
+  {
+    id: earlyFailure.id,
+    status: "failed",
+    error: {
+      code: "PROVIDER_EXECUTION_ERROR",
+      message: "provider failed after session creation",
+      retryable: false,
+    },
+  },
+  { id: timedWaitAgent.id, status: "running", wait: "timeout" },
+]);
+runtimes.get(timedWaitAgent.id)!.release();
+await waitFor(() => getRecord(timedWaitAgent.id).status === "idle");
+
+const cancelledWaitAgent = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "hold cancelled wait",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => runtimes.get(cancelledWaitAgent.id)?.inputs.length === 1);
+const waitAbort = new AbortController();
+const cancelledWait = manager.wait([cancelledWaitAgent.id], scope, undefined, waitAbort.signal);
+waitAbort.abort();
+assert.deepEqual(unwrap(await cancelledWait), [{ id: cancelledWaitAgent.id, status: "running" }]);
+assert.equal(getRecord(cancelledWaitAgent.id).status, "running", "cancelling a waiter must not stop its turn");
+runtimes.get(cancelledWaitAgent.id)!.release();
+await waitFor(() => getRecord(cancelledWaitAgent.id).status === "idle");
+
+const invalidWait = await manager.wait([waitingOne.id, "agt_missing"], scope, 5);
+assert.equal(invalidWait.isErr(), true);
+if (invalidWait.isErr()) assert.equal(invalidWait.error.code, "AGENT_NOT_FOUND");
 
 const wrongWorkspace = await manager.continue(
   first.id,

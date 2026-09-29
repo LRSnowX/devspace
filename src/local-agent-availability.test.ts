@@ -1,48 +1,61 @@
 import assert from "node:assert/strict";
-import {
-  checkLocalAgentProviderAvailability,
-  formatLocalAgentProviderAvailabilitySummary,
-  getLocalAgentProviderAvailabilitySnapshot,
-} from "./local-agent-availability.js";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { getLocalAgentProviderAvailabilitySnapshot } from "./local-agent-availability.js";
+
+const snapshot = getLocalAgentProviderAvailabilitySnapshot({
+  ...process.env,
+  CODEX_COMMAND: "/definitely/missing/devspace-codex",
+});
+assert.deepEqual(snapshot.find((provider) => provider.name === "codex"), {
+  name: "codex",
+  available: false,
+  reason: "/definitely/missing/devspace-codex executable not found",
+});
+assert.equal(
+  getLocalAgentProviderAvailabilitySnapshot({ ...process.env, CODEX_COMMAND: "" })
+    .find((provider) => provider.name === "codex")?.available,
+  false,
+);
 
 {
-  const availability = checkLocalAgentProviderAvailability("codex");
-  assert.equal(availability.name, "codex");
-  assert.equal(typeof availability.available, "boolean");
-  if (availability.available) {
-    assert.equal(availability.note, "available");
+  const directory = mkdtempSync(join(tmpdir(), "devspace-provider-command-"));
+  const executable = join(directory, "codex-wrapper");
+  try {
+    assert.equal(
+      getLocalAgentProviderAvailabilitySnapshot({
+        ...process.env,
+        CODEX_COMMAND: directory,
+      }).find((provider) => provider.name === "codex")?.available,
+      false,
+    );
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    chmodSync(executable, 0o700);
+    const availability = getLocalAgentProviderAvailabilitySnapshot(
+      {
+        ...process.env,
+        CODEX_COMMAND: "/definitely/missing/devspace-codex",
+        OPENAI_API_KEY: "must-not-appear",
+      },
+      {
+        enabled: true,
+        instructions: "on-demand",
+        providers: [{
+          id: "codex",
+          enabled: true,
+          command: executable,
+          env: { OPENAI_API_KEY: "configured-secret", EMPTY_VALUE: "" },
+        }],
+      },
+    ).find((provider) => provider.name === "codex");
+    assert.deepEqual(availability, {
+      name: "codex",
+      available: true,
+      note: "available",
+    });
+    assert.doesNotMatch(JSON.stringify(availability), /configured-secret|must-not-appear/);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 }
-
-{
-  const availability = checkLocalAgentProviderAvailability("codex", {
-    ...process.env,
-    CODEX_COMMAND: "/definitely/missing/devspace-codex",
-  });
-  assert.equal(availability.available, false);
-  assert.match(availability.reason ?? "", /executable not found/);
-}
-
-{
-  assert.equal(checkLocalAgentProviderAvailability("pi").available, true);
-}
-
-{
-  const snapshot = getLocalAgentProviderAvailabilitySnapshot({
-    ...process.env,
-    CODEX_COMMAND: "/definitely/missing/devspace-codex",
-  });
-  assert.deepEqual(
-    snapshot.map((provider) => provider.name),
-    ["codex", "claude", "opencode", "pi", "cursor", "copilot", "grok"],
-  );
-  assert.equal(snapshot.find((provider) => provider.name === "pi")?.available, true);
-}
-
-assert.equal(
-  formatLocalAgentProviderAvailabilitySummary([
-    { name: "codex", available: true, note: "available" },
-    { name: "pi", available: false, reason: "pi executable not found" },
-  ]),
-  "available: codex (available); unavailable: pi (pi executable not found)",
-);

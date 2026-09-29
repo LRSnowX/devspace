@@ -3,7 +3,8 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
-import { loadLocalAgentProfiles, summarizeLocalAgentProfile } from "./local-agent-profiles.js";
+import { loadLocalAgentProfiles } from "./local-agent-profiles.js";
+import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-agent-profiles-test-"));
 
@@ -57,12 +58,10 @@ try {
     ].join("\n"),
   );
 
-  const enabledConfig = loadConfig({
-    DEVSPACE_CONFIG_DIR: configDir,
-    DEVSPACE_ALLOWED_ROOTS: workspaceRoot,
-    DEVSPACE_SUBAGENTS: "1",
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-  });
+  const enabledConfig = loadConfig(writeTestDevspaceConfig(configDir, {
+    workspaces: { allowedRoots: [workspaceRoot] },
+    subagents: { enabled: true, instructions: "on-demand", providers: [] },
+  }));
   const profiles = await loadLocalAgentProfiles(enabledConfig, workspaceRoot);
 
   assert.equal(profiles.length, 1);
@@ -72,14 +71,6 @@ try {
   assert.equal(profiles[0]?.model, "sonnet");
   assert.equal(profiles[0]?.effort, "high");
   assert.equal(profiles[0]?.body, "Project body.");
-  assert.deepEqual(summarizeLocalAgentProfile(profiles[0]!), {
-    name: "reviewer",
-    description: "Project reviewer #1.",
-    provider: "claude",
-    model: "sonnet",
-    effort: "high",
-  });
-
   await writeFile(
     join(workspaceRoot, ".devspace", "agents", "custom.md"),
     [
@@ -96,12 +87,10 @@ try {
   const profilesWithInvalid = await loadLocalAgentProfiles(enabledConfig, workspaceRoot);
   assert.deepEqual(profilesWithInvalid.map((profile) => profile.name), ["reviewer"]);
 
-  const disabledConfig = loadConfig({
-    DEVSPACE_CONFIG_DIR: configDir,
-    DEVSPACE_ALLOWED_ROOTS: workspaceRoot,
-    DEVSPACE_SUBAGENTS: "0",
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-  });
+  const disabledConfig = loadConfig(writeTestDevspaceConfig(configDir, {
+    workspaces: { allowedRoots: [workspaceRoot] },
+    subagents: { enabled: false, instructions: "on-demand", providers: [] },
+  }));
   assert.deepEqual(await loadLocalAgentProfiles(disabledConfig, workspaceRoot), []);
 } finally {
   await rm(root, { recursive: true, force: true });

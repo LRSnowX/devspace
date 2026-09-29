@@ -1,6 +1,3 @@
-import { spawnSync } from "node:child_process";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import {
   AgentProviderExecutionError,
   AgentProviderProtocolError,
@@ -20,6 +17,14 @@ import type {
 } from "./local-agent-runtime.js";
 
 type ClaudePermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk" | "auto";
+
+const CLAUDE_WORKSPACE_ALLOWED_TOOLS = [
+  // allowedTools is passed as a session/CLI rule, so `/` is anchored to the query cwd.
+  "Read(/**)",
+  "Edit(/**)",
+  "Bash",
+] as const;
+
 
 export interface ClaudeQueryLike extends AsyncIterable<unknown> {
   close(): void;
@@ -262,7 +267,7 @@ export function claudeQueryOptions(
   input: LocalAgentRunInput,
   env: NodeJS.ProcessEnv = process.env,
 ): Record<string, unknown> {
-  const executable = env.CLAUDE_COMMAND ?? resolveExecutable("claude", env);
+  const executable = env.CLAUDE_COMMAND;
   const permissionMode = claudePermissionMode(input.writeMode);
   const authority = claudeAuthorityOptions(input.workspaceRoot, input.writeMode);
   return {
@@ -271,6 +276,11 @@ export function claudeQueryOptions(
     ...(input.effort ? { thinking: { type: "adaptive" }, effort: input.effort } : {}),
     ...(context.providerSessionId ? { resume: context.providerSessionId } : {}),
     permissionMode,
+    // Restricted runtimes stay warm across read_only/allowed turns. Keep the
+    // workspace capabilities static and narrow individual turns with deny rules.
+    ...(input.writeMode === "full_access"
+      ? {}
+      : { allowedTools: [...CLAUDE_WORKSPACE_ALLOWED_TOOLS] }),
     sandbox: authority.sandbox,
     settings: authority.settings,
     ...(input.writeMode === "full_access" ? { allowDangerouslySkipPermissions: true } : {}),
@@ -316,25 +326,10 @@ function claudeAuthorityOptions(
     };
   }
 
-  const resolvedWorkspace = workspaceRoot.replaceAll("\\", "/");
-  const workspaceRules = [
-    `Read(${resolvedWorkspace}/**)`,
-    `Glob(${resolvedWorkspace}/**)`,
-    `Grep(${resolvedWorkspace}/**)`,
-    `LS(${resolvedWorkspace}/**)`,
-  ];
   const allowed = writeMode !== "read_only";
-  const protectedPaths = claudeProtectedPaths();
   const permissions = {
     defaultMode: "dontAsk",
-    allow: [
-      ...workspaceRules,
-      ...(allowed ? [`Edit(${resolvedWorkspace}/**)`, "Bash(*)"] : []),
-    ],
-    deny: [
-      ...protectedPaths.map((path) => `Read(${path.replaceAll("\\", "/")}/**)`),
-      ...(allowed ? [] : ["Bash(*)", "Edit(*)", "Write(*)", "NotebookEdit(*)"]),
-    ],
+    deny: allowed ? [] : ["Bash", "Edit"],
   };
   const sandbox = {
     enabled: true,
@@ -344,23 +339,9 @@ function claudeAuthorityOptions(
     filesystem: {
       allowWrite: allowed ? [workspaceRoot] : [],
       denyWrite: allowed ? [] : [workspaceRoot],
-      denyRead: protectedPaths,
-      allowRead: [workspaceRoot],
     },
   };
   return { sandbox, settings: { permissions, sandbox } };
-}
-
-function claudeProtectedPaths(): string[] {
-  const home = homedir();
-  return [
-    join(home, ".ssh"),
-    join(home, ".aws"),
-    join(home, ".gnupg"),
-    join(home, ".config", "gcloud"),
-    join(home, ".netrc"),
-    join(home, ".npmrc"),
-  ];
 }
 
 export function claudeCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -393,18 +374,6 @@ export interface ClaudeUserMessage {
   type: "user";
   message: { role: "user"; content: string };
   parent_tool_use_id: null;
-}
-
-function resolveExecutable(command: string, env: NodeJS.ProcessEnv): string | undefined {
-  const commandHasPath = command.includes("/") || command.includes("\\");
-  if (commandHasPath) return command;
-  const result = spawnSync(process.platform === "win32" ? "where.exe" : "which", [command], {
-    encoding: "utf8",
-    env,
-    windowsHide: true,
-  });
-  const executable = result.stdout?.split(/\r?\n/).find((line) => line.trim());
-  return executable?.trim() || undefined;
 }
 
 function directString(value: unknown): string | undefined {

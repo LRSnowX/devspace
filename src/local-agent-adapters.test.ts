@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { delimiter } from "node:path";
 import {
   claudeCommandEnvironment,
-  createLocalAgentAdapter,
   extractOpenCodeFinalResponse,
   extractPiFinalResponse,
   extractPiProviderError,
@@ -10,24 +9,6 @@ import {
   resolveAcpEffortConfigUpdate,
 } from "./local-agent-adapters.js";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
-import type { LocalAgentProvider } from "./local-agent-profiles.js";
-
-const providers: LocalAgentProvider[] = [
-  "codex",
-  "claude",
-  "opencode",
-  "pi",
-  "cursor",
-  "copilot",
-  "grok",
-];
-
-for (const provider of providers) {
-  const adapter = createLocalAgentAdapter(provider);
-  assert.equal(adapter.provider, provider);
-  assert.equal(typeof adapter.runtimeKey, "function");
-}
-
 assert.deepEqual(
   resolveAcpModelConfigUpdate({
     sessionId: "session_model_1",

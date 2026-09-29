@@ -156,12 +156,3 @@ export function resolveLocalAgentTarget(
 
   return undefined;
 }
-
-export function formatAvailableLocalAgentTargets(profiles: LocalAgentProfile[]): string {
-  const profileNames = profiles.map((profile) => profile.name);
-  const parts = [
-    profileNames.length > 0 ? `profiles: ${profileNames.join(", ")}` : undefined,
-    `providers: ${LOCAL_AGENT_PROVIDERS.join(", ")}`,
-  ].filter(Boolean);
-  return parts.join("; ");
-}

@@ -67,18 +67,6 @@ export async function loadLocalAgentProfiles(
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-export function summarizeLocalAgentProfile(
-  profile: LocalAgentProfile,
-): LocalAgentProfileSummary {
-  return {
-    name: profile.name,
-    description: profile.description,
-    provider: profile.provider,
-    model: profile.model,
-    effort: profile.effort,
-  };
-}
-
 async function loadProfilesFromDirectory(directory: string): Promise<LocalAgentProfile[]> {
   const resolvedDirectory = resolve(directory);
   if (!existsSync(resolvedDirectory)) return [];

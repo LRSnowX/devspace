@@ -1,7 +1,6 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { accessSync, constants } from "node:fs";
 import { createRequire } from "node:module";
-import { delimiter, resolve } from "node:path";
+import { resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
   AgentProviderProtocolError,
@@ -10,6 +9,7 @@ import {
   isProgrammerDefect,
 } from "./local-agent-errors.js";
 import { terminateProcessTree } from "./process-platform.js";
+import { DEVSPACE_VERSION } from "./version.js";
 import {
   GrokPromptCompletionRegistry,
   GROK_DEFAULT_MODEL,
@@ -27,6 +27,7 @@ import type {
   LocalAgentRuntimeContext,
   LocalAgentWriteMode,
 } from "./local-agent-runtime.js";
+import { resolveExecutableCommand } from "./local-agent-command.js";
 
 export type AcpProvider = "cursor" | "copilot" | "grok";
 
@@ -36,7 +37,6 @@ const ACP_INITIALIZE_TIMEOUT_MS = 10_000;
 const ACP_GROK_PROMPT_COMPLETION_TIMEOUT_MS = 10 * 60_000;
 const require = createRequire(import.meta.url);
 const spawn = require("cross-spawn") as typeof import("node:child_process").spawn;
-const DEVSPACE_VERSION = readDevspaceVersion();
 
 const observeChildError = (): void => {};
 
@@ -617,20 +617,7 @@ export function resolveAcpCommand(
       ? env.COPILOT_COMMAND
       : env.GROK_COMMAND;
   const command = configured ?? ACP_COMMANDS[provider][0];
-  if (command.includes("/") || command.includes("\\")) return executableExists(command) ? command : undefined;
-  const path = env.PATH;
-  if (!path) return undefined;
-  const extensions = process.platform === "win32"
-    ? ["", ...(env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)]
-    : [""];
-  for (const directory of path.split(delimiter)) {
-    if (!directory) continue;
-    for (const extension of extensions) {
-      const candidate = resolve(directory, `${command}${extension}`);
-      if (executableExists(candidate)) return candidate;
-    }
-  }
-  return undefined;
+  return resolveExecutableCommand(command, env);
 }
 
 export type AcpCommandResolver = (provider: AcpProvider, env: NodeJS.ProcessEnv) => string | undefined;
@@ -829,15 +816,6 @@ function appendTail(current: string, chunk: string, maxBytes: number): string {
   return Buffer.from(next, "utf8").subarray(-maxBytes).toString("utf8");
 }
 
-function executableExists(command: string): boolean {
-  try {
-    accessSync(command, process.platform === "win32" ? constants.F_OK : constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
@@ -849,14 +827,6 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
   } finally {
     if (timer) clearTimeout(timer);
   }
-}
-
-function readDevspaceVersion(): string {
-  const packageJson = require("../package.json") as { version?: unknown };
-  if (typeof packageJson.version !== "string" || !packageJson.version) {
-    throw new Error("Unable to read DevSpace package version.");
-  }
-  return packageJson.version;
 }
 
 function readArray(value: unknown, key: string): unknown[] | undefined {

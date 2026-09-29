@@ -44,12 +44,23 @@ export interface MemoryClient {
 export class MemoryThreadAuthorizationStore {
   private readonly byProject = new Map<string, Set<string>>();
 
-  constructor(private readonly maxPerProject = 512) {}
+  constructor(
+    private readonly maxPerProject = 512,
+    private readonly maxProjects = 128,
+  ) {}
 
   authorize(projectKey: string, ids: readonly string[]): void {
     let authorized = this.byProject.get(projectKey);
     if (!authorized) {
       authorized = new Set();
+      this.byProject.set(projectKey, authorized);
+      while (this.byProject.size > this.maxProjects) {
+        const oldest = this.byProject.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        this.byProject.delete(oldest);
+      }
+    } else {
+      this.byProject.delete(projectKey);
       this.byProject.set(projectKey, authorized);
     }
     for (const id of ids) {

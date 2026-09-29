@@ -37,6 +37,16 @@ const migrations: Migration[] = [
     name: "local-agent-effort-rename",
     up: migrateLocalAgentEffortRename,
   },
+  {
+    version: 7,
+    name: "workspace-recovery-state",
+    up: migrateWorkspaceRecoveryState,
+  },
+  {
+    version: 8,
+    name: "local-agent-turns",
+    up: migrateLocalAgentTurns,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -49,13 +59,24 @@ export function migrateDatabase(sqlite: Database.Database): void {
       );
     `);
 
-    const applied = new Set(
-      (
-        sqlite.prepare("select version from devspace_schema_migrations").all() as Array<{
-          version: number;
-        }>
-      ).map((row) => row.version),
-    );
+    const appliedRows = sqlite
+      .prepare("select version, name from devspace_schema_migrations order by version")
+      .all() as Array<{ version: number; name: string }>;
+    const migrationsByVersion = new Map(migrations.map((migration) => [migration.version, migration]));
+    for (const row of appliedRows) {
+      const expected = migrationsByVersion.get(row.version);
+      if (!expected) {
+        throw new Error(
+          `Database migration history is incompatible: version ${row.version} (${JSON.stringify(row.name)}) is unknown to this build.`,
+        );
+      }
+      if (row.name !== expected.name) {
+        throw new Error(
+          `Database migration history is incompatible: version ${row.version} is recorded as ${JSON.stringify(row.name)}, but this build expects ${JSON.stringify(expected.name)}.`,
+        );
+      }
+    }
+    const applied = new Set(appliedRows.map((row) => row.version));
     const recordMigration = sqlite.prepare(
       "insert into devspace_schema_migrations (version, name, applied_at) values (?, ?, ?)",
     );
@@ -233,6 +254,39 @@ function migrateLocalAgentEffortRename(sqlite: Database.Database): void {
     return;
   }
   sqlite.exec("alter table local_agent_sessions rename column thinking to effort");
+}
+
+function migrateWorkspaceRecoveryState(sqlite: Database.Database): void {
+  const workspaceStateExists = sqlite
+    .prepare("select 1 from sqlite_master where type = 'table' and name = 'workspace_sessions'")
+    .get();
+  if (!workspaceStateExists) return;
+
+  addColumnIfMissing(sqlite, "workspace_sessions", "recovery_kind", "text");
+}
+
+function migrateLocalAgentTurns(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists local_agent_turns (
+      id integer primary key autoincrement,
+      agent_id text not null,
+      prompt text not null,
+      status text not null,
+      response text,
+      error text,
+      error_code text,
+      error_retryable text,
+      created_at text not null,
+      completed_at text,
+      foreign key (agent_id) references local_agent_sessions(id) on delete cascade
+    );
+
+    create index if not exists local_agent_turns_agent_id_idx
+      on local_agent_turns(agent_id, id desc);
+
+    create index if not exists local_agent_turns_status_idx
+      on local_agent_turns(status);
+  `);
 }
 
 function addColumnIfMissing(

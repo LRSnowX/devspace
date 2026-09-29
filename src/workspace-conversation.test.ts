@@ -9,6 +9,7 @@ import { loadConfig, type ServerConfig } from "./config.js";
 import { openDatabase } from "./db/client.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -242,14 +243,14 @@ test("canonical checkout identity survives macOS var path aliases", { skip: plat
     return;
   }
 
-  const aliasConfig = loadConfig({
-    DEVSPACE_CONFIG_DIR: join(context.root, ".alias-config"),
-    DEVSPACE_ALLOWED_ROOTS: `${context.root},${macAlias}`,
-    DEVSPACE_WORKTREE_ROOT: join(context.root, ".worktrees"),
-    DEVSPACE_AGENT_DIR: join(context.root, "agent"),
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-    PORT: "1",
-  });
+  const aliasConfig = loadConfig(writeTestDevspaceConfig(join(context.root, ".alias-config"), {
+    server: { port: 1 },
+    workspaces: {
+      allowedRoots: [context.root, macAlias],
+      worktreeRoot: join(context.root, ".worktrees"),
+    },
+    skills: { agentDir: join(context.root, "agent") },
+  }));
   const aliasRegistry = new WorkspaceRegistry(aliasConfig, context.store);
 
   const direct = await context.registry.openWorkspace(context.project, {
@@ -416,15 +417,12 @@ async function fixture(
 
   if (options.git) await initializeGitRepository(project);
 
-  const config = loadConfig({
-    DEVSPACE_CONFIG_DIR: join(root, ".config"),
-    DEVSPACE_ALLOWED_ROOTS: root,
-    DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
-    DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_SUBAGENTS: "1",
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-    PORT: "1",
-  });
+  const config = loadConfig(writeTestDevspaceConfig(join(root, ".config"), {
+    server: { port: 1 },
+    workspaces: { allowedRoots: [root], worktreeRoot: join(root, ".worktrees") },
+    skills: { agentDir },
+    subagents: { enabled: true, instructions: "on-demand", providers: [] },
+  }));
   const openStore = () => {
     const store = new SqliteWorkspaceStore(stateDir);
     stores.add(store);

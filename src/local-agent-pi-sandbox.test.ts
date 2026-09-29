@@ -12,6 +12,29 @@ import {
   releasePiSandboxSession,
 } from "./local-agent-pi-sandbox.js";
 
+{
+  const workspace = await mkdtemp(join(tmpdir(), "devspace-pi-env-test-"));
+  const modeRef = createPiSandboxModeRef("full_access");
+  const tools = new Map<string, { execute: (...args: any[]) => Promise<unknown> }>();
+  try {
+    createPiSandboxExtension(workspace, modeRef, {
+      ...process.env,
+      DEVSPACE_PI_ENV_TEST: "provider-env",
+    })({
+      registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<unknown> }) =>
+        tools.set(tool.name, tool),
+    } as never);
+    const bash = tools.get("bash");
+    assert.ok(bash);
+    const result = await bash.execute("provider-env-test", { command: "printf %s \"$DEVSPACE_PI_ENV_TEST\"" }) as {
+      content: Array<{ type: string; text?: string }>;
+    };
+    assert.equal(result.content[0]?.text, "provider-env");
+  } finally {
+    await rm(workspace, { recursive: true, force: true });
+  }
+}
+
 const dependencies = await SandboxManager.checkDependenciesAsync();
 if (process.env.DEVSPACE_REQUIRE_PI_SANDBOX === "1") {
   assert.equal(SandboxManager.isSupportedPlatform(), true, "Pi sandbox integration is required on this CI lane");
@@ -91,6 +114,31 @@ if (SandboxManager.isSupportedPlatform() && dependencies.errors.length === 0) {
       /Read-only file system|Command exited with code/,
       "sandboxed Pi bash cannot overwrite protected workspace environment files",
     );
+
+    const workspaceAlias = join(root, "workspace-alias");
+    await symlink(workspace, workspaceAlias, process.platform === "win32" ? "junction" : "dir");
+    const retargetedSession = {};
+    const retargetedModeRef = createPiSandboxModeRef("allowed");
+    const retargetedTools = new Map<string, { execute: (...args: any[]) => Promise<unknown> }>();
+    createPiSandboxExtension(workspaceAlias, retargetedModeRef)({
+      registerTool: (tool: { name: string; execute: (...args: any[]) => Promise<unknown> }) =>
+        retargetedTools.set(tool.name, tool),
+    } as never);
+    await registerPiSandboxSession(retargetedSession, workspaceAlias, retargetedModeRef, "allowed");
+    await rm(workspaceAlias, { recursive: true, force: true });
+    await symlink(outsideDirectory, workspaceAlias, process.platform === "win32" ? "junction" : "dir");
+    const escapedBashFile = join(outsideDirectory, "bash-escaped.txt");
+    try {
+      const retargetedBash = retargetedTools.get("bash");
+      assert.ok(retargetedBash);
+      await assert.rejects(
+        retargetedBash.execute("retargeted-workspace-bash-test", { command: `touch '${escapedBashFile}'` }),
+        /outside allowed roots|outside the allowed root|outside the workspace|not allowed/i,
+      );
+      assert.equal(existsSync(escapedBashFile), false);
+    } finally {
+      await releasePiSandboxSession(retargetedSession);
+    }
   } finally {
     await releasePiSandboxSession(session);
     await rm(root, { recursive: true, force: true });

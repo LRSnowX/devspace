@@ -1,4 +1,5 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, lt } from "drizzle-orm";
+import { Result, TaggedError, type Result as BetterResult } from "better-result";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
   workspaceConversationBindings,
@@ -8,15 +9,37 @@ import {
 } from "./db/schema.js";
 
 export type WorkspaceMode = "checkout" | "worktree";
+export type WorkspaceStatus = "active" | "inactive" | "pruned";
+export type WorkspaceRecoveryKind = "head" | "stash";
+
+export class WorkspaceStoreError extends TaggedError("WorkspaceStoreError")<{
+  code: "WORKSPACE_STORE_ERROR";
+  operation: string;
+  workspaceId?: string;
+  cause: unknown;
+  message: string;
+}>() {
+  constructor(operation: string, cause: unknown, workspaceId?: string) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super({
+      code: "WORKSPACE_STORE_ERROR",
+      operation,
+      workspaceId,
+      cause,
+      message: `Workspace persistence operation failed (${operation}): ${detail}`,
+    });
+  }
+}
 
 export interface WorkspaceSession {
   id: string;
   root: string;
-  status: string;
+  status: WorkspaceStatus;
   mode: WorkspaceMode;
   sourceRoot?: string;
   baseRef?: string;
   baseSha?: string;
+  recoveryKind?: WorkspaceRecoveryKind;
   managed: boolean;
   createdAt: string;
   lastUsedAt: string;
@@ -41,7 +64,12 @@ export interface WorkspaceStore {
     managed?: boolean;
   }): WorkspaceSession;
   getSession(id: string): WorkspaceSession | undefined;
-  touchSession(id: string): void;
+  getSessionResult(id: string): BetterResult<WorkspaceSession | undefined, WorkspaceStoreError>;
+  listStaleManagedWorktrees(before: Date): BetterResult<WorkspaceSession[], WorkspaceStoreError>;
+  markSessionPruned(id: string, recoveryKind?: WorkspaceRecoveryKind): BetterResult<void, WorkspaceStoreError>;
+  reactivateSession(id: string): BetterResult<boolean, WorkspaceStoreError>;
+  touchSession(id: string): BetterResult<boolean, WorkspaceStoreError>;
+  deleteSession(id: string): BetterResult<void, WorkspaceStoreError>;
   getConversationBinding(
     conversationScopeId: string,
     targetKey: string,
@@ -115,12 +143,87 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     return row ? rowToWorkspaceSession(row) : undefined;
   }
 
-  touchSession(id: string): void {
-    this.database.db
-      .update(workspaceSessions)
-      .set({ lastUsedAt: new Date().toISOString() })
-      .where(eq(workspaceSessions.id, id))
-      .run();
+  getSessionResult(id: string): BetterResult<WorkspaceSession | undefined, WorkspaceStoreError> {
+    return workspaceStoreResult("get_session", () => this.getSession(id), id);
+  }
+
+  listStaleManagedWorktrees(before: Date): BetterResult<WorkspaceSession[], WorkspaceStoreError> {
+    return workspaceStoreResult("list_stale_managed_worktrees", () => (
+      this.database.db
+        .select()
+        .from(workspaceSessions)
+        .where(
+          and(
+            eq(workspaceSessions.status, "active"),
+            eq(workspaceSessions.mode, "worktree"),
+            eq(workspaceSessions.managed, "true"),
+            lt(workspaceSessions.lastUsedAt, before.toISOString()),
+          ),
+        )
+        .all()
+        .map(rowToWorkspaceSession)
+    ));
+  }
+
+  markSessionPruned(
+    id: string,
+    recoveryKind?: WorkspaceRecoveryKind,
+  ): BetterResult<void, WorkspaceStoreError> {
+    return workspaceStoreResult("mark_session_pruned", () => {
+      this.database.db
+        .update(workspaceSessions)
+        .set({
+          status: "pruned",
+          recoveryKind: recoveryKind ?? null,
+        })
+        .where(eq(workspaceSessions.id, id))
+        .run();
+    }, id);
+  }
+
+  reactivateSession(id: string): BetterResult<boolean, WorkspaceStoreError> {
+    return workspaceStoreResult("reactivate_session", () => {
+      const result = this.database.db
+        .update(workspaceSessions)
+        .set({
+          status: "active",
+          recoveryKind: null,
+          lastUsedAt: new Date().toISOString(),
+        })
+        .where(
+          and(
+            eq(workspaceSessions.id, id),
+            eq(workspaceSessions.status, "pruned"),
+          ),
+        )
+        .run();
+      return result.changes > 0;
+    }, id);
+  }
+
+  touchSession(id: string): BetterResult<boolean, WorkspaceStoreError> {
+    return workspaceStoreResult("touch_session", () => {
+      const result = this.database.db
+        .update(workspaceSessions)
+        .set({ lastUsedAt: new Date().toISOString() })
+        .where(
+          and(
+            eq(workspaceSessions.id, id),
+            eq(workspaceSessions.status, "active"),
+          ),
+        )
+        .run();
+      return result.changes > 0;
+    }, id);
+  }
+
+  deleteSession(id: string): BetterResult<void, WorkspaceStoreError> {
+    return workspaceStoreResult("delete_session", () => {
+      this.database.db
+        .delete(workspaceSessions)
+        .where(eq(workspaceSessions.id, id))
+        .run();
+    }, id);
   }
 
   getConversationBinding(
@@ -211,19 +314,40 @@ export function createWorkspaceStore(stateDir: string): WorkspaceStore {
   return new SqliteWorkspaceStore(stateDir);
 }
 
+export function createWorkspaceStoreResult(
+  stateDir: string,
+): BetterResult<WorkspaceStore, WorkspaceStoreError> {
+  return workspaceStoreResult("open_workspace_store", () => createWorkspaceStore(stateDir));
+}
+
+export function closeWorkspaceStoreResult(
+  store: WorkspaceStore,
+): BetterResult<void, WorkspaceStoreError> {
+  return workspaceStoreResult("close_workspace_store", () => store.close?.());
+}
+
 function rowToWorkspaceSession(row: WorkspaceSessionRow): WorkspaceSession {
   return {
     id: row.id,
     root: row.root,
-    status: row.status,
+    status: readWorkspaceStatus(row.status),
     mode: row.mode === "worktree" ? "worktree" : "checkout",
     sourceRoot: row.sourceRoot ?? undefined,
     baseRef: row.baseRef ?? undefined,
     baseSha: row.baseSha ?? undefined,
+    recoveryKind:
+      row.recoveryKind === "head" || row.recoveryKind === "stash"
+        ? row.recoveryKind
+        : undefined,
     managed: row.managed === "true",
     createdAt: row.createdAt,
     lastUsedAt: row.lastUsedAt,
   };
+}
+
+function readWorkspaceStatus(status: string): WorkspaceStatus {
+  if (status === "active" || status === "inactive" || status === "pruned") return status;
+  throw new Error(`Unknown workspace session status: ${status}`);
 }
 
 function rowToWorkspaceConversationBinding(
@@ -236,4 +360,25 @@ function rowToWorkspaceConversationBinding(
     createdAt: row.createdAt,
     lastUsedAt: row.lastUsedAt,
   };
+}
+
+function workspaceStoreResult<T>(
+  operation: string,
+  run: () => T,
+  workspaceId?: string,
+): BetterResult<T, WorkspaceStoreError> {
+  try {
+    return Result.ok(run());
+  } catch (cause) {
+    if (isProgrammerDefect(cause)) throw cause;
+    return Result.err(new WorkspaceStoreError(operation, cause, workspaceId));
+  }
+}
+
+function isProgrammerDefect(error: unknown): boolean {
+  return error instanceof TypeError
+    || error instanceof ReferenceError
+    || error instanceof SyntaxError
+    || error instanceof RangeError
+    || (error instanceof Error && error.name === "AssertionError");
 }

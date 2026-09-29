@@ -42,43 +42,12 @@ body {
   color: var(--color-text-primary, #f5f5f6);
 }
 
-.tool-card.workspace,
-.tool-card.directory {
+.tool-card.workspace {
   --tool-accent: color-mix(in srgb, var(--color-text-primary, #f5f5f6) 34%, #3b82f6 66%);
 }
 
-.tool-card.read,
-.tool-card.search {
-  --tool-accent: color-mix(in srgb, var(--color-text-primary, #f5f5f6) 32%, #06b6d4 68%);
-}
-
-.tool-card.write {
-  --tool-accent: var(--color-success-text, #6fda83);
-}
-
-.tool-card.edit,
 .tool-card.review {
   --tool-accent: color-mix(in srgb, var(--color-text-primary, #f5f5f6) 28%, #d99742 72%);
-}
-
-.tool-card.delete {
-  --tool-accent: var(--color-danger-text, #ee7676);
-}
-
-.tool-card.shell {
-  --tool-accent: color-mix(in srgb, var(--color-text-primary, #f5f5f6) 42%, #64748b 58%);
-}
-
-.tool-card.state-success {
-  --tool-accent: var(--color-success-text, #6fda83);
-}
-
-.tool-card.state-error {
-  --tool-accent: var(--color-danger-text, #ee7676);
-}
-
-.tool-card.state-running {
-  --tool-accent: color-mix(in srgb, var(--color-text-primary, #f5f5f6) 30%, #38bdf8 70%);
 }
 
 @supports selector(::-webkit-scrollbar) {
@@ -246,29 +215,6 @@ body {
 
 .chevron.expanded {
   transform: rotate(180deg);
-}
-
-.chevron.loading {
-  transform: none;
-}
-
-.chevron.loading .icon-svg {
-  animation: payload-spinner 700ms linear infinite;
-  fill: none;
-  stroke-linecap: round;
-  stroke-dasharray: 38 14;
-}
-
-@keyframes payload-spinner {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .chevron.loading .icon-svg {
-    animation: none;
-  }
 }
 
 .tool-body {
@@ -708,7 +654,7 @@ body {
 }
 
 .review-diff-file {
-  overflow: hidden;
+  overflow: clip;
   border: 0;
   border-radius: 0;
 }
@@ -718,6 +664,9 @@ body {
 }
 
 .review-diff-file-header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
   display: grid;
   grid-template-columns: 22px minmax(0, 1fr) auto;
   align-items: center;
@@ -726,7 +675,7 @@ body {
   min-height: 42px;
   padding: 0 12px;
   border: 0;
-  background: transparent;
+  background: var(--tool-card-body-bg);
   color: var(--color-text-primary, #f5f5f6);
   cursor: pointer;
   font: inherit;
@@ -765,11 +714,9 @@ body {
 }
 
 .review-single-file {
-  overflow: hidden;
-}
-
-.review-diff-file-header:hover {
-  background: var(--tool-card-hover-bg);
+  max-height: 520px;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .review-diff-file-name,
@@ -836,38 +783,22 @@ body {
   color: var(--color-danger-text, #ee7676);
 }
 
-.pierre-diff,
-.pierre-file {
+.pierre-diff {
   --diffs-bg: var(--tool-payload-bg, var(--color-background-primary, #101114));
   --diffs-light-bg: var(--color-background-primary, #ffffff);
   --diffs-dark-bg: var(--tool-payload-bg, var(--color-background-primary, #101114));
   --diffs-font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
   --diffs-header-font-family: var(--font-sans, ui-sans-serif, system-ui, sans-serif);
-  --diffs-font-size: var(--font-text-sm-size, 12px);
+  /* Keep iOS WebKit from inflating dense diff text independently of the card UI. */
+  --diffs-font-size: 12px;
   --diffs-line-height: 20px;
+
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
   display: block;
-  max-height: 420px;
-  overflow: auto;
+  overflow: visible;
   border-bottom-right-radius: 8px;
   border-bottom-left-radius: 8px;
-}
-
-.text-payload {
-  max-height: 420px;
-  margin: 0;
-  overflow: auto;
-  padding: 10px 12px;
-  color: var(--color-text-secondary, #c7c7ce);
-  font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
-  font-size: var(--font-text-sm-size, 12px);
-  line-height: 1.55;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-}
-
-.text-payload.bash {
-  color: var(--color-text-primary, #f5f5f6);
-  background: var(--color-background-primary, #101114);
 }
 
 @media (max-width: 520px) {

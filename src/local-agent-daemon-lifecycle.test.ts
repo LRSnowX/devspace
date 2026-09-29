@@ -10,7 +10,6 @@ import {
   localAgentDaemonPaths,
   removeLocalAgentDaemonFiles,
   ensureLocalAgentDaemonSecret,
-  writeLocalAgentDaemonPid,
 } from "./local-agent-daemon-lifecycle.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-agentd-lifecycle-test-"));
@@ -38,7 +37,6 @@ try {
   const recovered = new LocalAgentDaemonLock(paths);
   recovered.acquire();
   assert.equal(await readFile(paths.lockPath, "utf8"), `${process.pid}\n`);
-  writeLocalAgentDaemonPid(paths);
   assert.equal(await readFile(paths.pidPath, "utf8"), `${process.pid}\n`);
   assert.equal(isProcessAlive(process.pid), true);
   recovered.release();

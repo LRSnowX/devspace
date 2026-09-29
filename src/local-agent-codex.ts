@@ -10,6 +10,7 @@ import {
 } from "./local-agent-errors.js";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import { terminateProcessTree } from "./process-platform.js";
+import { DEVSPACE_VERSION } from "./version.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunCallbacks,
@@ -109,7 +110,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
 
   async initialize(): Promise<void> {
     await this.rpc.request("initialize", {
-      clientInfo: { name: "devspace", title: "DevSpace", version: "1.0.7" },
+      clientInfo: { name: "devspace", title: "DevSpace", version: DEVSPACE_VERSION },
       capabilities: {},
     });
     this.rpc.notify("initialized");
@@ -481,9 +482,9 @@ export function sandboxFor(writeMode: LocalAgentWriteMode | undefined): string {
   }
 }
 
-function sandboxPolicyFor(writeMode: LocalAgentWriteMode | undefined): Record<string, string> {
+function sandboxPolicyFor(writeMode: LocalAgentWriteMode | undefined): Record<string, string | boolean> {
   switch (writeMode) {
-    case "allowed": return { type: "workspaceWrite" };
+    case "allowed": return { type: "workspaceWrite", networkAccess: true };
     case "full_access": return { type: "dangerFullAccess" };
     case "read_only":
     case undefined: return { type: "readOnly" };
@@ -496,7 +497,8 @@ function parseCompletedTurn(params: unknown, items: unknown[]): {
   failure?: string;
 } {
   const turn = asRecord(asRecord(params)?.turn);
-  const completedItems = (Array.isArray(turn?.items) ? turn.items : items).slice(-MAX_TURN_ITEMS);
+  const turnItems = turn?.items;
+  const completedItems = (Array.isArray(turnItems) && turnItems.length > 0 ? turnItems : items).slice(-MAX_TURN_ITEMS);
   let finalResponse = "";
   for (const item of completedItems) {
     const record = asRecord(item);

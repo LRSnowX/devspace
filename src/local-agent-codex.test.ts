@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   CodexAppServerRuntime,
@@ -12,19 +12,7 @@ import {
 } from "./local-agent-codex.js";
 import { toAgentErrorPayload } from "./local-agent-errors.js";
 
-let resolverCalls = 0;
-const cachedDriver = new CodexLocalAgentDriver(
-  { CODEX_HOME: "/tmp/codex-home" },
-  () => {
-    resolverCalls += 1;
-    return { executable: "/usr/local/bin/codex", version: "1.2.3" };
-  },
-);
 const cachedContext = { agentId: "agt_test", provider: "codex" as const, workspaceRoot: "/tmp/project" };
-const resolvedCodexHome = resolve("/tmp/codex-home");
-assert.equal(cachedDriver.runtimeKey(cachedContext), `codex:/usr/local/bin/codex:${resolvedCodexHome}`);
-assert.equal(cachedDriver.runtimeKey(cachedContext), `codex:/usr/local/bin/codex:${resolvedCodexHome}`);
-assert.equal(resolverCalls, 1, "Codex executable identity is resolved once per driver lifecycle");
 
 assert.equal(parseCodexVersion("codex-cli 0.9.1"), "0.9.1");
 assert.equal(sandboxFor("read_only"), "read-only");
@@ -85,7 +73,15 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         output({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed", items: [] } } });
         return;
       }
-      const item = { type: "agentMessage", text: "fake response " + turn };
+      if (message.params.input[0].text === "notLoaded") {
+        const item = { type: "agentMessage", text: "CODEXOK" };
+        output({ method: "item/completed", params: { threadId: message.params.threadId, turnId, item } });
+        output({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed", items: [], itemsView: "notLoaded" } } });
+        return;
+      }
+      const item = { type: "agentMessage", text: message.params.input[0].text === "policy"
+        ? JSON.stringify(message.params.sandboxPolicy)
+        : "fake response " + turn };
       output({ method: "item/completed", params: { threadId: message.params.threadId, turnId, item } });
       output({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed", items: [item] } } });
     });
@@ -145,6 +141,23 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       assert.ok(protocolFailure.error.cause, "provider protocol cause remains available internally");
       assert.equal("cause" in toAgentErrorPayload(protocolFailure.error), false);
     }
+    const notLoaded = await runtime.run({
+      prompt: "notLoaded",
+      workspaceRoot: "/tmp/project",
+      providerSessionId: first.providerSessionId ?? undefined,
+    });
+    assert.equal(notLoaded.isOk(), true, "empty turn.items must fall back to item/completed stream items");
+    if (notLoaded.isErr()) throw notLoaded.error;
+    assert.equal(notLoaded.value.finalResponse, "CODEXOK");
+    const policy = await runtime.run({
+      prompt: "policy",
+      workspaceRoot: "/tmp/project",
+      writeMode: "allowed",
+      providerSessionId: first.providerSessionId ?? undefined,
+    });
+    assert.equal(policy.isOk(), true);
+    if (policy.isErr()) throw policy.error;
+    assert.deepEqual(JSON.parse(policy.value.finalResponse), { type: "workspaceWrite", networkAccess: true });
     await runtime.releaseSession("thread_new");
   } finally {
     await runtime.close();

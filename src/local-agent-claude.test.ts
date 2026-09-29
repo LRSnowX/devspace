@@ -5,6 +5,8 @@ import {
   type ClaudeQueryLike,
   type ClaudeUserMessage,
 } from "./local-agent-claude.js";
+import { createLocalAgentDrivers } from "./local-agent-adapters.js";
+import { subagentsConfigSchema } from "./local-agent-config.js";
 import type { LocalAgentRuntimeContext } from "./local-agent-runtime.js";
 
 class FakeClaudeQuery implements ClaudeQueryLike, AsyncIterator<unknown> {
@@ -121,6 +123,8 @@ assert.equal(query?.model, "sonnet");
 assert.equal(lastOptions?.resume, undefined);
 assert.equal(lastOptions?.permissionMode, "dontAsk");
 assert.equal(lastOptions?.allowDangerouslySkipPermissions, undefined);
+assert.deepEqual(lastOptions?.allowedTools, ["Read(/**)", "Edit(/**)", "Bash"]);
+assert.equal(lastOptions?.pathToClaudeCodeExecutable, undefined);
 const initialSandbox = lastOptions?.sandbox as Record<string, unknown>;
 assert.equal(initialSandbox.enabled, true);
 assert.equal(initialSandbox.failIfUnavailable, true);
@@ -131,17 +135,15 @@ assert.deepEqual((initialSandbox.filesystem as Record<string, unknown>).denyWrit
 const allowedSettings = claudeAuthoritySettings("/tmp/project", "allowed");
 const allowedPermissions = allowedSettings.permissions as Record<string, unknown>;
 const allowedSandbox = allowedSettings.sandbox as Record<string, unknown>;
-assert.ok((allowedPermissions.allow as string[]).includes("Bash(*)"));
+assert.deepEqual(allowedPermissions.deny, []);
 assert.deepEqual(allowedSandbox.filesystem, {
   allowWrite: ["/tmp/project"],
   denyWrite: [],
-  denyRead: (allowedSandbox.filesystem as Record<string, unknown>).denyRead,
-  allowRead: ["/tmp/project"],
 });
 const readOnlySettings = claudeAuthoritySettings("/tmp/project", "read_only");
 const readOnlyPermissions = readOnlySettings.permissions as Record<string, unknown>;
-assert.equal((readOnlyPermissions.allow as string[]).some((rule) => rule.startsWith("Edit(")), false);
-assert.ok((readOnlyPermissions.deny as string[]).includes("Bash(*)"));
+assert.ok((readOnlyPermissions.deny as string[]).includes("Bash"));
+assert.ok((readOnlyPermissions.deny as string[]).includes("Edit"));
 assert.deepEqual(
   ((readOnlySettings.sandbox as Record<string, unknown>).filesystem as Record<string, unknown>).allowWrite,
   [],
@@ -161,8 +163,9 @@ assert.equal(
   "dontAsk",
 );
 assert.equal(query?.flagSettings[1]?.effortLevel, "low");
-assert.ok(
-  ((query?.flagSettings[1]?.permissions as Record<string, unknown>).allow as string[]).includes("Bash(*)"),
+assert.equal(
+  ((query?.flagSettings[1]?.permissions as Record<string, unknown>).deny as string[]).includes("Edit"),
+  false,
 );
 assert.equal(
   (query?.flagSettings[2]?.permissions as Record<string, unknown>).defaultMode,
@@ -176,6 +179,15 @@ assert.equal(query?.closeCount, 1);
 const coldRuntime = await driver.createRuntime({ ...context, providerSessionId: "cold_session" });
 assert.equal(coldRuntime.isOk(), true);
 assert.equal(lastOptions?.resume, "cold_session");
+
+const customCommandDriver = new ClaudeLocalAgentDriver(({ prompt, options }) => {
+  lastOptions = options;
+  return new FakeClaudeQuery(prompt);
+}, { CLAUDE_COMMAND: "/opt/claude" });
+const customCommandRuntime = await customCommandDriver.createRuntime(context);
+assert.equal(customCommandRuntime.isOk(), true);
+assert.equal(lastOptions?.pathToClaudeCodeExecutable, "/opt/claude");
+if (customCommandRuntime.isOk()) await customCommandRuntime.value.close();
 
 const cancelled = await new ClaudeLocalAgentDriver(async () => {
   throw new DOMException("cancelled", "AbortError");
@@ -220,3 +232,39 @@ await assert.rejects(
   TypeError,
   "programmer defects must not be reclassified as provider failures",
 );
+
+let configuredOptions: Record<string, unknown> | undefined;
+const configuredDriver = createLocalAgentDrivers({
+  env: {
+    PATH: "/usr/bin",
+    CLAUDE_COMMAND: "/usr/bin/claude",
+    ANTHROPIC_API_KEY: "inherited",
+    INHERITED: "yes",
+  },
+  subagents: subagentsConfigSchema.parse({
+    enabled: true,
+    providers: [{
+      id: "claude",
+      enabled: true,
+      command: "/opt/bin/claude-wrapper",
+      env: { ANTHROPIC_API_KEY: "configured", EMPTY_VALUE: "" },
+    }],
+  }),
+  claudeQueryFactory: ({ prompt, options }) => {
+    configuredOptions = options;
+    return new FakeClaudeQuery(prompt);
+  },
+}).find((driver) => driver.provider === "claude");
+assert.ok(configuredDriver);
+const configuredRuntime = await configuredDriver.createRuntime(context);
+assert.equal(configuredRuntime.isOk(), true);
+if (configuredRuntime.isErr()) throw configuredRuntime.error;
+assert.equal(configuredOptions?.pathToClaudeCodeExecutable, "/opt/bin/claude-wrapper");
+assert.deepEqual(configuredOptions?.env, {
+  PATH: "/usr/bin",
+  CLAUDE_COMMAND: "/opt/bin/claude-wrapper",
+  ANTHROPIC_API_KEY: "configured",
+  INHERITED: "yes",
+  EMPTY_VALUE: "",
+});
+await configuredRuntime.value.close();

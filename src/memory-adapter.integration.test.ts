@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
+import { homedir } from "node:os";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -11,6 +12,7 @@ import { ProcessSessionManager } from "./process-sessions.js";
 import { createMcpServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
 const workspacePath = process.env.DEVSPACE_MEMORY_TEST_WORKSPACE;
 const memoryCommand = process.env.DEVSPACE_MEMORY_MCP_COMMAND;
@@ -30,21 +32,14 @@ test(
     const agentDir = join(temp, "agent");
     const stateDir = join(temp, "state");
     await mkdir(agentDir, { recursive: true });
-    const config = loadConfig({
-      DEVSPACE_CONFIG_DIR: join(temp, "config"),
-      DEVSPACE_ALLOWED_ROOTS: dirname(workspacePath),
-      DEVSPACE_WORKTREE_ROOT: join(temp, "worktrees"),
-      DEVSPACE_AGENT_DIR: agentDir,
-      DEVSPACE_WIDGETS: "off",
-      DEVSPACE_TOOL_MODE: "codex",
-      DEVSPACE_SKILLS: "0",
-      DEVSPACE_SUBAGENTS: "0",
-      DEVSPACE_MEMORY_ENABLED: "1",
-      DEVSPACE_MEMORY_MCP_COMMAND: memoryCommand,
-      ...(dataHome ? { DEVSPACE_MEMORY_DATA_HOME: dataHome } : {}),
-      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-      PORT: "1",
-    });
+    const config = loadConfig(writeTestDevspaceConfig(join(temp, "config"), {
+      server: { port: 1 },
+      workspaces: { allowedRoots: [dirname(workspacePath)], worktreeRoot: join(temp, "worktrees") },
+      storage: { stateDir },
+      skills: { enabled: false, agentDir },
+      ui: { enabled: false },
+      memory: { enabled: true, command: memoryCommand, dataHome: dataHome ?? null },
+    }));
     const store = new SqliteWorkspaceStore(stateDir);
     const workspaces = new WorkspaceRegistry(config, store);
     const server = createMcpServer(
@@ -72,21 +67,38 @@ test(
       const opened = await client.callTool({
         name: "open_workspace",
         arguments: { path: workspacePath, mode: "checkout" },
+        _meta: { "openai/session": "memory-e2e-session" },
       });
-      const workspaceId = readString(opened.structuredContent, "workspaceId");
+      const workspaceId = readString(opened.structuredContent, "workspace_id");
       assert.ok(workspaceId);
-      const bootstrap = readRecord(readRecord(opened.structuredContent)?.memoryContext);
+      const bootstrap = readRecord(readRecord(opened.structuredContent)?.memory_context);
       assert.ok(bootstrap);
-      assert.equal(readString(bootstrap, "project"), readString(opened.structuredContent, "projectName"));
+      assert.equal(readString(bootstrap, "project"), readString(opened.structuredContent, "project_name"));
       assert.ok(Buffer.byteLength(JSON.stringify(bootstrap), "utf8") <= 12_288);
+
+      const byName = await client.callTool({
+        name: "open_workspace",
+        arguments: { path: basename(workspacePath) },
+        _meta: { "openai/session": "memory-e2e-session" },
+      });
+      assert.equal(readString(byName.structuredContent, "workspace_id"), workspaceId);
+      const homeRelative = relative(homedir(), workspacePath);
+      if (!homeRelative.startsWith("..")) {
+        const byTilde = await client.callTool({
+          name: "open_workspace",
+          arguments: { path: `~/${homeRelative}` },
+          _meta: { "openai/session": "memory-e2e-session" },
+        });
+        assert.equal(readString(byTilde.structuredContent, "workspace_id"), workspaceId);
+      }
 
       if (foreignConversationId) {
         const denied = await client.callTool({
           name: "memory_get_thread",
           arguments: {
-            workspaceId,
-            conversationId: foreignConversationId,
-            messageLimit: 1,
+            workspace_id: workspaceId,
+            conversation_id: foreignConversationId,
+            message_limit: 1,
           },
         });
         assert.equal(denied.isError, true);
@@ -94,7 +106,7 @@ test(
 
       const search = await client.callTool({
         name: "memory_search",
-        arguments: { workspaceId, query: searchQuery, limit: 5 },
+        arguments: { workspace_id: workspaceId, query: searchQuery, limit: 5 },
       });
       assert.notEqual(search.isError, true);
       const hits = readArray(search.structuredContent, "hits");
@@ -110,9 +122,9 @@ test(
       const thread = await client.callTool({
         name: "memory_get_thread",
         arguments: {
-          workspaceId,
-          conversationId: evidenceId,
-          messageLimit: 5,
+          workspace_id: workspaceId,
+          conversation_id: evidenceId,
+          message_limit: 5,
         },
       });
       assert.notEqual(thread.isError, true);

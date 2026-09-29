@@ -1,13 +1,10 @@
 import assert from "node:assert/strict";
-import { basename } from "node:path";
 import type { AgentSessionEvent, AgentSessionEventListener } from "@earendil-works/pi-coding-agent";
 import {
   PiLocalAgentDriver,
-  piToolsForWriteMode,
   type PiSessionFactory,
   type PiSessionLike,
 } from "./local-agent-pi.js";
-import { createPiSandboxConfig } from "./local-agent-pi-sandbox.js";
 import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
 import type { LocalAgentRuntimeContext } from "./local-agent-runtime.js";
 
@@ -56,13 +53,15 @@ class FakePiSession implements PiSessionLike {
 
 const contexts: LocalAgentRuntimeContext[] = [];
 const sessions: FakePiSession[] = [];
-const factory: PiSessionFactory = async (context) => {
+let factoryEnv: NodeJS.ProcessEnv | undefined;
+const factory: PiSessionFactory = async (context, _input, env) => {
   contexts.push(context);
+  factoryEnv = env;
   const session = new FakePiSession();
   sessions.push(session);
   return session;
 };
-const driver = new PiLocalAgentDriver(factory);
+const driver = new PiLocalAgentDriver(factory, { HARNESS_ENV: "pi" });
 const pool = new LocalAgentRuntimePool();
 const context: LocalAgentRuntimeContext = {
   agentId: "agt_pi",
@@ -80,6 +79,7 @@ const first = await pool.run(driver, context, {
 }, {
   onSessionId: (sessionId) => { sessionIds.push(sessionId); },
 });
+assert.equal(factoryEnv?.HARNESS_ENV, "pi");
 const second = await pool.run(driver, context, {
   prompt: "second",
   workspaceRoot: "/tmp/project",
@@ -105,11 +105,6 @@ assert.equal(second.value.finalResponse, "response:second");
 assert.deepEqual(sessions[0]?.model, { id: "model" });
 assert.equal(sessions[0]?.effort, "high");
 assert.deepEqual(sessionIds, ["pi_session_1"]);
-assert.deepEqual(piToolsForWriteMode("allowed"), ["read", "grep", "find", "ls", "edit", "write", "bash"]);
-assert.ok(
-  createPiSandboxConfig().filesystem.denyRead.some((path) => basename(path) === ".ssh"),
-  "sandbox config includes the protected-home read rule; enforcement is covered by local-agent-pi-sandbox.test.ts",
-);
 assert.deepEqual(sessions[0]?.activeTools, ["read", "grep", "find", "ls"]);
 assert.deepEqual(sessions[0]?.toolHistory, [
   ["read", "grep", "find", "ls"],

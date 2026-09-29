@@ -7,9 +7,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+import { resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+import { createMcpHandler } from "@modelcontextprotocol/server";
+import { toNodeHandler } from "@modelcontextprotocol/node";
 import {
   registerAppResource,
   registerAppTool,
@@ -18,12 +18,11 @@ import {
 import express from "express";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";
-import { applyPatch } from "./apply-patch.js";
 import {
   isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
 } from "./artifact-tools.js";
-import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
+import { loadConfig, type ServerConfig } from "./config.js";
 import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
@@ -32,28 +31,31 @@ import {
   logEvent,
   requestIp,
   requestPath,
-  commandPreview,
-  sessionIdPrefix,
 } from "./logger.js";
-import {
-  editFileTool,
-  findFilesTool,
-  grepFilesTool,
-  listDirectoryTool,
-  readFileTool,
-  runShellTool,
-  writeFileTool,
-} from "./pi-tools.js";
+import { readFileTool } from "./pi-tools.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import {
-  McpSessionRegistry,
-  type McpSessionCloseResult,
-} from "./mcp-sessions.js";
-import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
+  compileMcpRegistrationSurface,
+  createModernMcpServerAdapter,
+  modernMcpAdapterErrorLogFields,
+  type McpRegistrationTarget,
+} from "./mcp-modern-server.js";
+import { ProcessSessionManager } from "./process-sessions.js";
+import {
+  MemoryAdapter,
+  MemoryThreadAuthorizationStore,
+  memoryEvidenceIdsFromBootstrapContext,
+  memoryEvidenceIdsFromSearchResult,
+  type MemoryBootstrapContext,
+  type MemoryClient,
+} from "./memory-adapter.js";
+import { ProjectRegistry } from "./project-registry.js";
+import { expandHomePath } from "./roots.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
-import { openAiConversationScopeId } from "./request-meta.js";
+import { conversationScopeIdFromRequestMeta } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
+import { DEVSPACE_VERSION } from "./version.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import {
@@ -65,41 +67,34 @@ import {
   formatLocalAgentProviderStatusSummary,
   type LocalAgentProviderStatus,
 } from "./local-agent-catalog.js";
+import { getToolSurface } from "./tool-surfaces/index.js";
 import {
-  MemoryAdapter,
-  MemoryThreadAuthorizationStore,
-  memoryEvidenceIdsFromBootstrapContext,
-  memoryEvidenceIdsFromSearchResult,
-  type MemoryBootstrapContext,
-  type MemoryClient,
-} from "./memory-adapter.js";
-import { ProjectRegistry } from "./project-registry.js";
+  contentText,
+  logFailedToolResponse,
+  logToolCall,
+  resultOutputSchema,
+  textBlock,
+  workspaceAppDescriptorMeta,
+} from "./tool-surfaces/shared.js";
+import {
+  WORKSPACE_APP_URI,
+  toolNames,
+  workspaceIdDescription,
+  type ToolContent,
+  type ToolSurface,
+} from "./tool-surfaces/types.js";
 
-type Transport = StreamableHTTPServerTransport;
-// MCP clients can reconnect without closing the previous transport. Bound stale
-// session retention so abandoned MCP servers do not accumulate for the life of the process.
-const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
-const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
-const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
-const WRITE_TOOL_ANNOTATIONS = {
-  readOnlyHint: false,
-  destructiveHint: true,
-  idempotentHint: false,
-  openWorldHint: false,
-};
-const EDIT_TOOL_ANNOTATIONS = {
-  readOnlyHint: false,
-  destructiveHint: true,
-  idempotentHint: false,
-  openWorldHint: false,
-};
-const SHELL_TOOL_ANNOTATIONS = {
-  readOnlyHint: false,
-  destructiveHint: true,
-  idempotentHint: false,
-  openWorldHint: true,
-};
+
+function mcpServerInfo() {
+  return {
+    name: "devspace",
+    title: "DevSpace",
+    version: DEVSPACE_VERSION,
+    description:
+      "Coding tools for project workspaces. Open each project or worktree once, then reuse its workspace_id.",
+  };
+}
 
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
@@ -108,9 +103,25 @@ interface RunningServer {
   close(): Promise<void>;
 }
 
-type ToolContent =
-  | { type: "text"; text: string }
-  | { type: "image"; data: string; mimeType: string };
+type TrackToolActivity = <T>(operation: () => Promise<T>) => Promise<T>;
+
+class ToolActivityTracker {
+  private readonly active = new Set<Promise<unknown>>();
+
+  readonly track: TrackToolActivity = <T>(operation: () => Promise<T>): Promise<T> => {
+    const promise = operation();
+    this.active.add(promise);
+    const remove = () => this.active.delete(promise);
+    void promise.then(remove, remove);
+    return promise;
+  };
+
+  async waitForIdle(): Promise<void> {
+    while (this.active.size > 0) {
+      await Promise.allSettled(Array.from(this.active));
+    }
+  }
+}
 
 interface WorkspaceAppManifestEntry {
   file: string;
@@ -120,116 +131,69 @@ interface WorkspaceAppManifestEntry {
 
 type WorkspaceAppManifest = Record<string, WorkspaceAppManifestEntry>;
 
-interface DiffStats {
-  additions: number;
-  removals: number;
-}
-
-type ToolWidgetKind =
-  | "workspace"
-  | "read"
-  | "write"
-  | "edit"
-  | "search"
-  | "directory"
-  | "shell"
-  | "show_changes";
-
-interface ToolDefinitionMeta extends Record<string, unknown> {
-  ui: {
-    resourceUri: string;
-    visibility: ["model"];
-  };
-}
-
-type EmptyToolDefinitionMeta = Record<string, unknown> & {
-  "ui/resourceUri"?: string;
-};
-
-interface ToolWidgetDescriptorMeta {
-  _meta: ToolDefinitionMeta | EmptyToolDefinitionMeta;
-}
-
-function shouldAttachWidget(mode: WidgetMode, kind: ToolWidgetKind): boolean {
-  switch (mode) {
-    case "off":
-      return false;
-    case "changes":
-      return kind === "workspace" || kind === "show_changes";
-    case "full":
-      return true;
-  }
-}
-
-function toolWidgetDescriptorMeta(
+function serverInstructions(
   config: ServerConfig,
-  kind: ToolWidgetKind,
-): ToolWidgetDescriptorMeta {
-  if (!shouldAttachWidget(config.widgets, kind)) return { _meta: {} };
-
-  return {
-    _meta: {
-      ui: {
-        resourceUri: WORKSPACE_APP_URI,
-        visibility: ["model"],
-      },
-    },
-  };
-}
-
-const toolNames = {
-  openWorkspace: "open_workspace",
-  read: "read",
-  write: "write",
-  edit: "edit",
-  grep: "grep",
-  glob: "glob",
-  ls: "ls",
-  shell: "bash",
-} as const;
-
-const workspaceIdDescription =
-  "Workspace to use. Reuse the current project's workspaceId.";
-
-interface ToolLogFields {
-  tool: string;
-  workspaceId?: string;
-  path?: string;
-  workingDirectory?: string;
-  command?: string;
-  commandLength?: number;
-  success: boolean;
-  durationMs: number;
-  error?: string;
-}
-
-function serverInstructions(config: ServerConfig): string {
-  const artifactInstruction = config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
-    ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value, the existing workspace ID, and a suitable relative destination path chosen from the user's request and project structure. The tool refuses to overwrite an existing destination and returns the normalized workspace-relative path. Use normal workspace tools when explicit inspection, replacement, movement, renaming, or deletion is needed. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
-    : "";
-  const showChangesInstruction =
-    config.widgets === "changes"
-      ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
+  toolSurface: ToolSurface,
+): string {
+  const artifactInstruction =
+    config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
+      ? " When the user provides an attached or generated file that needs to be added to the workspace, pass the provided file directly to download_artifact with the existing workspace_id and a suitable relative destination path. Do not reconstruct attached files manually."
       : "";
-  const handoffInstruction = config.memory.enabled
-    ? " A short continuation request such as '继续 <project>' can be opened directly by passing the project name or alias to open_workspace. It returns bounded project memory context when available. Use memory_search for explicit historical questions and memory_get_thread only to expand selected evidence. Cross-check recovered memory against the current repository before implementation."
-    : " A project may be opened by absolute path, canonical project name, alias, or a unique top-level directory name under an allowed root.";
-
-  if (config.toolMode === "codex") {
-    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${handoffInstruction}${artifactInstruction}${showChangesInstruction}`;
-  }
-
-  const inspection = config.toolMode !== "full"
-    ? `In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use ${toolNames.shell} with command-line tools such as grep, rg, find, ls, and tree for search and directory inspection. `
-    : `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. `;
-
+  const showChangesInstruction =
+    " If files are modified, call show_changes once after the final related change and before the final response.";
   const skills = config.skillsEnabled
-    ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `
+    ? `When ${toolNames.openWorkspace} returns available skills and a task matches one, use ${toolNames.read} with the returned skill path before proceeding. `
     : "";
+  const agents = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in available_agents_files, use ${toolNames.read} to inspect that instruction file and follow it. `;
+  const common = `Call ${toolNames.openWorkspace} when starting work in a project folder or isolated worktree without a usable workspace_id, then reuse the returned workspace_id for subsequent operations in that workspace.`;
+  const projectMemory = " open_workspace also accepts an unambiguous project name or registered alias. When memory is configured it may return bounded memory_context; verify it against current files. Use memory_search for explicit history questions and memory_get_thread only for discovered evidence.";
 
-  const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
+  return `${common}${projectMemory} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}`;
+}
 
-  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${handoffInstruction}${artifactInstruction}${showChangesInstruction}`;
+const memoryBootstrapHitOutputSchema = z.object({
+  conversation_id: z.string(),
+  evidence_conversation_id: z.string().optional(),
+  source: z.string(),
+  title: z.string(),
+  update_time: z.number().optional(),
+  snippet: z.string().optional(),
+  topic_tags: z.array(z.string()),
+});
+const memoryBootstrapContextOutputSchema = z.object({
+  project: z.string(),
+  source_policy: z.string(),
+  relevant: z.array(memoryBootstrapHitOutputSchema),
+  recent: z.array(memoryBootstrapHitOutputSchema),
+  truncated: z.boolean(),
+  byte_budget: z.number().int().positive(),
+});
+
+function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number) {
+  const mapHit = (hit: MemoryBootstrapContext["relevant"][number]) => ({
+    conversation_id: hit.conversationId,
+    evidence_conversation_id: hit.evidenceConversationId,
+    source: hit.source,
+    title: hit.title,
+    update_time: hit.updateTime,
+    snippet: hit.snippet,
+    topic_tags: hit.topicTags,
+  });
+  const output = {
+    project: context.project,
+    source_policy: context.sourcePolicy,
+    relevant: context.relevant.map(mapHit),
+    recent: context.recent.map(mapHit),
+    truncated: context.truncated,
+    byte_budget: byteBudget,
+  };
+  while (Buffer.byteLength(JSON.stringify(output), "utf8") > byteBudget) {
+    if (output.recent.length > 0) output.recent.pop();
+    else if (output.relevant.length > 0) output.relevant.pop();
+    else throw new Error("Memory bootstrap byte budget is too small for its envelope");
+    output.truncated = true;
+  }
+  return output;
 }
 
 function formatVisibleAgent(agent: {
@@ -255,17 +219,6 @@ function formatAvailableAgentProvider(provider: {
     provider.note,
   ].filter(Boolean).join(", ");
   return `${provider.id}${details ? ` (${details})` : ""}`;
-}
-
-function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
-  return {
-    result: z
-      .string()
-      .describe(
-        "Model-readable result text for follow-up reasoning and plain MCP hosts.",
-      ),
-    ...extra,
-  };
 }
 
 const workspaceSkillOutputSchema = z.object({
@@ -298,39 +251,6 @@ const workspaceAvailableAgentsFileOutputSchema = z.object({
   path: z.string(),
 });
 
-const reviewFileOutputSchema = z.object({
-  path: z.string(),
-  previousPath: z.string().optional(),
-  type: z.enum(["change", "rename-pure", "rename-changed", "new", "deleted"]),
-  additions: z.number(),
-  removals: z.number(),
-});
-
-const reviewSummaryOutputSchema = z.object({
-  files: z.number(),
-  additions: z.number(),
-  removals: z.number(),
-});
-
-const memoryBootstrapHitOutputSchema = z.object({
-  conversationId: z.string(),
-  evidenceConversationId: z.string().optional(),
-  source: z.string(),
-  title: z.string(),
-  updateTime: z.number().optional(),
-  snippet: z.string().optional(),
-  topicTags: z.array(z.string()),
-});
-
-const memoryBootstrapContextOutputSchema = z.object({
-  project: z.string(),
-  sourcePolicy: z.string(),
-  relevant: z.array(memoryBootstrapHitOutputSchema),
-  recent: z.array(memoryBootstrapHitOutputSchema),
-  truncated: z.boolean(),
-  byteBudget: z.number().int().positive(),
-});
-
 function sendJsonRpcError(
   res: Response,
   status: number,
@@ -353,105 +273,6 @@ function requestLogFields(req: Request, config: ServerConfig): Record<string, un
     referer: req.header("referer"),
     contentLength: req.header("content-length"),
   };
-}
-
-function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
-  if (!config.logging.toolCalls) return;
-
-  const { command, ...safeFields } = fields;
-  logEvent(config.logging, fields.success ? "info" : "warn", "tool_call", {
-    ...safeFields,
-    commandPreview: config.logging.shellCommands && command ? commandPreview(command) : undefined,
-  });
-}
-
-function contentText(content: ToolContent[]): string {
-  return content
-    .filter(
-      (item): item is { type: "text"; text: string } => item.type === "text",
-    )
-    .map((item) => item.text)
-    .join("\n");
-}
-
-function toolErrorPreview(content: ToolContent[]): string | undefined {
-  const text = contentText(content).replace(/\s+/g, " ").trim();
-  if (!text) return undefined;
-  return text.length > 240 ? `${text.slice(0, 237)}...` : text;
-}
-
-function logFailedToolResponse(
-  config: ServerConfig,
-  fields: Omit<ToolLogFields, "success" | "durationMs" | "error">,
-  content: ToolContent[],
-  startedAt: number,
-): void {
-  logToolCall(config, {
-    ...fields,
-    success: false,
-    durationMs: Math.round(performance.now() - startedAt),
-    error: toolErrorPreview(content),
-  });
-}
-
-function textBlock(text: string): ToolContent {
-  return { type: "text", text };
-}
-
-function textSummary(content: ToolContent[]): {
-  lines: number;
-  characters: number;
-} {
-  const text = contentText(content);
-  return {
-    lines: text.length === 0 ? 0 : text.split("\n").length,
-    characters: text.length,
-  };
-}
-
-function contentLineCount(content: string): number {
-  if (content.length === 0) return 0;
-  return content.endsWith("\n")
-    ? content.slice(0, -1).split("\n").length
-    : content.split("\n").length;
-}
-
-function countDiffStats(diff: string | undefined): DiffStats {
-  if (!diff) return { additions: 0, removals: 0 };
-
-  let additions = 0;
-  let removals = 0;
-
-  for (const line of diff.split("\n")) {
-    if (line.startsWith("+") && !line.startsWith("+++")) additions++;
-    if (line.startsWith("-") && !line.startsWith("---")) removals++;
-  }
-
-  return { additions, removals };
-}
-
-function newFilePatch(path: string, content: string): string {
-  const lines =
-    content.length === 0
-      ? []
-      : content.endsWith("\n")
-        ? content.slice(0, -1).split("\n")
-        : content.split("\n");
-  const hunkLength = lines.length;
-  const hunkRange = hunkLength === 0 ? "+0,0" : `+1,${hunkLength}`;
-  const body = lines.map((line) => `+${line}`).join("\n");
-
-  return [
-    `diff --git a/${path} b/${path}`,
-    "new file mode 100644",
-    "index 0000000..0000000",
-    "--- /dev/null",
-    `+++ b/${path}`,
-    `@@ -0,0 ${hunkRange} @@`,
-    body,
-  ]
-    .filter((line) => line.length > 0)
-    .join("\n");
 }
 
 function assetBaseUrl(config: ServerConfig): string {
@@ -541,201 +362,6 @@ async function assertWorkspaceAppAssets(): Promise<void> {
   }
 }
 
-function processResult(snapshot: ProcessSnapshot): string {
-  const status = snapshot.running
-    ? `Process running with session ID ${snapshot.sessionId}.`
-    : snapshot.signal
-      ? `Process exited after signal ${snapshot.signal}.`
-      : `Process exited with code ${snapshot.exitCode ?? "unknown"}.`;
-  return snapshot.output ? `${snapshot.output.replace(/\n$/, "")}\n${status}` : status;
-}
-
-function processOutputSchema(): z.ZodRawShape {
-  return resultOutputSchema({
-    sessionId: z.number().optional(),
-    running: z.boolean(),
-    exitCode: z.number().int().optional(),
-    signal: z.string().optional(),
-    wallTimeMs: z.number().nonnegative(),
-    outputTruncated: z.boolean(),
-  });
-}
-
-function processToolResponse(
-  tool: "exec_command" | "write_stdin",
-  workspaceId: string,
-  snapshot: ProcessSnapshot,
-  summary: Record<string, unknown>,
-) {
-  const result = processResult(snapshot);
-  const content = [textBlock(result)];
-  const outputSummary = textSummary(snapshot.output ? [textBlock(snapshot.output)] : []);
-  return {
-    content,
-    _meta: {
-      tool,
-      card: {
-        workspaceId,
-        summary: { ...summary, ...outputSummary },
-        payload: { content },
-      },
-    },
-    structuredContent: {
-      result,
-      sessionId: snapshot.sessionId,
-      running: snapshot.running,
-      exitCode: snapshot.exitCode,
-      signal: snapshot.signal,
-      wallTimeMs: snapshot.wallTimeMs,
-      outputTruncated: snapshot.outputTruncated,
-    },
-  };
-}
-
-function registerCodexProcessTools(
-  server: McpServer,
-  config: ServerConfig,
-  workspaces: WorkspaceRegistry,
-  processSessions: ProcessSessionManager,
-): void {
-  registerAppTool(
-    server,
-    "exec_command",
-    {
-      title: "Execute command",
-      description:
-        "Run a command in a workspace. Returns its result when it exits during the yield window, otherwise returns a sessionId for write_stdin. Use this for file inspection, tests, builds, package scripts, and long-running processes.",
-      inputSchema: {
-        workspaceId: z.string().describe(workspaceIdDescription),
-        cmd: z.string().min(1).describe("Shell command to execute."),
-        tty: z
-          .boolean()
-          .optional()
-          .describe("Allocate a pseudo-terminal for interactive commands. Defaults to false."),
-        columns: z.number().int().min(1).max(1_000).optional().describe("Initial PTY width. Defaults to 80."),
-        rows: z.number().int().min(1).max(1_000).optional().describe("Initial PTY height. Defaults to 24."),
-        workingDirectory: z
-          .string()
-          .optional()
-          .describe("Working directory relative to the workspace root. Defaults to the workspace root."),
-        yieldTimeMs: z
-          .number()
-          .int()
-          .min(0)
-          .max(30_000)
-          .optional()
-          .describe("Milliseconds to wait before returning a running session. Defaults to 10000."),
-        maxOutputTokens: z
-          .number()
-          .int()
-          .positive()
-          .max(100_000)
-          .optional()
-          .describe("Approximate output token budget. Defaults to 10000."),
-      },
-      outputSchema: processOutputSchema(),
-      ...toolWidgetDescriptorMeta(config, "shell"),
-      annotations: SHELL_TOOL_ANNOTATIONS,
-    },
-    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
-      const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
-      const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
-      const snapshot = await processSessions.start({
-        workspaceId,
-        command: cmd,
-        cwd,
-        workspaceRoot: workspace.root,
-        tty,
-        columns,
-        rows,
-        yieldTimeMs,
-        maxOutputTokens,
-      });
-
-      logToolCall(config, {
-        tool: "exec_command",
-        workspaceId,
-        workingDirectory: workingDirectory ?? ".",
-        command: cmd,
-        commandLength: cmd.length,
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
-      });
-
-      return processToolResponse("exec_command", workspaceId, snapshot, {
-        command: cmd,
-        workingDirectory: workingDirectory ?? ".",
-        running: snapshot.running,
-        exitCode: snapshot.exitCode,
-        wallTimeMs: snapshot.wallTimeMs,
-      });
-    },
-  );
-
-  registerAppTool(
-    server,
-    "write_stdin",
-    {
-      title: "Write to process",
-      description:
-        "Poll or write characters to a process returned by exec_command. Omit chars or pass an empty string to poll. Pass \\u0003 to send Ctrl-C.",
-      inputSchema: {
-        workspaceId: z.string().describe("Workspace identifier used to start the process."),
-        sessionId: z.number().describe("Process session identifier returned by exec_command."),
-        chars: z.string().optional().describe("Characters to write. Omit or pass an empty string to poll."),
-        columns: z.number().int().min(1).max(1_000).optional().describe("Resize a PTY to this width."),
-        rows: z.number().int().min(1).max(1_000).optional().describe("Resize a PTY to this height."),
-        yieldTimeMs: z
-          .number()
-          .int()
-          .min(0)
-          .max(30_000)
-          .optional()
-          .describe("Milliseconds to wait for process output or completion. Defaults to 10000."),
-        maxOutputTokens: z
-          .number()
-          .int()
-          .positive()
-          .max(100_000)
-          .optional()
-          .describe("Approximate output token budget. Defaults to 10000."),
-      },
-      outputSchema: processOutputSchema(),
-      ...toolWidgetDescriptorMeta(config, "shell"),
-      annotations: SHELL_TOOL_ANNOTATIONS,
-    },
-    async ({ workspaceId, sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens }) => {
-      const startedAt = performance.now();
-      workspaces.getWorkspace(workspaceId);
-      const snapshot = await processSessions.write({
-        workspaceId,
-        sessionId,
-        chars,
-        columns,
-        rows,
-        yieldTimeMs,
-        maxOutputTokens,
-      });
-
-      logToolCall(config, {
-        tool: "write_stdin",
-        workspaceId,
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
-      });
-
-      return processToolResponse("write_stdin", workspaceId, snapshot, {
-        sessionId,
-        charactersWritten: chars?.length ?? 0,
-        running: snapshot.running,
-        exitCode: snapshot.exitCode,
-        wallTimeMs: snapshot.wallTimeMs,
-      });
-    },
-  );
-}
-
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -743,30 +369,62 @@ export function createMcpServer(
   processSessions: ProcessSessionManager,
   resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  trackToolActivity?: TrackToolActivity,
   memoryClient?: MemoryClient,
   memoryThreadAuthorizations = new MemoryThreadAuthorizationStore(),
 ): McpServer {
+  const toolSurface = getToolSurface(config.toolMode);
   const server = new McpServer(
+    mcpServerInfo(),
     {
-      name: "devspace",
-      title: "DevSpace",
-      version: "0.1.0",
-      description:
-        "Coding tools for project workspaces. Open each project or worktree once, then reuse its workspaceId.",
-    },
-    {
-      instructions: serverInstructions(config),
+      instructions: serverInstructions(config, toolSurface),
     },
   );
+
+  registerMcpSurface(
+    server,
+    config,
+    workspaces,
+    reviewCheckpoints,
+    processSessions,
+    resolveLocalAgentProviders,
+    incomingArtifactAdapters,
+    trackToolActivity,
+    memoryClient,
+    memoryThreadAuthorizations,
+  );
+  return server;
+}
+
+function registerMcpSurface(
+  server: McpRegistrationTarget,
+  config: ServerConfig,
+  workspaces: WorkspaceRegistry,
+  reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
+  processSessions: ProcessSessionManager,
+  resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
+  incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  trackToolActivity?: TrackToolActivity,
+  memoryClient?: MemoryClient,
+  memoryThreadAuthorizations = new MemoryThreadAuthorizationStore(),
+): void {
+  const registrationTarget = trackToolActivity
+    ? withTrackedToolHandlers(server, trackToolActivity)
+    : server;
+  const toolSurface = getToolSurface(config.toolMode);
   const memory = memoryClient ?? new MemoryAdapter(config.memory);
   const projects = new ProjectRegistry(config.projectRegistryPath, config.allowedRoots);
-  const memoryAuthorizationKey = (workspaceId: string): string => {
-    const workspace = workspaces.getWorkspace(workspaceId);
-    return workspace.sourceRoot ?? workspace.root;
+  const memoryProjectForWorkspace = async (workspaceId: string) => {
+    const workspace = await workspaces.getWorkspace(workspaceId);
+    const path = workspace.sourceRoot ?? workspace.root;
+    return {
+      project: projects.projectNameForPath(path) ?? basename(path),
+      authorizationKey: path,
+    };
   };
 
   registerAppResource(
-    server,
+    registrationTarget,
     "DevSpace Diff Card",
     WORKSPACE_APP_URI,
     {
@@ -797,17 +455,17 @@ export function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    registrationTarget,
     "open_workspace",
     {
       title: "Open workspace",
       description:
-        "Start work in a project when no usable workspaceId exists for it. Accepts an absolute path, canonical project name, registered alias, or unique top-level directory name under an allowed root. During continued work, reuse the existing workspaceId. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work.",
+        "Start work in a project directory or isolated worktree when no usable workspace_id exists for it. Accepts an absolute or ~/ path, registered project name or alias, or unique top-level directory name in an allowed root. Reuse the existing workspace_id during continued work. Defaults to the actual checkout; set mode=\"worktree\" for isolated work.",
       inputSchema: {
         path: z
           .string()
           .describe(
-            "Absolute/~/ path, canonical project name, registered alias, or unique top-level directory name under an allowed root.",
+            "Absolute or ~/ path, canonical project name, registered alias, or unique top-level directory name under an allowed root.",
           ),
         mode: z
           .enum(["checkout", "worktree"])
@@ -815,56 +473,61 @@ export function createMcpServer(
           .describe(
             "Defaults to checkout, which works in the actual directory. Use worktree for isolated or parallel Git work.",
           ),
-        baseRef: z
+        base_ref: z
           .string()
           .optional()
           .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
       },
       outputSchema: {
-        workspaceId: z.string(),
+        workspace_id: z.string(),
         root: z.string(),
         mode: z.enum(["checkout", "worktree"]),
-        sourceRoot: z.string().optional(),
+        source_root: z.string().optional(),
         worktree: z
           .object({
             path: z.string(),
-            baseRef: z.string(),
-            baseSha: z.string(),
-            dirtySource: z.boolean(),
+            base_ref: z.string(),
+            base_sha: z.string(),
+            dirty_source: z.boolean(),
             detached: z.boolean(),
             managed: z.boolean(),
           })
           .optional(),
-        agentsFiles: z.array(workspaceAgentsFileOutputSchema).optional(),
-        availableAgentsFiles: z.array(workspaceAvailableAgentsFileOutputSchema).optional(),
+        agents_files: z.array(workspaceAgentsFileOutputSchema).optional(),
+        available_agents_files: z.array(workspaceAvailableAgentsFileOutputSchema).optional(),
         skills: z.array(workspaceSkillOutputSchema).optional(),
-        agentProviders: z.array(workspaceLocalAgentProviderOutputSchema).optional(),
+        agent_providers: z.array(workspaceLocalAgentProviderOutputSchema).optional(),
         agents: z.array(workspaceLocalAgentOutputSchema).optional(),
-        skillDiagnostics: z.array(z.unknown()).optional(),
-        projectName: z.string(),
-        memoryContext: memoryBootstrapContextOutputSchema.optional(),
+        skill_diagnostics: z.array(z.unknown()).optional(),
+        project_name: z.string(),
+        memory_context: memoryBootstrapContextOutputSchema.optional(),
+        review: z.discriminatedUnion("available", [
+          z.object({ available: z.literal(true) }),
+          z.object({
+            available: z.literal(false),
+            reason: z.string(),
+          }),
+        ]),
         instruction: z.string(),
       },
-      ...toolWidgetDescriptorMeta(config, "workspace"),
+      ...workspaceAppDescriptorMeta(config),
       annotations: { readOnlyHint: true },
     },
-    async ({ path, mode, baseRef }, { _meta }) => {
+    async ({ path, mode, base_ref }, { _meta }) => {
       const startedAt = performance.now();
+      const baseRef = base_ref;
       let resolvedPath = path;
       let projectName: string;
       if (isAbsolute(path) || path === "~" || path.startsWith("~/") || path.startsWith("~\\")) {
+        resolvedPath = expandHomePath(path);
         projectName = projects.projectNameForPath(path) ?? basename(path);
       } else {
         const lookup = projects.lookup(path);
         if (lookup.status === "unknown") {
-          throw new Error(
-            `Unknown project '${path}'. Pass an absolute path inside an allowed root or register the project in ${config.projectRegistryPath}.`,
-          );
+          throw new Error(`Unknown project '${path}'. Pass an absolute path inside an allowed root or register it with devspace projects register.`);
         }
         if (lookup.status === "ambiguous") {
-          throw new Error(
-            `Project '${path}' is ambiguous across allowed roots: ${lookup.paths.join(", ")}. Pass an absolute path or add a canonical registry entry.`,
-          );
+          throw new Error(`Project '${path}' is ambiguous across allowed roots: ${lookup.paths.join(", ")}. Pass an absolute path or register it.`);
         }
         resolvedPath = lookup.resolution.project.path;
         projectName = lookup.resolution.project.name;
@@ -877,16 +540,21 @@ export function createMcpServer(
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
         { path: resolvedPath, mode, baseRef },
-        { conversationScopeId: openAiConversationScopeId(_meta) },
+        { conversationScopeId: conversationScopeIdFromRequestMeta(_meta) },
       );
-      if (config.widgets === "changes") {
-        await reviewCheckpoints.initializeWorkspace({
-          workspaceId: workspace.id,
-          root: workspace.root,
-        });
-      }
+      const review = await reviewCheckpoints.initializeWorkspace({
+        workspaceId: workspace.id,
+        root: workspace.root,
+      });
+      const preloadSubagents = config.subagents.enabled
+        && config.subagents.instructions === "preload";
+      const subagentsSkill = workspace.skills.find((skill) => skill.name === "subagents");
+      const preloadedSubagentInstructions = preloadSubagents && subagentsSkill
+        ? readFileSync(subagentsSkill.filePath, "utf8")
+        : undefined;
       const cardSkills = workspace.skills
         .filter((skill) => !skill.disableModelInvocation)
+        .filter((skill) => !(preloadSubagents && skill.name === "subagents"))
         .map((skill) => ({
           name: skill.name,
           description: skill.description,
@@ -918,13 +586,15 @@ export function createMcpServer(
       const visibleAgents = includeBootstrapContext ? cardAgents : [];
       const loadedAgentsFiles = includeBootstrapContext ? cardAgentsFiles : [];
       const availableAgentsFileOutputs = includeBootstrapContext ? cardAvailableAgentsFiles : [];
-      let memoryContext: MemoryBootstrapContext | undefined;
+      let memoryContext: ReturnType<typeof modelMemoryContext> | undefined;
       if (memory.enabled && includeBootstrapContext) {
         try {
-          memoryContext = await memory.bootstrapProjectContext(projectName);
+          const compact = await memory.bootstrapProjectContext(projectName);
+          const candidate = modelMemoryContext(compact, config.memory.bootstrapByteBudget);
+          memoryContext = candidate;
           memoryThreadAuthorizations.authorize(
             workspace.sourceRoot ?? workspace.root,
-            memoryEvidenceIdsFromBootstrapContext(memoryContext),
+            memoryEvidenceIdsFromBootstrapContext(compact),
           );
         } catch (error) {
           logEvent(config.logging, "warn", "memory_bootstrap_failed", {
@@ -934,17 +604,24 @@ export function createMcpServer(
         }
       }
       const cardInstruction = config.skillsEnabled
-        ? "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
-        : "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.";
-      const instruction = workspaceReused
+        ? "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
+        : "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file.";
+      const workspaceInstruction = workspaceReused
         ? [
             `Workspace already open as ${workspace.id}.`,
-            "Continue with this workspaceId.",
+            "Continue with this workspace_id.",
             "Keep following the project instructions, nested instruction files, skills, agent profiles, and diagnostics already provided for this workspace.",
           ].join("\n\n")
         : workspace.mode === "worktree"
-          ? "Use this workspaceId for subsequent work in this isolated worktree. Keep reusing it while working in this worktree. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for it."
+          ? "Use this workspace_id for subsequent work in this isolated worktree. Keep reusing it while working in this worktree. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for it."
           : cardInstruction;
+      const instruction = preloadedSubagentInstructions && includeBootstrapContext
+        ? [
+            workspaceInstruction,
+            "Subagent workflow instructions:",
+            preloadedSubagentInstructions,
+          ].join("\n\n")
+        : workspaceInstruction;
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -971,9 +648,7 @@ export function createMcpServer(
             visibleAgents.length > 0
               ? `Available subagent profiles: ${visibleAgents.map(formatVisibleAgent).join(", ")}`
               : undefined,
-            memoryContext
-              ? "Bounded project memory context is available in structuredContent.memoryContext."
-              : undefined,
+            memoryContext ? "Bounded project memory context is available in structuredContent.memory_context." : undefined,
             instruction,
           ].filter(Boolean).join("\n"),
         },
@@ -989,7 +664,6 @@ export function createMcpServer(
       return {
         content: resultContent,
         _meta: {
-          tool: "open_workspace",
           card: {
             workspaceId: workspace.id,
             root: workspace.root,
@@ -1004,6 +678,7 @@ export function createMcpServer(
             skills: cardSkills,
             agentProviders: cardAgentProviders,
             agents: cardAgents,
+            review,
             instruction: cardInstruction,
             summary: {
               mode: workspace.mode,
@@ -1016,21 +691,31 @@ export function createMcpServer(
           },
         },
         structuredContent: {
-          workspaceId: workspace.id,
+          workspace_id: workspace.id,
           root: workspace.root,
           mode: workspace.mode,
-          projectName,
-          memoryContext,
-          sourceRoot: workspace.sourceRoot,
-          worktree: workspace.worktree,
+          project_name: projectName,
+          memory_context: memoryContext,
+          source_root: workspace.sourceRoot,
+          worktree: workspace.worktree
+            ? {
+                path: workspace.worktree.path,
+                base_ref: workspace.worktree.baseRef,
+                base_sha: workspace.worktree.baseSha,
+                dirty_source: workspace.worktree.dirtySource,
+                detached: workspace.worktree.detached,
+                managed: workspace.worktree.managed,
+              }
+            : undefined,
+          review,
           ...(includeBootstrapContext
             ? {
-                agentsFiles: loadedAgentsFiles,
-                availableAgentsFiles: availableAgentsFileOutputs,
+                agents_files: loadedAgentsFiles,
+                available_agents_files: availableAgentsFileOutputs,
                 skills: visibleSkills,
-                agentProviders: visibleAgentProviders,
+                agent_providers: visibleAgentProviders,
                 agents: visibleAgents,
-                skillDiagnostics: workspace.skillDiagnostics,
+                skill_diagnostics: workspace.skillDiagnostics,
               }
             : {}),
           instruction,
@@ -1040,93 +725,78 @@ export function createMcpServer(
   );
 
   if (memory.enabled) {
-    const projectNameForWorkspace = (workspaceId: string): string => {
-      const workspace = workspaces.getWorkspace(workspaceId);
-      const identityPath = workspace.sourceRoot ?? workspace.root;
-      return projects.projectNameForPath(identityPath) ?? basename(identityPath);
-    };
-    server.registerTool(
+    registrationTarget.registerTool(
       "memory_search",
       {
         title: "Search project memory",
-        description:
-          "Search long-term AI conversation memory for the current workspace. Uses project-scoped multilingual hybrid retrieval; use the returned evidence conversation id with memory_get_thread to expand original evidence.",
+        description: "Search long-term AI conversation memory relevant to the current project. Results are a relevance filter, not a project security boundary. Use memory_get_thread to expand discovered evidence.",
         inputSchema: {
-          workspaceId: z.string().describe(workspaceIdDescription),
-          query: z.string().trim().min(1).describe("Natural-language memory query."),
-          limit: z.number().int().positive().max(20).optional().describe("Maximum hits. Defaults to 8."),
+          workspace_id: z.string().describe(workspaceIdDescription),
+          query: z.string().trim().min(1),
+          limit: z.number().int().positive().max(20).optional(),
         },
         annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, query, limit }) => {
-        const result = await memory.call("memory_search", {
-          query,
-          project: projectNameForWorkspace(workspaceId),
-          limit,
-        });
+      async ({ workspace_id, query, limit }) => {
+        const { project, authorizationKey } = await memoryProjectForWorkspace(workspace_id);
+        const result = await memory.call("memory_search", { project, query, limit });
         memoryThreadAuthorizations.authorize(
-          memoryAuthorizationKey(workspaceId),
+          authorizationKey,
           memoryEvidenceIdsFromSearchResult(result),
         );
         return result;
       },
     );
-
-    server.registerTool(
+    registrationTarget.registerTool(
       "memory_get_thread",
       {
-        title: "Read memory thread",
-        description:
-          "Read a normalized historical conversation thread with pagination. The conversation must have been returned for this project by open_workspace memory bootstrap or memory_search. After a DevSpace server restart, repeat memory_search before expanding older evidence.",
+        title: "Read discovered memory thread",
+        description: "Expand a conversation or evidence ID previously returned for this project by open_workspace or memory_search. Authorization is process-local and expires on server restart.",
         inputSchema: {
-          workspaceId: z.string().describe(workspaceIdDescription),
-          conversationId: z.string().trim().min(1).describe("Indexed conversation id."),
-          messageOffset: z.number().int().nonnegative().optional().describe("0-based message offset."),
-          messageLimit: z.number().int().positive().max(250).optional().describe("Maximum messages. Defaults to 80."),
+          workspace_id: z.string().describe(workspaceIdDescription),
+          conversation_id: z.string().trim().min(1),
+          message_offset: z.number().int().nonnegative().optional(),
+          message_limit: z.number().int().positive().max(250).optional(),
         },
         annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, conversationId, messageOffset, messageLimit }) => {
-        const authorizationKey = memoryAuthorizationKey(workspaceId);
-        if (!memoryThreadAuthorizations.isAuthorized(authorizationKey, conversationId)) {
-          throw new Error(
-            "Memory thread is not authorized by this project's memory discovery. Expand evidence returned by open_workspace memory context or memory_search; repeat memory_search after a server restart.",
-          );
+      async ({ workspace_id, conversation_id, message_offset, message_limit }) => {
+        const { authorizationKey } = await memoryProjectForWorkspace(workspace_id);
+        if (!memoryThreadAuthorizations.isAuthorized(authorizationKey, conversation_id)) {
+          throw new Error("Memory thread is not authorized by this project's memory discovery. Search again after a server restart.");
         }
         return memory.call("memory_get_thread", {
-          conversation_id: conversationId,
-          message_offset: messageOffset,
-          message_limit: messageLimit,
+          conversation_id,
+          message_offset,
+          message_limit,
         });
       },
     );
-
   }
 
-  registerAppTool(
-    server,
+  registrationTarget.registerTool(
     toolNames.read,
     {
       title: "Read file",
       description:
         [
-          "Read a file in a workspace. Use this for file inspection instead of shell commands like cat or sed.",
+          "Read all or part of a file in a workspace.",
           "Use this tool to inspect relevant AGENTS.md or CLAUDE.md files listed by open_workspace before working in nested directories.",
           config.skillsEnabled
-            ? "If available skills were returned and a task matches one, read that skill's path before proceeding. Skill paths may be outside the workspace; only advertised SKILL.md files and files under already-loaded skill directories are readable."
+            ? "If available skills were returned and a task matches one, read the returned skill path before proceeding."
             : "",
         ]
           .filter(Boolean)
           .join(" "),
       inputSchema: {
-        workspaceId: z
+        workspace_id: z
           .string()
           .describe(workspaceIdDescription),
         path: z
           .string()
           .describe(
             config.skillsEnabled
-              ? "File path to read, relative to the workspace root. May also be an advertised skill path from open_workspace skills."
+              ? "File path relative to the workspace root, or a skill path returned by open_workspace."
               : "File path to read, relative to the workspace root.",
           ),
         offset: z
@@ -1143,20 +813,16 @@ export function createMcpServer(
           .describe("Maximum number of lines to read."),
       },
       outputSchema: resultOutputSchema(),
-      ...toolWidgetDescriptorMeta(config, "read"),
       annotations: { readOnlyHint: true },
     },
-    async ({ workspaceId, ...input }) => {
+    async ({ workspace_id, ...input }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
-      const readPath = workspaces.resolveReadPath(workspace, input.path);
+      const workspaceId = workspace_id;
+      const workspace = await workspaces.getWorkspace(workspaceId);
+      const readPath = await workspaces.resolveReadPath(workspace, input.path);
       const response = await readFileTool(
         { ...input, path: readPath.absolutePath },
-        {
-          cwd: workspace.root,
-          root: workspace.root,
-          readRoots: readPath.readRoots,
-        },
+        { cwd: workspace.root },
       );
 
       if (response.isError) {
@@ -1167,13 +833,7 @@ export function createMcpServer(
         }, response.content, startedAt);
         return response;
       }
-      workspaces.markReadPathLoaded(workspace, readPath);
 
-      const summary = {
-        ...textSummary(response.content),
-        offset: input.offset ?? 1,
-        limited: input.limit !== undefined,
-      };
       logToolCall(config, {
         tool: toolNames.read,
         workspaceId,
@@ -1184,15 +844,6 @@ export function createMcpServer(
 
       return {
         ...response,
-        _meta: {
-          tool: toolNames.read,
-          card: {
-            workspaceId,
-            path: input.path,
-            summary,
-            payload: { content: response.content },
-          },
-        },
         structuredContent: {
           result: contentText(response.content),
         },
@@ -1200,622 +851,108 @@ export function createMcpServer(
     },
   );
 
-  if (config.toolMode !== "codex") {
-  registerAppTool(
-    server,
-    toolNames.write,
-    {
-      title: "Write file",
-      description:
-        `Create or completely overwrite a file in a workspace. Prefer ${toolNames.edit} for targeted changes to existing files.`,
-      inputSchema: {
-        workspaceId: z
-          .string()
-          .describe(workspaceIdDescription),
-        path: z
-          .string()
-          .describe("File path to write, relative to the workspace root."),
-        content: z.string().describe("Complete new file content."),
-      },
-      outputSchema: resultOutputSchema(),
-      ...toolWidgetDescriptorMeta(config, "write"),
-      annotations: WRITE_TOOL_ANNOTATIONS,
-    },
-    async ({ workspaceId, ...input }) => {
-      const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
-      const response = await writeFileTool(input, {
-        cwd: workspace.root,
-        root: workspace.root,
-      });
-
-      if (response.isError) {
-        logFailedToolResponse(config, {
-          tool: toolNames.write,
-          workspaceId,
-          path: input.path,
-        }, response.content, startedAt);
-        return response;
-      }
-
-      const patch = newFilePatch(input.path, input.content);
-      const stats = countDiffStats(patch);
-      const summary = {
-        ...stats,
-        lines: contentLineCount(input.content),
-        characters: input.content.length,
-      };
-      logToolCall(config, {
-        tool: toolNames.write,
-        workspaceId,
-        path: input.path,
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
-      });
-
-      return {
-        ...response,
-        _meta: {
-          tool: toolNames.write,
-          card: {
-            workspaceId,
-            path: input.path,
-            summary,
-            payload: {
-              content: response.content,
-              patch,
-            },
-          },
-        },
-        structuredContent: {
-          result: contentText(response.content),
-        },
-      };
-    },
-  );
+  toolSurface.register({
+    server: registrationTarget,
+    config,
+    workspaces,
+    processSessions,
+  });
 
   registerAppTool(
-    server,
-    toolNames.edit,
+    registrationTarget,
+    "show_changes",
     {
-      title: "Edit file",
+      title: "Show changes",
       description:
-        `Edit one file in a workspace by replacing exact text blocks. Prefer this over ${toolNames.write} for targeted changes. Each oldText must match a unique, non-overlapping region of the original file; merge nearby changes into one edit and keep oldText as small as possible while still unique.`,
+        "Show the changes made in this turn for an open workspace. Call this once after the final related file change and before your final response so the user can review the combined diff. Do not call it after each individual file change.",
       inputSchema: {
-        workspaceId: z
-          .string()
-          .describe(workspaceIdDescription),
-        path: z
-          .string()
-          .describe("File path to edit, relative to the workspace root."),
-        edits: z
-          .array(
-            z.object({
-              oldText: z
-                .string()
-                .describe(
-                  "Exact text to replace. Must match uniquely in the original file.",
-                ),
-              newText: z.string().describe("Replacement text."),
-            }),
-          )
-          .min(1),
+        workspace_id: z.string().describe(workspaceIdDescription),
       },
       outputSchema: resultOutputSchema({
-        status: z.literal("applied"),
+        workspace_id: z.string(),
+        review_ref: z.string().regex(/^[0-9a-f]{40,64}$/),
       }),
-      ...toolWidgetDescriptorMeta(config, "edit"),
-      annotations: EDIT_TOOL_ANNOTATIONS,
+      ...workspaceAppDescriptorMeta(config),
+      annotations: { readOnlyHint: true },
     },
-    async ({ workspaceId, ...input }) => {
+    async ({ workspace_id }, { _meta }) => {
       const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
-      const response = await editFileTool(input, {
-        cwd: workspace.root,
-        root: workspace.root,
-      });
+      const workspaceId = workspace_id;
+      const workspace = await workspaces.getWorkspace(workspaceId);
+      const reviewRef = typeof _meta?.["devspace/reviewRef"] === "string"
+        ? _meta["devspace/reviewRef"]
+        : undefined;
+      const review = reviewRef
+        ? await reviewCheckpoints.reviewByRef({
+            workspaceId,
+            root: workspace.root,
+            reviewRef,
+          })
+        : await reviewCheckpoints.reviewChanges({
+            workspaceId,
+            root: workspace.root,
+            markReviewed: true,
+          });
 
-      if (response.isError) {
-        logFailedToolResponse(config, {
-          tool: toolNames.edit,
-          workspaceId,
-          path: input.path,
-        }, response.content, startedAt);
-        return response;
-      }
-
-      const stats = countDiffStats(
-        response.details?.patch ?? response.details?.diff,
-      );
-      const summary = {
-        ...stats,
-        editCount: input.edits.length,
-      };
-      const editResultText = `Edited ${input.path} (+${stats.additions} -${stats.removals}).`;
-      const editContent = [textBlock(editResultText)];
+      const content = [textBlock(review.result)];
       logToolCall(config, {
-        tool: toolNames.edit,
+        tool: "show_changes",
         workspaceId,
-        path: input.path,
         success: true,
         durationMs: Math.round(performance.now() - startedAt),
       });
 
       return {
-        content: editContent,
+        content,
         _meta: {
-          tool: toolNames.edit,
           card: {
             workspaceId,
-            path: input.path,
-            summary,
+            summary: review.summary,
+            files: review.files,
             payload: {
-              diff: response.details?.diff,
-              patch: response.details?.patch,
+              patch: review.patch,
             },
           },
         },
         structuredContent: {
-          status: "applied",
-          result: contentText(editContent),
+          workspace_id: workspaceId,
+          review_ref: review.reviewRef,
+          result: contentText(content),
         },
       };
     },
   );
-  }
-
-  if (config.toolMode === "codex") {
-    registerAppTool(
-      server,
-      "apply_patch",
-      {
-        title: "Apply patch",
-        description:
-          "Apply one Codex-style patch in a workspace. Supports adding, overwriting, updating, deleting, and moving files. Use this for all file modifications. Paths must be relative to the workspace.",
-        inputSchema: {
-          workspaceId: z
-            .string()
-            .describe(workspaceIdDescription),
-          patch: z
-            .string()
-            .describe("Patch text enclosed by *** Begin Patch and *** End Patch markers."),
-        },
-        outputSchema: resultOutputSchema({
-          additions: z.number(),
-          removals: z.number(),
-          files: z.array(
-            z.object({
-              path: z.string(),
-              previousPath: z.string().optional(),
-              operation: z.enum(["add", "update", "delete", "move"]),
-            }),
-          ),
-        }),
-        ...toolWidgetDescriptorMeta(config, "edit"),
-        annotations: EDIT_TOOL_ANNOTATIONS,
-      },
-      async ({ workspaceId, patch }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        const applied = await applyPatch(workspace.root, patch);
-        const paths = applied.files.map((file) => file.path).join(", ");
-        const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
-        const content = [textBlock(result)];
-        const displayPath = applied.files.length === 1
-          ? applied.files[0]?.path
-          : `${applied.files.length} files`;
-
-        logToolCall(config, {
-          tool: "apply_patch",
-          workspaceId,
-          success: true,
-          durationMs: Math.round(performance.now() - startedAt),
-        });
-
-        return {
-          content,
-          _meta: {
-            tool: "apply_patch",
-            card: {
-              workspaceId,
-              path: displayPath,
-              summary: {
-                files: applied.files.length,
-                additions: applied.additions,
-                removals: applied.removals,
-              },
-              files: applied.files,
-              payload: { patch: applied.patch },
-            },
-          },
-          structuredContent: {
-            result,
-            additions: applied.additions,
-            removals: applied.removals,
-            files: applied.files,
-          },
-        };
-      },
-    );
-  }
-
-  if (config.widgets === "changes") {
-    registerAppTool(
-      server,
-      "show_changes",
-      {
-        title: "Show changes",
-        description:
-          "Show the changes made in this turn for an open workspace. Call this once after the final related file change and before your final response so the user can review the combined diff. Do not call it after each individual file change.",
-        inputSchema: {
-          workspaceId: z
-            .string()
-            .describe(workspaceIdDescription),
-        },
-        outputSchema: resultOutputSchema(),
-        ...toolWidgetDescriptorMeta(config, "show_changes"),
-        annotations: { readOnlyHint: true },
-      },
-      async ({ workspaceId }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        const review = await reviewCheckpoints.reviewChanges({
-          workspaceId,
-          root: workspace.root,
-          markReviewed: true,
-        });
-
-        const content = [textBlock(review.result)];
-        logToolCall(config, {
-          tool: "show_changes",
-          workspaceId,
-          success: true,
-          durationMs: Math.round(performance.now() - startedAt),
-        });
-
-        return {
-          content,
-          _meta: {
-            tool: "show_changes",
-            card: {
-              workspaceId,
-              summary: review.summary,
-              files: review.files,
-              payload: {
-                patch: review.patch,
-              },
-            },
-          },
-          structuredContent: {
-            result: contentText(content),
-          },
-        };
-      },
-    );
-  }
-
-  if (config.toolMode === "full") {
-    registerAppTool(
-      server,
-      toolNames.grep,
-      {
-        title: "Grep",
-        description:
-          "Search file contents in a workspace. Use this before broad reads when looking for symbols, text, or usage sites. Respects project ignore rules.",
-        inputSchema: {
-          workspaceId: z
-            .string()
-            .describe(workspaceIdDescription),
-          pattern: z.string().describe("Search pattern."),
-          path: z
-            .string()
-            .optional()
-            .describe(
-              "Optional path or glob scope relative to the workspace root.",
-            ),
-          include: z.string().optional().describe("Optional include glob."),
-        },
-        outputSchema: resultOutputSchema(),
-        ...toolWidgetDescriptorMeta(config, "search"),
-        annotations: { readOnlyHint: true },
-      },
-      async ({ workspaceId, ...input }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        if (input.path) workspaces.resolvePath(workspace, input.path);
-        const response = await grepFilesTool(input, {
-          cwd: workspace.root,
-          root: workspace.root,
-        });
-
-        if (response.isError) {
-          logFailedToolResponse(config, {
-            tool: toolNames.grep,
-            workspaceId,
-            path: input.path,
-          }, response.content, startedAt);
-          return response;
-        }
-
-        const summary = {
-          pattern: input.pattern,
-          scope: input.path ?? ".",
-          ...textSummary(response.content),
-        };
-        logToolCall(config, {
-          tool: toolNames.grep,
-          workspaceId,
-          path: input.path,
-          success: true,
-          durationMs: Math.round(performance.now() - startedAt),
-        });
-
-        return {
-          ...response,
-          _meta: {
-            tool: toolNames.grep,
-            card: {
-              workspaceId,
-              path: input.path,
-              summary,
-              payload: { content: response.content },
-            },
-          },
-          structuredContent: {
-            result: contentText(response.content),
-          },
-        };
-      },
-    );
-
-    registerAppTool(
-      server,
-      toolNames.glob,
-      {
-        title: "Glob",
-        description:
-          "Find files by glob pattern in a workspace. Use this to discover filenames or narrow file sets before reading. Respects project ignore rules.",
-        inputSchema: {
-          workspaceId: z
-            .string()
-            .describe(workspaceIdDescription),
-          pattern: z.string().describe("File glob pattern."),
-          path: z
-            .string()
-            .optional()
-            .describe("Optional path scope relative to the workspace root."),
-        },
-        outputSchema: resultOutputSchema(),
-        ...toolWidgetDescriptorMeta(config, "search"),
-        annotations: { readOnlyHint: true },
-      },
-      async ({ workspaceId, ...input }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        if (input.path) workspaces.resolvePath(workspace, input.path);
-        const response = await findFilesTool(input, {
-          cwd: workspace.root,
-          root: workspace.root,
-        });
-
-        if (response.isError) {
-          logFailedToolResponse(config, {
-            tool: toolNames.glob,
-            workspaceId,
-            path: input.path,
-          }, response.content, startedAt);
-          return response;
-        }
-
-        const summary = {
-          pattern: input.pattern,
-          scope: input.path ?? ".",
-          ...textSummary(response.content),
-        };
-        logToolCall(config, {
-          tool: toolNames.glob,
-          workspaceId,
-          path: input.path,
-          success: true,
-          durationMs: Math.round(performance.now() - startedAt),
-        });
-
-        return {
-          ...response,
-          _meta: {
-            tool: toolNames.glob,
-            card: {
-              workspaceId,
-              path: input.path,
-              summary,
-              payload: { content: response.content },
-            },
-          },
-          structuredContent: {
-            result: contentText(response.content),
-          },
-        };
-      },
-    );
-
-    registerAppTool(
-      server,
-      toolNames.ls,
-      {
-        title: "Ls",
-        description:
-          "List a directory in a workspace. Use this for directory inspection before reading files.",
-        inputSchema: {
-          workspaceId: z
-            .string()
-            .describe(workspaceIdDescription),
-          path: z
-            .string()
-            .describe(
-              "Directory path to list, relative to the workspace root.",
-            ),
-        },
-        outputSchema: resultOutputSchema(),
-        ...toolWidgetDescriptorMeta(config, "directory"),
-        annotations: { readOnlyHint: true },
-      },
-      async ({ workspaceId, ...input }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        workspaces.resolvePath(workspace, input.path);
-        const response = await listDirectoryTool(input, {
-          cwd: workspace.root,
-          root: workspace.root,
-        });
-
-        if (response.isError) {
-          logFailedToolResponse(config, {
-            tool: toolNames.ls,
-            workspaceId,
-            path: input.path,
-          }, response.content, startedAt);
-          return response;
-        }
-
-        const summary = textSummary(response.content);
-        logToolCall(config, {
-          tool: toolNames.ls,
-          workspaceId,
-          path: input.path,
-          success: true,
-          durationMs: Math.round(performance.now() - startedAt),
-        });
-
-        return {
-          ...response,
-          _meta: {
-            tool: toolNames.ls,
-            card: {
-              workspaceId,
-              path: input.path,
-              summary,
-              payload: { content: response.content },
-            },
-          },
-          structuredContent: {
-            result: contentText(response.content),
-          },
-        };
-      },
-    );
-  }
-
-  if (config.toolMode !== "codex") {
-  registerAppTool(
-    server,
-    toolNames.shell,
-    {
-      title: "Bash",
-      description: config.toolMode !== "full"
-        ? `Run a shell command in a workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. This is powerful execution and should only be exposed behind strong authentication.`
-        : `Run a shell command in a workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. This is powerful execution and should only be exposed behind strong authentication.`,
-      inputSchema: {
-        workspaceId: z
-          .string()
-          .describe(workspaceIdDescription),
-        command: z
-          .string()
-          .describe(
-            `Shell command to run. Must not create or modify project files; use ${toolNames.edit} or ${toolNames.write} for file changes.`,
-          ),
-        workingDirectory: z
-          .string()
-          .optional()
-          .describe(
-            "Optional working directory relative to the workspace root. Defaults to the workspace root.",
-          ),
-        timeout: z
-          .number()
-          .positive()
-          .max(300)
-          .optional()
-          .describe("Timeout in seconds. Defaults to 30, max 300."),
-      },
-      outputSchema: resultOutputSchema(),
-      ...toolWidgetDescriptorMeta(config, "shell"),
-      annotations: SHELL_TOOL_ANNOTATIONS,
-    },
-    async ({ workspaceId, workingDirectory, ...input }) => {
-      const startedAt = performance.now();
-      const workspace = workspaces.getWorkspace(workspaceId);
-      const cwd = workspaces.resolveWorkingDirectory(
-        workspace,
-        workingDirectory,
-      );
-      const response = await runShellTool(input, {
-        cwd,
-        root: workspace.root,
-      });
-
-      if (response.isError) {
-        logFailedToolResponse(config, {
-          tool: toolNames.shell,
-          workspaceId,
-          workingDirectory: workingDirectory ?? ".",
-          command: input.command,
-          commandLength: input.command.length,
-        }, response.content, startedAt);
-        return response;
-      }
-
-      const summary = {
-        command: input.command,
-        workingDirectory: workingDirectory ?? ".",
-        ...textSummary(response.content),
-      };
-      logToolCall(config, {
-        tool: toolNames.shell,
-        workspaceId,
-        workingDirectory: workingDirectory ?? ".",
-        command: input.command,
-        commandLength: input.command.length,
-        success: true,
-        durationMs: Math.round(performance.now() - startedAt),
-      });
-
-      return {
-        ...response,
-        _meta: {
-          tool: toolNames.shell,
-          card: {
-            workspaceId,
-            path: workingDirectory,
-            summary,
-            payload: { content: response.content },
-          },
-        },
-        structuredContent: {
-          result: contentText(response.content),
-        },
-      };
-    },
-  );
-  }
-
-  if (config.toolMode === "codex") {
-    registerCodexProcessTools(server, config, workspaces, processSessions);
-  }
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
-    registerArtifactTools(server, {
+    registerArtifactTools(registrationTarget, {
       config,
       workspaces,
       incomingArtifactAdapters,
     });
   }
+}
 
-  return server;
+function withTrackedToolHandlers(
+  server: McpRegistrationTarget,
+  trackToolActivity: TrackToolActivity,
+): McpRegistrationTarget {
+  return {
+    registerTool: ((...args: unknown[]) => {
+      const handler = args.at(-1) as (...handlerArgs: unknown[]) => unknown;
+      return (server.registerTool as (...callArgs: unknown[]) => unknown)(
+        ...args.slice(0, -1),
+        (...handlerArgs: unknown[]) => trackToolActivity(
+          () => Promise.resolve(handler(...handlerArgs)),
+        ),
+      );
+    }) as McpRegistrationTarget["registerTool"],
+    registerResource: server.registerResource.bind(server),
+  };
 }
 
 export interface CreateServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
+  memoryClient?: MemoryClient;
 }
 
 export function createServer(
@@ -1831,7 +968,6 @@ export function createServer(
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
-  const transports = new McpSessionRegistry<Transport>();
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
@@ -1845,45 +981,51 @@ export function createServer(
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   const memoryThreadAuthorizations = new MemoryThreadAuthorizationStore();
+  const memoryClient = options.memoryClient ?? new MemoryAdapter(config.memory);
+  const toolActivities = new ToolActivityTracker();
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
-    getLocalAgentProviderAvailabilitySnapshot(),
+    getLocalAgentProviderAvailabilitySnapshot(process.env, config.subagents),
   );
   const resolveLocalAgentProviders = () => buildLocalAgentProviderStatuses(
     config.subagents,
-    getLocalAgentProviderAvailabilitySnapshot(),
+    getLocalAgentProviderAvailabilitySnapshot(process.env, config.subagents),
   );
-
-  const logSessionCloseResults = (
-    reason: "idle_timeout" | "server_shutdown",
-    results: McpSessionCloseResult[],
-  ) => {
-    for (const result of results) {
-      if (result.error) {
-        logEvent(config.logging, "warn", "mcp_session_close_failed", {
-          reason,
-          sessionIdPrefix: sessionIdPrefix(result.sessionId),
-          error:
-            result.error instanceof Error
-              ? result.error.message
-              : String(result.error),
-        });
-        continue;
-      }
-
-      logEvent(config.logging, "info", "mcp_session_closed", {
-        reason,
-        sessionIdPrefix: sessionIdPrefix(result.sessionId),
-      });
-    }
-  };
-
-  const sessionCleanupTimer = setInterval(() => {
-    void transports
-      .closeIdle(MCP_SESSION_IDLE_TIMEOUT_MS)
-      .then((results) => logSessionCloseResults("idle_timeout", results));
-  }, MCP_SESSION_CLEANUP_INTERVAL_MS);
-  sessionCleanupTimer.unref();
+  const modernToolSurface = getToolSurface(config.toolMode);
+  const bindModernMcpSurface = compileMcpRegistrationSurface((target) => {
+    registerMcpSurface(
+      target,
+      config,
+      workspaces,
+      reviewCheckpoints,
+      processSessions,
+      resolveLocalAgentProviders,
+      incomingArtifactAdapters,
+      toolActivities.track,
+      memoryClient,
+      memoryThreadAuthorizations,
+    );
+  });
+  const logMcpHandlerError = (error: Error) => logEvent(
+    config.logging,
+    "error",
+    "mcp_handler_error",
+    modernMcpAdapterErrorLogFields(error),
+  );
+  const mcpHandler = createMcpHandler(() => {
+    const adapter = createModernMcpServerAdapter(
+      mcpServerInfo(),
+      { instructions: serverInstructions(config, modernToolSurface) },
+    );
+    bindModernMcpSurface(adapter.registrationTarget);
+    return adapter.server;
+  }, {
+    legacy: "stateless",
+    onerror: logMcpHandlerError,
+  });
+  const mcpNodeHandler = toNodeHandler(mcpHandler, {
+    onerror: logMcpHandlerError,
+  });
 
   if (config.logging.trustProxy) {
     app.set("trust proxy", true);
@@ -1944,8 +1086,6 @@ export function createServer(
 
   app.all("/mcp", async (req, res) => {
     const requestId = res.locals.requestId as string | undefined;
-    const sessionId = req.header("mcp-session-id");
-    const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
 
     await new Promise<void>((resolve, reject) => {
       bearerAuth(req, res, (error?: unknown) => {
@@ -1955,7 +1095,7 @@ export function createServer(
     });
     if (res.headersSent) return;
 
-    if (!req.auth?.resource || !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl })) {
+    if (!req.auth?.resource || !oauthProvider.isResourceAllowed(req.auth.resource)) {
       logEvent(config.logging, "warn", "auth_denied", {
         requestId,
         method: req.method,
@@ -1970,60 +1110,10 @@ export function createServer(
     logEvent(config.logging, "debug", "mcp_request", {
       requestId,
       method: req.method,
-      sessionIdPresent: Boolean(sessionId),
-      sessionIdPrefix: sessionIdPrefix(sessionId),
-      isInitialize: initializeRequest,
     });
 
     try {
-      let transport: Transport | undefined;
-
-      if (sessionId) {
-        transport = transports.get(sessionId);
-        if (!transport) {
-          sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
-          return;
-        }
-      } else if (initializeRequest) {
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (newSessionId) => {
-            if (transport) transports.register(newSessionId, transport);
-            logEvent(config.logging, "info", "mcp_session_created", {
-              requestId,
-              sessionIdPrefix: sessionIdPrefix(newSessionId),
-              ...requestLogFields(req, config),
-            });
-          },
-        });
-
-        transport.onclose = () => {
-          const closedSessionId = transport?.sessionId;
-          if (closedSessionId && transports.remove(closedSessionId)) {
-            logEvent(config.logging, "info", "mcp_session_closed", {
-              reason: "transport_close",
-              sessionIdPrefix: sessionIdPrefix(closedSessionId),
-            });
-          }
-        };
-
-        const server = createMcpServer(
-          config,
-          workspaces,
-          reviewCheckpoints,
-          processSessions,
-          resolveLocalAgentProviders,
-          incomingArtifactAdapters,
-          undefined,
-          memoryThreadAuthorizations,
-        );
-        await server.connect(transport);
-      } else {
-        sendJsonRpcError(res, 400, -32000, "No valid MCP session");
-        return;
-      }
-
-      await transport.handleRequest(req, res, req.body);
+      await mcpNodeHandler(req, res, req.body);
     } catch (error) {
       logEvent(config.logging, "error", "mcp_request_error", {
         requestId,
@@ -2042,9 +1132,14 @@ export function createServer(
     localAgentProviders,
     close: () => {
       closePromise ??= (async () => {
-        clearInterval(sessionCleanupTimer);
-        const results = await transports.closeAll();
-        logSessionCloseResults("server_shutdown", results);
+        try {
+          await mcpHandler.close();
+        } catch (error) {
+          logEvent(config.logging, "warn", "mcp_handler_close_failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+        await toolActivities.waitForIdle();
         processSessions.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();

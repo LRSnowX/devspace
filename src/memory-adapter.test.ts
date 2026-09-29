@@ -85,6 +85,16 @@ test("memory thread authorization is bounded and project scoped", () => {
   assert.equal(store.isAuthorized("/projects/Jack", "c"), true);
 });
 
+test("memory thread authorization evicts old projects", () => {
+  const store = new MemoryThreadAuthorizationStore(2, 2);
+  store.authorize("first", ["one"]);
+  store.authorize("second", ["two"]);
+  store.authorize("third", ["three"]);
+  assert.equal(store.isAuthorized("first", "one"), false);
+  assert.equal(store.isAuthorized("second", "two"), true);
+  assert.equal(store.isAuthorized("third", "three"), true);
+});
+
 test("memory bootstrap enforces its timeout", async () => {
   const adapter = new MemoryAdapter({
     enabled: true,

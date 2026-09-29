@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
@@ -9,6 +9,7 @@ import {
   loadWorkspaceSkills,
   resolveSkillReadPath,
 } from "./skills.js";
+import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-skills-test-"));
 const originalHome = process.env.HOME;
@@ -160,23 +161,22 @@ try {
     ].join("\n"),
   );
 
-  const disabledConfig = loadConfig({
-    DEVSPACE_ALLOWED_ROOTS: projectRoot,
-    DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_SKILL_PATHS: explicitSkills,
-    DEVSPACE_SKILLS: "0",
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-    PORT: "1",
-  });
+  const configDir = join(root, ".devspace");
+  const disabledConfig = loadConfig(writeTestDevspaceConfig(configDir, {
+    server: { port: 1 },
+    workspaces: { allowedRoots: [projectRoot] },
+    skills: { agentDir, paths: [explicitSkills], enabled: false },
+  }));
   assert.deepEqual(loadWorkspaceSkills(disabledConfig, projectRoot).skills, []);
 
-  const config = loadConfig({
-    DEVSPACE_ALLOWED_ROOTS: projectRoot,
-    DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_SKILL_PATHS: [explicitSkills, "~/.claude/skills", "./.claude/skills"].join(","),
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-    PORT: "1",
-  });
+  const config = loadConfig(writeTestDevspaceConfig(configDir, {
+    server: { port: 1 },
+    workspaces: { allowedRoots: [projectRoot] },
+    skills: {
+      agentDir,
+      paths: [explicitSkills, "~/.claude/skills", "./.claude/skills"],
+    },
+  }));
   const loaded = loadWorkspaceSkills(config, projectRoot);
   assert.equal(loaded.skills.some((skill) => skill.name === "agent-global-skill"), true);
   assert.equal(loaded.skills.some((skill) => skill.name === "agent-project-skill"), true);
@@ -195,39 +195,51 @@ try {
     false,
   );
 
-  const experimentalConfig = loadConfig({
-    DEVSPACE_ALLOWED_ROOTS: projectRoot,
-    DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_SUBAGENTS: "1",
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-    PORT: "1",
-  });
+  await mkdir(join(devspaceSkills, "subagents"), { recursive: true });
+  await writeFile(
+    join(devspaceSkills, "subagents", "SKILL.md"),
+    [
+      "---",
+      "name: subagents",
+      "description: stale user copy",
+      "---",
+      "",
+      "# Stale subagents skill",
+    ].join("\n"),
+  );
+  const experimentalConfig = loadConfig(writeTestDevspaceConfig(configDir, {
+    server: { port: 1 },
+    workspaces: { allowedRoots: [projectRoot] },
+    skills: { agentDir },
+    subagents: { enabled: true, instructions: "on-demand", providers: [] },
+  }));
+  const experimentalSkills = loadWorkspaceSkills(experimentalConfig, projectRoot).skills;
+  const managedSubagents = experimentalSkills.find((skill) => skill.name === "subagents");
+  assert.ok(managedSubagents);
   assert.equal(
-    loadWorkspaceSkills(experimentalConfig, projectRoot).skills.some(
-      (skill) => skill.name === "subagents",
-    ),
-    true,
+    managedSubagents.filePath,
+    join(devspaceSkills, "subagents", "SKILL.md"),
+  );
+  assert.match(
+    await readFile(join(devspaceSkills, "subagents", "SKILL.md"), "utf8"),
+    /# DevSpace subagents/,
   );
 
-  const duplicateConfig = loadConfig({
-    DEVSPACE_ALLOWED_ROOTS: projectRoot,
-    DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_SKILL_PATHS: [explicitSkills, "./.agents/skills"].join(","),
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-    PORT: "1",
-  });
+  const duplicateConfig = loadConfig(writeTestDevspaceConfig(configDir, {
+    server: { port: 1 },
+    workspaces: { allowedRoots: [projectRoot] },
+    skills: { agentDir, paths: [explicitSkills, "./.agents/skills"] },
+  }));
   assert.equal(
     effectiveSkillPaths(duplicateConfig, projectRoot).filter((path) => path === projectAgentsSkills).length,
     1,
   );
 
-  const legacyPiConfig = loadConfig({
-    DEVSPACE_ALLOWED_ROOTS: projectRoot,
-    DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_SKILL_PATHS: [explicitSkills, join(projectRoot, ".pi", "skills")].join(","),
-    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
-    PORT: "1",
-  });
+  const legacyPiConfig = loadConfig(writeTestDevspaceConfig(configDir, {
+    server: { port: 1 },
+    workspaces: { allowedRoots: [projectRoot] },
+    skills: { agentDir, paths: [explicitSkills, join(projectRoot, ".pi", "skills")] },
+  }));
   assert.equal(
     loadWorkspaceSkills(legacyPiConfig, projectRoot).skills.some((skill) => skill.name === "project-skill"),
     true,
@@ -237,18 +249,12 @@ try {
   assert.ok(projectSkill);
   assert.match(formatPathForPrompt(projectSkill.filePath), /SKILL\.md$/);
 
-  const skillFileRead = resolveSkillReadPath(loaded.skills, new Set(), projectSkill.filePath);
-  assert.equal(skillFileRead?.isSkillFile, true);
+  const skillFileRead = resolveSkillReadPath(loaded.skills, projectSkill.filePath);
   assert.equal(skillFileRead?.absolutePath, projectSkill.filePath);
 
   const resourcePath = join(projectSkill.baseDir, "references.md");
   await writeFile(resourcePath, "reference\n");
-  assert.equal(resolveSkillReadPath(loaded.skills, new Set(), resourcePath), undefined);
-  assert.equal(
-    resolveSkillReadPath(loaded.skills, new Set([projectSkill.baseDir]), resourcePath)
-      ?.isSkillFile,
-    false,
-  );
+  assert.equal(resolveSkillReadPath(loaded.skills, resourcePath)?.absolutePath, resourcePath);
 } finally {
   if (originalHome === undefined) delete process.env.HOME;
   else process.env.HOME = originalHome;

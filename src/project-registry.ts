@@ -3,12 +3,27 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { assertAllowedPath, expandHomePath } from "./roots.js";
+import { assertAllowedPath, expandHomePath, isPathInsideRoot } from "./roots.js";
+
+function canonicalProjectPath(path: string, allowedRoots: readonly string[], allowMissing = false): string {
+  const logical = assertAllowedPath(path, [...allowedRoots]);
+  if (allowMissing && !existsSync(logical)) return logical;
+  const canonical = realpathSync(logical);
+  if (allowedRoots.some((root) => {
+    try {
+      return isPathInsideRoot(canonical, realpathSync(resolve(expandHomePath(root))));
+    } catch {
+      return false;
+    }
+  })) return logical;
+  throw new Error(`Path is outside allowed roots: ${path}`);
+}
 
 export interface ProjectRegistration {
   name: string;
@@ -51,6 +66,14 @@ function normalizeAliases(values: readonly string[] | undefined, name: string): 
     aliases.push(alias);
   }
   return aliases;
+}
+
+function sameProjectPath(left: string, right: string): boolean {
+  const logicalLeft = resolve(expandHomePath(left));
+  const logicalRight = resolve(expandHomePath(right));
+  if (logicalLeft === logicalRight) return true;
+  if (!existsSync(logicalLeft) || !existsSync(logicalRight)) return false;
+  return realpathSync(logicalLeft) === realpathSync(logicalRight);
 }
 
 export class ProjectRegistry {
@@ -97,13 +120,19 @@ export class ProjectRegistry {
         if (normalizeProjectKey(entry.name) !== key) continue;
         const candidate = resolve(rootPath, entry.name);
         if (entry.isDirectory() || (entry.isSymbolicLink() && statSync(candidate).isDirectory())) {
-          matches.push(assertAllowedPath(candidate, [...this.allowedRoots]));
+          matches.push(canonicalProjectPath(candidate, this.allowedRoots));
         }
       }
     }
     const unique = [...new Set(matches.map((value) => resolve(value)))];
     if (unique.length === 0) return { status: "unknown" };
     if (unique.length > 1) return { status: "ambiguous", paths: unique.sort() };
+    const registeredPath = this.projects.find((entry) =>
+      existsSync(entry.path) && realpathSync(entry.path) === realpathSync(unique[0]!),
+    );
+    if (registeredPath) {
+      return { status: "found", resolution: { project: registeredPath, registered: true } };
+    }
     return {
       status: "found",
       resolution: {
@@ -123,8 +152,12 @@ export class ProjectRegistry {
   }
 
   projectNameForPath(projectPath: string): string | undefined {
-    const resolvedPath = resolve(expandHomePath(projectPath));
-    return this.projects.find((entry) => resolve(entry.path) === resolvedPath)?.name;
+    const path = resolve(expandHomePath(projectPath));
+    if (!existsSync(path)) return undefined;
+    const resolvedPath = realpathSync(path);
+    return this.projects.find((entry) =>
+      existsSync(entry.path) && realpathSync(entry.path) === resolvedPath,
+    )?.name;
   }
 
   register(input: {
@@ -136,10 +169,11 @@ export class ProjectRegistry {
     const key = normalizeProjectKey(name);
     if (!name || !key) throw new Error("Project name must not be empty");
 
-    const projectPath = assertAllowedPath(input.path, [...this.allowedRoots]);
-    if (!existsSync(projectPath)) {
-      throw new Error(`Project path does not exist: ${projectPath}`);
+    const logicalPath = assertAllowedPath(input.path, [...this.allowedRoots]);
+    if (!existsSync(logicalPath)) {
+      throw new Error(`Project path does not exist: ${logicalPath}`);
     }
+    const projectPath = canonicalProjectPath(logicalPath, this.allowedRoots);
     if (!statSync(projectPath).isDirectory()) {
       throw new Error(`Project path is not a directory: ${projectPath}`);
     }
@@ -147,7 +181,7 @@ export class ProjectRegistry {
     const aliases = normalizeAliases(input.aliases, name);
     const incomingKeys = new Set([key, ...aliases.map(normalizeProjectKey)]);
     for (const existing of this.projects) {
-      if (resolve(existing.path) === resolve(projectPath)) continue;
+      if (sameProjectPath(existing.path, projectPath)) continue;
       if (this.keysFor(existing).some((existingKey) => incomingKeys.has(existingKey))) {
         throw new Error(
           `Project name or alias conflicts with registered project ${existing.name}`,
@@ -157,7 +191,7 @@ export class ProjectRegistry {
 
     const registration = { name, path: projectPath, aliases };
     const samePathIndex = this.projects.findIndex(
-      (entry) => resolve(entry.path) === resolve(projectPath),
+      (entry) => sameProjectPath(entry.path, projectPath),
     );
     if (samePathIndex >= 0) {
       this.projects[samePathIndex] = registration;
@@ -198,7 +232,7 @@ export class ProjectRegistry {
       if (typeof entry.name !== "string" || typeof entry.path !== "string") {
         throw new Error(`Invalid project registry entry: ${this.filePath}`);
       }
-      const projectPath = assertAllowedPath(entry.path, [...this.allowedRoots]);
+      const projectPath = canonicalProjectPath(entry.path, this.allowedRoots, true);
       const aliases = Array.isArray(entry.aliases)
         ? entry.aliases.filter((alias): alias is string => typeof alias === "string")
         : [];

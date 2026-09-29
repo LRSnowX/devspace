@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -69,6 +69,38 @@ test("project registry discovers a unique top-level directory without persisting
     assert.equal(resolution?.project.path, project);
     assert.equal(resolution?.project.name, "Jack");
     assert.equal(registry.list().length, 0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("project registry rejects symlink escapes", () => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-project-root-"));
+  const outside = mkdtempSync(join(tmpdir(), "devspace-project-outside-"));
+  symlinkSync(outside, join(root, "Escape"));
+  try {
+    const registry = new ProjectRegistry(join(root, "projects.json"), [root]);
+    assert.throws(() => registry.register({ name: "Escape", path: join(root, "Escape") }), /outside allowed roots/);
+    assert.throws(() => registry.lookup("Escape"), /outside allowed roots/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test("project registry keeps one canonical identity for real and symlink paths", () => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-project-same-realpath-"));
+  const project = join(root, "real-project");
+  const aliasPath = join(root, "alias-project");
+  mkdirSync(project);
+  symlinkSync(project, aliasPath);
+  try {
+    const registry = new ProjectRegistry(join(root, "projects.json"), [root]);
+    registry.register({ name: "CanonicalA", path: project });
+    registry.register({ name: "CanonicalB", path: aliasPath });
+    assert.equal(registry.list().length, 1);
+    assert.equal(registry.projectNameForPath(project), "CanonicalB");
+    assert.equal(registry.projectNameForPath(aliasPath), "CanonicalB");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

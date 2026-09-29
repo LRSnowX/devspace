@@ -20,6 +20,8 @@
 
 DevSpace is a self-hosted MCP server that lets ChatGPT read, edit, search, and run code in your real local projects — your files, your tools, your terminal — without uploading anything to a third party. You run it on your machine, expose it through a tunnel you control, and approve the connection with a password only you have.
 
+The same `/mcp` endpoint serves the 2026-07-28 per-request protocol and automatically supports older 2025-era clients through stateless compatibility handling. There is no protocol mode to configure.
+
 ## Sponsors and Special Thanks
 <!-- 
 
@@ -81,7 +83,11 @@ npx @waishnav/devspace init
 During setup, DevSpace asks for:
 
 - where you will use it: ChatGPT, Coding Agents, or both
-- which Coding Agents DevSpace may use
+- which agents DevSpace may use as subagents
+
+The first choice is where you invoke DevSpace from. The subagent choice is
+separate: ChatGPT or another coding agent can delegate work through DevSpace to
+the agents you select there.
 
 If you select ChatGPT, setup also asks which local project folders it may open
 and for your public HTTPS base URL from Cloudflare Tunnel, ngrok, Pinggy,
@@ -248,11 +254,21 @@ This year, I began my journey to build a one-person, multi-agent company capable
 
 For working on DevSpace itself:
 
+Install pnpm 11.25.0, the version pinned in `package.json`, with
+`npm install --global pnpm@11.25.0`, then:
+
 ```bash
-npm install --include=dev
-npm run dev
-npm run typecheck
-npm test
-npm run build
-npm run start
+pnpm install --frozen-lockfile
+pnpm dev:seed
+pnpm dev
+pnpm typecheck
+pnpm test
+pnpm build
+pnpm start
 ```
+
+`dev:seed` forks your normal DevSpace config and SQLite state into an ignored
+checkout-local `.devspace-dev/` directory so source builds and migrations do not
+modify your normal installation. Use `pnpm dev:reset` to discard that QA state
+and fork it again. See [Development and Manual QA](docs/development.md) for
+worktree switching, ChatGPT, and database-migration workflows.
