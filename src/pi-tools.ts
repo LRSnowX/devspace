@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, open, readFile } from "node:fs/promises";
+import { access, open, readFile, writeFile as fsWriteFile } from "node:fs/promises";
 import {
   createBashTool,
   createEditTool,
@@ -68,7 +68,10 @@ async function runTool<TInput, TDetails = unknown>(
       details: result.details,
     };
   } catch (error) {
-    return { content: formatToolError(error), isError: true };
+    const payload = toolErrorPayload(error);
+    return payload
+      ? { content: formatToolError(error), toolError: payload }
+      : { content: formatToolError(error), isError: true };
   }
 }
 
@@ -80,13 +83,13 @@ export async function readFileTool(
   const displayPath = context.displayPath ?? input.path;
   const tool = createReadTool(context.cwd, {
     operations: {
-      access: (path) => readFsOperation(displayPath, () => access(path, constants.R_OK)),
+      access: (path) => fileNotFoundOperation(displayPath, () => access(path, constants.R_OK)),
       readFile: async (path) => {
-        const bytes = await readFsOperation(displayPath, () => readFile(path));
+        const bytes = await fileNotFoundOperation(displayPath, () => readFile(path));
         revision = fileRevision(bytes);
         return bytes;
       },
-      detectImageMimeType: (path) => readFsOperation(
+      detectImageMimeType: (path) => fileNotFoundOperation(
         displayPath,
         () => detectSupportedImageMimeTypeFromFile(path),
       ),
@@ -121,7 +124,7 @@ export async function readFileTool(
   };
 }
 
-async function readFsOperation<T>(
+async function fileNotFoundOperation<T>(
   displayPath: string,
   operation: () => Promise<T>,
 ): Promise<T> {
@@ -158,7 +161,25 @@ export async function writeFileTool(input: WriteToolInput, context: ToolContext)
 }
 
 export async function editFileTool(input: EditToolInput, context: ToolContext): Promise<ToolResponse<EditToolDetails>> {
-  const tool = createEditTool(context.cwd);
+  const displayPath = context.displayPath ?? input.path;
+  const tool = createEditTool(context.cwd, {
+    operations: {
+      access: async (path) => {
+        try {
+          await access(path, constants.R_OK | constants.W_OK);
+        } catch (error) {
+          const code = errnoCode(error);
+          if (code === "ENOENT" || code === "ENOTDIR") return;
+          throw error;
+        }
+      },
+      readFile: (path) => fileNotFoundOperation(displayPath, () => readFile(path)),
+      writeFile: (path, content) => fileNotFoundOperation(
+        displayPath,
+        () => fsWriteFile(path, content, "utf-8"),
+      ),
+    },
+  });
 
   return runTool((params) => tool.execute("edit_file", params), {
     path: input.path,

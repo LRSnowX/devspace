@@ -55,12 +55,22 @@ reads still return a complete-file revision for stale-read protection. Other
 upstream read failures remain unclassified unless DevSpace has a typed signal,
 avoiding brittle message parsing.
 
+## Completed after this assessment: structured Claude mutation path errors
+
+Claude `write` and `edit` now return ordinary structured domain results for
+typed workspace/path failures. `edit` also reports a missing target as
+`FILE_NOT_FOUND` using filesystem errno classification. Upstream edit
+semantics such as zero matches, multiple matches, and overlapping replacements
+remain unclassified because the dependency currently exposes them only as
+human-readable errors.
+
 ## Priority 1: structured errors for the remaining coding surface
 
-`read`, Codex `apply_patch`, and process-session misuse now have a
-host-compatible structured domain-error contract. Other tools still use legacy
-thrown errors for many expected failures, such as missing/invalid project
-entry, unauthorized Memory thread expansion, and mutation-tool failures.
+`read`, Claude mutation path failures, Codex `apply_patch`, and
+process-session misuse now have a host-compatible structured domain-error
+contract. Remaining expected failures include missing/invalid project entry,
+unauthorized Memory thread expansion, and dependency-owned tool semantics that
+do not yet expose a stable typed signal.
 
 Extending the taxonomy would improve model self-correction, but it is primarily
 an ergonomics and reliability improvement rather than a current data-integrity

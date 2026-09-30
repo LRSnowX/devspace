@@ -5,6 +5,11 @@ import {
   writeFileTool,
 } from "../pi-tools.js";
 import {
+  toolErrorPayload,
+  toolErrorPayloadSchema,
+  type ToolErrorPayload,
+} from "../tool-errors.js";
+import {
   EDIT_TOOL_ANNOTATIONS,
   SHELL_TOOL_ANNOTATIONS,
   WRITE_TOOL_ANNOTATIONS,
@@ -38,6 +43,18 @@ export function registerClaudeTools(context: ToolRegistrationContext): void {
 
 const CLAUDE_SHELL_DESCRIPTION = "Run a shell command in a workspace with the user's local permissions.";
 
+function mutationErrorResponse(payload: ToolErrorPayload) {
+  const content = [textBlock(payload.message)];
+  return {
+    content,
+    structuredContent: {
+      result: payload.message,
+      status: "error" as const,
+      error: payload,
+    },
+  };
+}
+
 function registerClaudeMutationTools(context: ToolRegistrationContext): void {
   const { server, config, workspaces } = context;
 
@@ -53,15 +70,54 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
           .describe("File path to write, relative to the workspace root."),
         content: z.string().describe("Complete new file content."),
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: resultOutputSchema({
+        status: z.enum(["applied", "error"]),
+        error: toolErrorPayloadSchema.optional(),
+      }),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
     async ({ workspace_id, ...input }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
-      const workspace = await workspaces.getWorkspace(workspaceId);
-      const path = await workspaces.resolvePath(workspace, input.path);
-      const response = await writeFileTool({ ...input, path }, { cwd: workspace.root });
+      let response;
+      try {
+        const workspace = await workspaces.getWorkspace(workspaceId);
+        const path = await workspaces.resolvePath(workspace, input.path);
+        response = await writeFileTool(
+          { ...input, path },
+          { cwd: workspace.root, displayPath: input.path },
+        );
+      } catch (error) {
+        const payload = toolErrorPayload(error);
+        if (!payload) throw error;
+        const result = mutationErrorResponse(payload);
+        logFailedToolResponse(
+          config,
+          {
+            tool: toolNames.write,
+            workspaceId,
+            path: input.path,
+          },
+          result.content,
+          startedAt,
+        );
+        return result;
+      }
+
+      if (response.toolError) {
+        const result = mutationErrorResponse(response.toolError);
+        logFailedToolResponse(
+          config,
+          {
+            tool: toolNames.write,
+            workspaceId,
+            path: input.path,
+          },
+          result.content,
+          startedAt,
+        );
+        return result;
+      }
 
       if (response.isError) {
         logFailedToolResponse(
@@ -88,6 +144,7 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
       return {
         ...response,
         structuredContent: {
+          status: "applied" as const,
           result: contentText(response.content),
         },
       };
@@ -119,23 +176,57 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
           .min(1),
       },
       outputSchema: resultOutputSchema({
-        status: z.literal("applied"),
+        status: z.enum(["applied", "error"]),
+        error: toolErrorPayloadSchema.optional(),
       }),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
     async ({ workspace_id, edits, ...input }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
-      const workspace = await workspaces.getWorkspace(workspaceId);
-      const path = await workspaces.resolvePath(workspace, input.path);
-      const response = await editFileTool({
-        ...input,
-        path,
-        edits: edits.map(({ old_text, new_text }) => ({
-          oldText: old_text,
-          newText: new_text,
-        })),
-      }, { cwd: workspace.root });
+      let response;
+      try {
+        const workspace = await workspaces.getWorkspace(workspaceId);
+        const path = await workspaces.resolvePath(workspace, input.path);
+        response = await editFileTool({
+          ...input,
+          path,
+          edits: edits.map(({ old_text, new_text }) => ({
+            oldText: old_text,
+            newText: new_text,
+          })),
+        }, { cwd: workspace.root, displayPath: input.path });
+      } catch (error) {
+        const payload = toolErrorPayload(error);
+        if (!payload) throw error;
+        const result = mutationErrorResponse(payload);
+        logFailedToolResponse(
+          config,
+          {
+            tool: toolNames.edit,
+            workspaceId,
+            path: input.path,
+          },
+          result.content,
+          startedAt,
+        );
+        return result;
+      }
+
+      if (response.toolError) {
+        const result = mutationErrorResponse(response.toolError);
+        logFailedToolResponse(
+          config,
+          {
+            tool: toolNames.edit,
+            workspaceId,
+            path: input.path,
+          },
+          result.content,
+          startedAt,
+        );
+        return result;
+      }
 
       if (response.isError) {
         logFailedToolResponse(

@@ -46,6 +46,8 @@ operation failures.
 Successful reads use `status: "read"`, return the complete-file revision, and
 do not include an `error` payload.
 
+Successful Claude `write` and `edit` mutations use `status: "applied"`.
+
 ## read codes
 
 The common `read` tool exposes:
@@ -75,6 +77,32 @@ The common `read` tool exposes:
 stable filesystem errno. Upstream read semantics such as an out-of-range
 `offset` remain transport errors until they have a non-brittle typed contract;
 DevSpace does not classify them by parsing human-readable messages.
+
+## Claude mutation path codes
+
+Claude `write` and `edit` reuse the common typed workspace/path errors:
+
+- `PATH_SCOPE_VIOLATION`
+  - category: `scope`
+  - retryable: false
+  - the requested mutation path escapes or resolves outside the workspace.
+- `WORKSPACE_NOT_FOUND`
+  - category: `not_found`
+  - retryable: true
+  - the supplied workspace id is no longer available; reopen the workspace.
+- `WORKSPACE_INVALIDATED`
+  - category: `state`
+  - retryable: true
+  - the previously opened workspace root disappeared or changed identity;
+    reopen it before mutating files.
+
+`edit` also exposes `FILE_NOT_FOUND` when its target disappears or does not
+exist, using filesystem `ENOENT`/`ENOTDIR` rather than message parsing.
+
+Upstream edit semantics such as zero matches, multiple matches, and overlapping
+replacements are still plain upstream errors. They remain transport errors
+until the upstream surface provides a stable typed signal; DevSpace does not
+infer those cases from human-readable messages.
 
 ## apply_patch codes
 
@@ -193,7 +221,8 @@ For expected classified failures:
 - tool-specific success fields remain neutral so the declared output schema
   stays stable. Patch failures use zero diff counters and an empty file list;
   process failures report `running: false`, `wall_time_ms: 0`, and no exit
-  code or signal; read failures omit `revision`.
+  code or signal; read failures omit `revision`; Claude mutation path failures
+  omit success-specific mutation details.
 
 Unexpected programmer defects, transport failures, and other uncategorized
 internal exceptions are still thrown rather than falsely classified. They remain
@@ -207,7 +236,7 @@ and other lifecycle fields with `status: "completed"` and no domain error.
 
 ## Scope
 
-This phase standardizes `read`, `apply_patch`, plus Codex process-session
-misuse and the domain errors those surfaces consume. Other coding tools may
-migrate to the same payload incrementally; they should not be classified by
-brittle message matching.
+This phase standardizes `read`, Claude mutation path failures, `apply_patch`,
+plus Codex process-session misuse and the domain errors those surfaces consume.
+Other coding tools may migrate to the same payload incrementally; they should
+not be classified by brittle message matching.

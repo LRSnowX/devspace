@@ -636,6 +636,7 @@ test("Claude edit and bash tools accept snake_case runtime inputs", async (t) =>
     },
   });
   assert.equal(edited.isError, undefined);
+  assert.equal(structuredContent(edited).status, "applied");
   assert.equal(await readFile(join(context.project, "note.txt"), "utf8"), "after\n");
 
   const shell = structuredContent(await context.client.callTool({
@@ -647,6 +648,82 @@ test("Claude edit and bash tools accept snake_case runtime inputs", async (t) =>
     },
   }));
   assert.match(shell.result as string, /nested/i);
+});
+
+test("Claude mutation tools structure typed path failures without classifying upstream edit semantics", async (t) => {
+  const context = await fixture(t, { toolMode: "claude", uiEnabled: false });
+
+  for (const name of ["write", "edit"] as const) {
+    const missingWorkspace = await context.client.callTool({
+      name,
+      arguments: name === "write"
+        ? {
+            workspace_id: "ws_missing",
+            path: "note.txt",
+            content: "hello\n",
+          }
+        : {
+            workspace_id: "ws_missing",
+            path: "note.txt",
+            edits: [{ old_text: "before", new_text: "after" }],
+          },
+    });
+    assert.notEqual(missingWorkspace.isError, true);
+    assert.equal(structuredContent(missingWorkspace).status, "error");
+    assert.equal(
+      (structuredContent(missingWorkspace).error as { code?: string }).code,
+      "WORKSPACE_NOT_FOUND",
+    );
+  }
+
+  const workspaceId = structuredContent(
+    await callOpen(context.client, context.project, "claude-mutation-errors"),
+  ).workspace_id;
+  assert.equal(typeof workspaceId, "string");
+
+  const missingFile = await context.client.callTool({
+    name: "edit",
+    arguments: {
+      workspace_id: workspaceId,
+      path: "missing.txt",
+      edits: [{ old_text: "before", new_text: "after" }],
+    },
+  });
+  assert.notEqual(missingFile.isError, true);
+  assert.deepEqual(structuredContent(missingFile), {
+    result: "File not found: missing.txt",
+    status: "error",
+    error: {
+      code: "FILE_NOT_FOUND",
+      category: "not_found",
+      message: "File not found: missing.txt",
+      retryable: false,
+      path: "missing.txt",
+    },
+  });
+
+  await writeFile(join(context.project, "note.txt"), "before\nbefore\n");
+  const ambiguousEdit = await context.client.callTool({
+    name: "edit",
+    arguments: {
+      workspace_id: workspaceId,
+      path: "note.txt",
+      edits: [{ old_text: "before", new_text: "after" }],
+    },
+  });
+  assert.equal(ambiguousEdit.isError, true);
+
+  const written = await context.client.callTool({
+    name: "write",
+    arguments: {
+      workspace_id: workspaceId,
+      path: "written.txt",
+      content: "written\n",
+    },
+  });
+  assert.notEqual(written.isError, true);
+  assert.equal(structuredContent(written).status, "applied");
+  assert.equal(await readFile(join(context.project, "written.txt"), "utf8"), "written\n");
 });
 
 test("read rejects a symlink that leaves the workspace", async (t) => {
@@ -697,7 +774,15 @@ test("write rejects a new file through a symlink that leaves the workspace", asy
       content: "escaped\n",
     },
   });
-  assert.equal(result.isError, true);
+  assert.notEqual(result.isError, true);
+  assert.equal(structuredContent(result).status, "error");
+  assert.deepEqual(structuredContent(result).error, {
+    code: "PATH_SCOPE_VIOLATION",
+    category: "scope",
+    message: "Path is outside allowed roots: outside-link/new.txt",
+    retryable: false,
+    path: "outside-link/new.txt",
+  });
   await assert.rejects(access(join(outside, "new.txt")));
 });
 
