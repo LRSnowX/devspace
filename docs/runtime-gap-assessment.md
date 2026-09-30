@@ -98,15 +98,27 @@ Extending the taxonomy would improve model self-correction, but it is primarily
 an ergonomics and reliability improvement rather than a current data-integrity
 gap.
 
-## Priority 2: persistent metadata retention
+## Priority 2 in progress: persistent metadata retention
 
-Workspace sessions, conversation bindings, and review refs do not yet have a
-general retention policy. Their persistent stores can grow over long-lived
-installations.
+Stale checkout workspace metadata now has a conservative product policy:
 
-This is not the same as process-session leakage: completed process sessions are
-removed and also have a bounded completion TTL. Persistent metadata retention
-should be handled by a product-level policy rather than ad hoc deletion.
+- devspace retention inspect reports checkout sessions idle for more than
+  90 days;
+- devspace retention prune explicitly removes eligible checkout sessions;
+- conversation bindings and loaded-agent-file state cascade with the session;
+- matching review refs are cleaned best-effort;
+- roots protected by unresolved patch recovery are skipped;
+- managed worktree sessions are excluded entirely;
+- no automatic startup retention is enabled.
+
+This addresses the largest monotonically growing workspace class without
+mixing it with recoverable worktree state.
+
+The remaining retention gap is managed-worktree recovery metadata. A pruned
+worktree can depend on both its persisted session and
+refs/devspace/recovery/<workspace-id>, and successful restoration currently
+does not retire an existing recovery ref. That lifecycle needs its own
+recovery-aware slice before any automatic deletion policy is considered.
 
 ## Deliberate non-goals
 

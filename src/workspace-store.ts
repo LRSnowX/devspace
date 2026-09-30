@@ -66,6 +66,7 @@ export interface WorkspaceStore {
   getSession(id: string): WorkspaceSession | undefined;
   getSessionResult(id: string): BetterResult<WorkspaceSession | undefined, WorkspaceStoreError>;
   listStaleManagedWorktrees(before: Date): BetterResult<WorkspaceSession[], WorkspaceStoreError>;
+  listStaleCheckoutSessions(before: Date): BetterResult<WorkspaceSession[], WorkspaceStoreError>;
   markSessionPruned(id: string, recoveryKind?: WorkspaceRecoveryKind): BetterResult<void, WorkspaceStoreError>;
   reactivateSession(id: string): BetterResult<boolean, WorkspaceStoreError>;
   touchSession(id: string): BetterResult<boolean, WorkspaceStoreError>;
@@ -157,6 +158,24 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
             eq(workspaceSessions.status, "active"),
             eq(workspaceSessions.mode, "worktree"),
             eq(workspaceSessions.managed, "true"),
+            lt(workspaceSessions.lastUsedAt, before.toISOString()),
+          ),
+        )
+        .all()
+        .map(rowToWorkspaceSession)
+    ));
+  }
+
+  listStaleCheckoutSessions(before: Date): BetterResult<WorkspaceSession[], WorkspaceStoreError> {
+    return workspaceStoreResult("list_stale_checkout_sessions", () => (
+      this.database.db
+        .select()
+        .from(workspaceSessions)
+        .where(
+          and(
+            eq(workspaceSessions.status, "active"),
+            eq(workspaceSessions.mode, "checkout"),
+            eq(workspaceSessions.managed, "false"),
             lt(workspaceSessions.lastUsedAt, before.toISOString()),
           ),
         )

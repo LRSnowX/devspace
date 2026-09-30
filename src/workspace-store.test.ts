@@ -41,6 +41,34 @@ test("workspace store lists only stale managed worktrees", async (t) => {
   assert.deepEqual(unwrap(store.listStaleManagedWorktrees(new Date(0))), []);
 });
 
+test("workspace store lists only stale active checkout sessions", async (t) => {
+  const stateDir = await mkdtemp(join(tmpdir(), "devspace-workspace-store-test-"));
+  const store = new SqliteWorkspaceStore(stateDir);
+  t.after(async () => {
+    store.close();
+    await rm(stateDir, { recursive: true, force: true });
+  });
+
+  const checkout = store.createSession({
+    id: "ws_checkout",
+    root: "/tmp/repo",
+  });
+  store.createSession({
+    id: "ws_worktree",
+    root: "/tmp/worktree",
+    mode: "worktree",
+    sourceRoot: "/tmp/repo",
+    managed: true,
+  });
+
+  assert.deepEqual(
+    unwrap(store.listStaleCheckoutSessions(new Date(Date.now() + 60_000)))
+      .map((session) => session.id),
+    [checkout.id],
+  );
+  assert.deepEqual(unwrap(store.listStaleCheckoutSessions(new Date(0))), []);
+});
+
 test("pruned worktree sessions retain recovery state and can be reactivated", async (t) => {
   const stateDir = await mkdtemp(join(tmpdir(), "devspace-workspace-store-test-"));
   const store = new SqliteWorkspaceStore(stateDir);

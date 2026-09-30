@@ -218,6 +218,9 @@ the corresponding regression coverage in the same change.
 - Historical `review_ref` values can reopen prior reviews without advancing
   the current checkpoint.
 - Review checkpoints survive manager/server recreation through persisted state.
+- Checkout-session retention is an explicit local operation. Sessions idle for
+  more than 90 days can be inspected or pruned with devspace retention;
+  managed worktree/recovery state is excluded from that policy.
 - Unborn Git repositories are reviewable without creating a synthetic initial
   commit.
 - Review state is scoped to its workspace/root and may not be reused for a

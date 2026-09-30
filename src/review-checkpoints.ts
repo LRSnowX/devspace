@@ -194,6 +194,23 @@ export async function readReviewRef(root: string, reviewRef: string): Promise<Re
   return readReviewCommit(eligibility.gitRoot, commit);
 }
 
+export async function deleteWorkspaceReviewRefs(
+  root: string,
+  workspaceId: string,
+): Promise<number> {
+  const eligibility = await getGitEligibility(root);
+  if (!eligibility.ok || !eligibility.gitRoot) return 0;
+
+  const refs = reviewRefs(workspaceId);
+  let deleted = 0;
+  for (const ref of [refs.openRef, refs.baselineRef]) {
+    if (!await commitForRef(eligibility.gitRoot, ref)) continue;
+    await git(eligibility.gitRoot, ["update-ref", "-d", ref]);
+    deleted += 1;
+  }
+  return deleted;
+}
+
 function assertWorkspaceRoot(
   state: WorkspaceReviewState | undefined,
   workspaceId: string,
