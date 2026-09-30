@@ -229,6 +229,13 @@ the corresponding regression coverage in the same change.
 - Retention deletion rechecks lifecycle state atomically in SQLite. A candidate
   reused or reactivated after inspection is skipped rather than deleted, and
   its review refs are not cleaned.
+- OAuth client registrations carry a last-used timestamp so future retention
+  can distinguish old registrations from clients still being reused. Existing
+  clients are backfilled to migration time; no OAuth client is pruned by the
+  current workspace retention command.
+- OAuth client registrations persist a last-used timestamp for future
+  retention decisions. Existing registrations are conservatively backfilled to
+  migration time; no OAuth client is deleted by the current retention command.
 - Unborn Git repositories are reviewable without creating a synthetic initial
   commit.
 - Review state is scoped to its workspace/root and may not be reused for a

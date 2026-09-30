@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import Database from "better-sqlite3";
 import { databasePath, openDatabase } from "./db/client.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
@@ -23,6 +24,7 @@ const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
 
 try {
   await testDatabaseConfiguration(join(root, "database-configuration"));
+  await testLegacyClientUsageBackfill(join(root, "legacy-oauth-client-usage"));
   testPersistenceAndTokenHashing(join(root, "persistence"));
   testExpiredTokenCleanup(join(root, "expiration"));
   testTransactionalTokenRotation(join(root, "rotation"));
@@ -30,6 +32,71 @@ try {
   await testRefreshResourcePolicy(join(root, "refresh-policy"));
 } finally {
   await rm(root, { recursive: true, force: true });
+}
+
+async function testLegacyClientUsageBackfill(stateDir: string): Promise<void> {
+  await mkdir(stateDir, { recursive: true });
+  const legacy = new Database(databasePath(stateDir));
+  legacy.exec(
+    "create table devspace_schema_migrations ("
+      + "version integer primary key,"
+      + "name text not null,"
+      + "applied_at text not null"
+      + ");"
+      + "create table oauth_clients ("
+      + "client_id text primary key,"
+      + "client_json text not null,"
+      + "issued_at integer not null"
+      + ");",
+  );
+  const recordMigration = legacy.prepare(
+    "insert into devspace_schema_migrations (version, name, applied_at) values (?, ?, ?)",
+  );
+  for (const [version, name] of [
+    [1, "workspace-state"],
+    [2, "oauth-state"],
+    [3, "local-agent-sessions"],
+    [4, "workspace-conversation-bindings"],
+    [5, "local-agent-structured-errors"],
+    [6, "local-agent-effort-rename"],
+    [7, "workspace-recovery-state"],
+    [8, "local-agent-turns"],
+    [10001, "patch-transactions"],
+  ] as const) {
+    recordMigration.run(version, name, "2026-09-01T00:00:00.000Z");
+  }
+  legacy.prepare(
+    "insert into oauth_clients (client_id, client_json, issued_at) values (?, ?, ?)",
+  ).run(
+    "devspace-legacy-client",
+    JSON.stringify({
+      client_id: "devspace-legacy-client",
+      client_id_issued_at: 1,
+      redirect_uris: [redirectUri],
+    }),
+    1,
+  );
+  legacy.close();
+
+  const before = Math.floor(Date.now() / 1000);
+  const upgraded = openDatabase(stateDir);
+  try {
+    const row = upgraded.sqlite
+      .prepare("select issued_at, last_used_at from oauth_clients where client_id = ?")
+      .get("devspace-legacy-client") as { issued_at: number; last_used_at: number };
+    const after = Math.floor(Date.now() / 1000);
+    assert.equal(row.issued_at, 1);
+    assert.ok(row.last_used_at >= before);
+    assert.ok(row.last_used_at <= after);
+    assert.deepEqual(
+      upgraded.sqlite
+        .prepare("select version, name from devspace_schema_migrations where version = 10002")
+        .get(),
+      { version: 10002, name: "oauth-client-last-used" },
+    );
+  } finally {
+    upgraded.close();
+  }
 }
 
 async function testDatabaseConfiguration(stateDir: string): Promise<void> {
@@ -53,6 +120,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 7, name: "workspace-recovery-state" },
       { version: 8, name: "local-agent-turns" },
       { version: 10001, name: "patch-transactions" },
+      { version: 10002, name: "oauth-client-last-used" },
     ]);
   } finally {
     database.close();
@@ -73,6 +141,15 @@ function testPersistenceAndTokenHashing(stateDir: string): void {
     redirect_uris: [redirectUri],
     client_name: "ChatGPT",
   });
+  const registeredUsage = openDatabase(stateDir);
+  try {
+    const row = registeredUsage.sqlite
+      .prepare("select issued_at, last_used_at from oauth_clients where client_id = ?")
+      .get(client.client_id) as { issued_at: number; last_used_at: number };
+    assert.equal(row.last_used_at, row.issued_at);
+  } finally {
+    registeredUsage.close();
+  }
 
   firstStore.saveTokenPair({
     accessTokenHash: hashToken(accessToken),
@@ -112,8 +189,26 @@ function testPersistenceAndTokenHashing(stateDir: string): void {
 
   const restoredStore = new SqliteOAuthStore(stateDir);
   try {
+    const usageDatabase = openDatabase(stateDir);
+    try {
+      usageDatabase.sqlite
+        .prepare("update oauth_clients set last_used_at = 1 where client_id = ?")
+        .run(client.client_id);
+    } finally {
+      usageDatabase.close();
+    }
     const restoredClient = restoredStore.getClient(client.client_id);
     assert.equal(restoredClient?.client_id, client.client_id);
+    const touchedDatabase = openDatabase(stateDir);
+    try {
+      const lastUsedAt = touchedDatabase.sqlite
+        .prepare("select last_used_at from oauth_clients where client_id = ?")
+        .pluck()
+        .get(client.client_id) as number;
+      assert.ok(lastUsedAt > 1);
+    } finally {
+      touchedDatabase.close();
+    }
     assert.equal(restoredStore.getAccessToken(hashToken(accessToken))?.resource, mcpUrl.href);
     assert.equal(restoredStore.getRefreshToken(hashToken(refreshToken))?.clientId, client.client_id);
   } finally {

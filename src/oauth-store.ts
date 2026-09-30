@@ -50,7 +50,9 @@ export class SqliteOAuthStore {
       .prepare("select client_json from oauth_clients where client_id = ?")
       .get(clientId) as { client_json: string } | undefined;
 
-    return row ? (JSON.parse(row.client_json) as OAuthClientInformationFull) : undefined;
+    if (!row) return undefined;
+    this.touchClient(clientId);
+    return JSON.parse(row.client_json) as OAuthClientInformationFull;
   }
 
   registerClient(
@@ -72,8 +74,10 @@ export class SqliteOAuthStore {
     };
 
     this.database.sqlite
-      .prepare("insert into oauth_clients (client_id, client_json, issued_at) values (?, ?, ?)")
-      .run(registered.client_id, JSON.stringify(registered), now);
+      .prepare(
+        "insert into oauth_clients (client_id, client_json, issued_at, last_used_at) values (?, ?, ?, ?)",
+      )
+      .run(registered.client_id, JSON.stringify(registered), now, now);
 
     return registered;
   }
@@ -150,6 +154,7 @@ export class SqliteOAuthStore {
 
       this.saveAccessToken(pair.accessTokenHash, pair.accessToken);
       this.saveRefreshToken(pair.refreshTokenHash, pair.refreshToken);
+      this.touchClient(pair.refreshToken.clientId);
       return true;
     });
 
@@ -184,6 +189,12 @@ export class SqliteOAuthStore {
   private deleteExpiredTokens(nowSeconds: number): void {
     this.database.sqlite.prepare("delete from oauth_access_tokens where expires_at < ?").run(nowSeconds);
     this.database.sqlite.prepare("delete from oauth_refresh_tokens where expires_at < ?").run(nowSeconds);
+  }
+
+  private touchClient(clientId: string): void {
+    this.database.sqlite
+      .prepare("update oauth_clients set last_used_at = ? where client_id = ?")
+      .run(Math.floor(Date.now() / 1000), clientId);
   }
 }
 

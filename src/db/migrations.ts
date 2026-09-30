@@ -55,7 +55,32 @@ const migrations: Migration[] = [
     name: "patch-transactions",
     up: migratePatchTransactions,
   },
+  {
+    version: 10002,
+    name: "oauth-client-last-used",
+    up: migrateOAuthClientLastUsed,
+  },
 ];
+
+function migrateOAuthClientLastUsed(sqlite: Database.Database): void {
+  const oauthClientsExists = sqlite
+    .prepare("select 1 from sqlite_master where type = 'table' and name = 'oauth_clients'")
+    .get();
+  if (!oauthClientsExists) return;
+
+  addColumnIfMissing(
+    sqlite,
+    "oauth_clients",
+    "last_used_at",
+    "integer not null default 0",
+  );
+  sqlite
+    .prepare("update oauth_clients set last_used_at = ? where last_used_at = 0")
+    .run(Math.floor(Date.now() / 1000));
+  sqlite.exec(
+    "create index if not exists oauth_clients_last_used_at_idx on oauth_clients(last_used_at desc)",
+  );
+}
 
 function migratePatchTransactions(sqlite: Database.Database): void {
   sqlite.exec(`
@@ -315,7 +340,7 @@ function migrateLocalAgentTurns(sqlite: Database.Database): void {
 
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "local_agent_sessions",
+  table: "workspace_sessions" | "local_agent_sessions" | "oauth_clients",
   column: string,
   definition: string,
 ): void {

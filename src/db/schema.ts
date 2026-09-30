@@ -76,6 +76,7 @@ export const oauthClients = sqliteTable(
     clientId: text("client_id").primaryKey(),
     clientJson: text("client_json").notNull(),
     issuedAt: integer("issued_at").notNull(),
+    lastUsedAt: integer("last_used_at").notNull(),
   },
 );
 

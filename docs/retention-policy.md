@@ -93,6 +93,31 @@ This command does not prune:
 - local-agent session or turn history;
 - OAuth clients or tokens.
 
+## OAuth client usage signal
+
+OAuth dynamic client registrations can also accumulate across reconnects and
+Refresh cycles, but an unreferenced client is not automatically disposable: a
+host may persist that client id and reuse it for a later authorization flow.
+
+DevSpace therefore records a separate oauth_clients.last_used_at signal before
+introducing any client-retention policy. The timestamp is updated when a client
+is registered, looked up by the OAuth provider, or successfully receives a new
+token pair.
+
+Existing clients are backfilled to the migration time rather than their
+historical issued_at value. This intentionally gives every pre-existing client
+a fresh observation window and prevents old registrations from becoming
+immediate retention candidates merely because the signal did not exist before.
+
+No OAuth client is deleted by devspace retention today. Expired access and
+refresh tokens continue to be removed by the OAuth store's existing expiry
+cleanup. A future client-retention slice should require all of the following:
+
+- no unexpired access token;
+- no unexpired refresh token;
+- a sufficiently old last_used_at value;
+- an explicit local retention action rather than invisible startup deletion.
+
 Recoverable managed worktree sessions can carry the metadata needed to restore
 an isolated workspace from a preserved recovery ref. Those sessions remain
 outside destructive retention. Only already-pruned sessions proven to have no
@@ -113,6 +138,24 @@ The remaining product question is retention for pruned worktrees that are never
 restored. Those rows and recovery refs may represent the only remaining copy of
 isolated work, so deleting them requires an explicit recovery-aware discard
 policy rather than a background TTL.
+
+## OAuth client observation
+
+OAuth refresh and access tokens already expire independently. Dynamic OAuth
+client registrations are different: a client can have no current token and
+still be retained by the host for a later authorization flow, so an orphan
+client is not automatically disposable.
+
+DevSpace therefore records oauth_clients.last_used_at but does not prune OAuth
+clients yet. Existing databases backfill every client to the time the usage
+column is first introduced, rather than to the original issued_at value. This
+gives pre-existing registrations a fresh observation window and prevents an
+upgrade from immediately classifying old-but-still-retained clients as stale.
+
+New registrations set last_used_at at registration. Looking up a registered
+client for an OAuth flow and successful token issuance/rotation refresh that
+timestamp. A future retention policy can require both a long idle interval and
+the absence of access/refresh tokens before considering a client disposable.
 
 ## Why there is no retention config knob yet
 

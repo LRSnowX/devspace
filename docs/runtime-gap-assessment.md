@@ -129,6 +129,20 @@ only surviving copy of isolated work. Any policy that discards that state must
 therefore be explicit and recovery-aware; it is not suitable for automatic
 startup TTL cleanup.
 
+OAuth dynamic client registrations are a separate persistent-growth surface.
+DevSpace now records oauth_clients.last_used_at and backfills existing clients
+to the migration time so old registrations are not retroactively treated as
+stale. Registration, client lookup, and successful token issuance refresh the
+signal. No OAuth client deletion policy is enabled yet; expired access/refresh
+tokens continue to use their existing cleanup path.
+
+OAuth registration growth is now observable without changing authentication
+behavior. Migration 10002 adds oauth_clients.last_used_at, conservatively
+backfills existing clients to migration time, and refreshes the timestamp when
+the registration participates in OAuth lookup or token issuance. OAuth client
+deletion is intentionally deferred until enough usage history exists to combine
+an idle threshold with the absence of access/refresh tokens.
+
 ## Deliberate non-goals
 
 - Shell commands continue to run with the local user's authority; DevSpace is
