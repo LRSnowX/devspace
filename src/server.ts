@@ -34,6 +34,11 @@ import {
 } from "./logger.js";
 import { readFileTool } from "./pi-tools.js";
 import { FILE_REVISION_PATTERN } from "./file-revision.js";
+import {
+  toolErrorPayload,
+  toolErrorPayloadSchema,
+  type ToolErrorPayload,
+} from "./tool-errors.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import {
   compileMcpRegistrationSurface,
@@ -221,6 +226,18 @@ function formatAvailableAgentProvider(provider: {
     provider.note,
   ].filter(Boolean).join(", ");
   return `${provider.id}${details ? ` (${details})` : ""}`;
+}
+
+function readErrorResponse(payload: ToolErrorPayload) {
+  const content = [textBlock(payload.message)];
+  return {
+    content,
+    structuredContent: {
+      result: payload.message,
+      status: "error" as const,
+      error: payload,
+    },
+  };
 }
 
 const workspaceSkillOutputSchema = z.object({
@@ -819,22 +836,48 @@ function registerMcpSurface(
           .describe("Maximum number of lines to read."),
       },
       outputSchema: resultOutputSchema({
+        status: z.enum(["read", "error"]),
         revision: z
           .string()
           .regex(FILE_REVISION_PATTERN)
+          .optional()
           .describe("SHA-256 revision of the complete file bytes read."),
+        error: toolErrorPayloadSchema.optional(),
       }),
       annotations: { readOnlyHint: true },
     },
     async ({ workspace_id, ...input }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
-      const workspace = await workspaces.getWorkspace(workspaceId);
-      const readPath = await workspaces.resolveReadPath(workspace, input.path);
-      const response = await readFileTool(
-        { ...input, path: readPath.absolutePath },
-        { cwd: workspace.root },
-      );
+      let response;
+      try {
+        const workspace = await workspaces.getWorkspace(workspaceId);
+        const readPath = await workspaces.resolveReadPath(workspace, input.path);
+        response = await readFileTool(
+          { ...input, path: readPath.absolutePath },
+          { cwd: workspace.root, displayPath: input.path },
+        );
+      } catch (error) {
+        const payload = toolErrorPayload(error);
+        if (!payload) throw error;
+        const result = readErrorResponse(payload);
+        logFailedToolResponse(config, {
+          tool: toolNames.read,
+          workspaceId,
+          path: input.path,
+        }, result.content, startedAt);
+        return result;
+      }
+
+      if (response.toolError) {
+        const result = readErrorResponse(response.toolError);
+        logFailedToolResponse(config, {
+          tool: toolNames.read,
+          workspaceId,
+          path: input.path,
+        }, result.content, startedAt);
+        return result;
+      }
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -862,6 +905,7 @@ function registerMcpSurface(
         ...response,
         structuredContent: {
           result: contentText(response.content),
+          status: "read" as const,
           revision,
         },
       };

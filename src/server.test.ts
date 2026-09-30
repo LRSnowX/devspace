@@ -218,6 +218,8 @@ test("Codex read and apply_patch expose the stale-read revision contract", async
     ["expected_absent_paths", "expected_revisions", "patch", "workspace_id"],
   );
   assert.equal("revision" in readOutputProperties, true);
+  assert.equal("status" in readOutputProperties, true);
+  assert.equal("error" in readOutputProperties, true);
 
   const expectedRevisions = patchInputProperties.expected_revisions as {
     items?: {
@@ -228,6 +230,72 @@ test("Codex read and apply_patch expose the stale-read revision contract", async
     Object.keys(expectedRevisions?.items?.properties ?? {}).sort(),
     ["path", "revision"],
   );
+});
+
+test("read returns structured workspace and missing-file errors on both tool surfaces", async (t) => {
+  for (const toolMode of ["claude", "codex"] as const) {
+    await t.test(toolMode, async (nested) => {
+      const context = await fixture(nested, { toolMode, uiEnabled: false });
+
+      const missingWorkspace = await context.client.callTool({
+        name: "read",
+        arguments: {
+          workspace_id: "ws_missing",
+          path: "note.txt",
+        },
+      });
+      assert.notEqual(missingWorkspace.isError, true);
+      assert.deepEqual(structuredContent(missingWorkspace), {
+        result:
+          "Unknown workspaceId: ws_missing. Open the target project or worktree again and continue with the new workspaceId.",
+        status: "error",
+        error: {
+          code: "WORKSPACE_NOT_FOUND",
+          category: "not_found",
+          message:
+            "Unknown workspaceId: ws_missing. Open the target project or worktree again and continue with the new workspaceId.",
+          retryable: true,
+        },
+      });
+
+      const workspaceId = structuredContent(
+        await callOpen(context.client, context.project, `read-errors-${toolMode}`),
+      ).workspace_id;
+      assert.equal(typeof workspaceId, "string");
+
+      const missingFile = await context.client.callTool({
+        name: "read",
+        arguments: {
+          workspace_id: workspaceId,
+          path: "missing.txt",
+        },
+      });
+      assert.notEqual(missingFile.isError, true);
+      assert.deepEqual(structuredContent(missingFile), {
+        result: "File not found: missing.txt",
+        status: "error",
+        error: {
+          code: "FILE_NOT_FOUND",
+          category: "not_found",
+          message: "File not found: missing.txt",
+          retryable: false,
+          path: "missing.txt",
+        },
+      });
+
+      await writeFile(join(context.project, "note.txt"), "hello\n");
+      const read = structuredContent(await context.client.callTool({
+        name: "read",
+        arguments: {
+          workspace_id: workspaceId,
+          path: "note.txt",
+        },
+      }));
+      assert.equal(read.status, "read");
+      assert.equal(read.error, undefined);
+      assert.match(String(read.revision), /^sha256:[0-9a-f]{64}$/);
+    });
+  }
 });
 
 test("Codex apply_patch absence preconditions protect intended-new paths", async (t) => {
@@ -307,6 +375,8 @@ test("read revisions reject stale Codex patches before publication", async (t) =
       limit: 1,
     },
   }));
+  assert.equal(firstPage.status, "read");
+  assert.equal(secondPage.status, "read");
   assert.match(String(firstPage.revision), /^sha256:[0-9a-f]{64}$/);
   assert.equal(firstPage.revision, secondPage.revision);
 
@@ -596,7 +666,15 @@ test("read rejects a symlink that leaves the workspace", async (t) => {
     name: "read",
     arguments: { workspace_id: workspaceId, path: "outside-link/secret.txt" },
   });
-  assert.equal(result.isError, true);
+  assert.notEqual(result.isError, true);
+  assert.equal(structuredContent(result).status, "error");
+  assert.deepEqual(structuredContent(result).error, {
+    code: "PATH_SCOPE_VIOLATION",
+    category: "scope",
+    message: "Path is outside allowed roots: outside-link/secret.txt",
+    retryable: false,
+    path: "outside-link/secret.txt",
+  });
 });
 
 test("write rejects a new file through a symlink that leaves the workspace", async (t) => {

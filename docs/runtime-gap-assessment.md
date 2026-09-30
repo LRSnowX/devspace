@@ -46,12 +46,21 @@ exceptions. Missing sessions, cross-workspace session access, and PTY-only
 resize requests have stable error codes. Normal non-zero or signaled process
 exits remain completed command results rather than tool errors.
 
+## Completed after this assessment: structured read path errors
+
+The common `read` tool now returns ordinary structured domain results for
+missing workspaces, workspace/skill scope violations, and filesystem
+`ENOENT`/`ENOTDIR` reads. Missing files use `FILE_NOT_FOUND`; successful
+reads still return a complete-file revision for stale-read protection. Other
+upstream read failures remain unclassified unless DevSpace has a typed signal,
+avoiding brittle message parsing.
+
 ## Priority 1: structured errors for the remaining coding surface
 
-Codex `apply_patch` and process-session misuse now have a host-compatible
-structured domain-error contract. Other tools still use legacy thrown errors
-for many expected failures, such as missing/invalid project entry, unauthorized
-Memory thread expansion, or missing files.
+`read`, Codex `apply_patch`, and process-session misuse now have a
+host-compatible structured domain-error contract. Other tools still use legacy
+thrown errors for many expected failures, such as missing/invalid project
+entry, unauthorized Memory thread expansion, and mutation-tool failures.
 
 Extending the taxonomy would improve model self-correction, but it is primarily
 an ergonomics and reliability improvement rather than a current data-integrity

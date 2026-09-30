@@ -1,9 +1,9 @@
 # Tool error contract
 
 DevSpace distinguishes expected tool-operation failures from MCP protocol
-failures. Expected Codex `apply_patch` and process-session failures remain
-visible to the model as ordinary tool results with an explicit domain status
-and stable machine-readable payload.
+failures. Expected `read`, Codex `apply_patch`, and process-session failures
+remain visible to the model as ordinary tool results with an explicit domain
+status and stable machine-readable payload.
 
 This is intentional host-compatibility behavior. The current ChatGPT MCP host
 converts `isError: true` tool results into connector exceptions and drops
@@ -42,6 +42,39 @@ Successful patch application uses `status: "applied"` and does not include an
 Codex process tools use `status: "running"` or `status: "completed"` for
 normal process lifecycle results and `status: "error"` for classified tool
 operation failures.
+
+Successful reads use `status: "read"`, return the complete-file revision, and
+do not include an `error` payload.
+
+## read codes
+
+The common `read` tool exposes:
+
+- `FILE_NOT_FOUND`
+  - category: `not_found`
+  - retryable: false for the unchanged request
+  - the requested path does not resolve to a readable file because the file or
+    an intermediate path component is missing.
+  - includes `path`.
+- `PATH_SCOPE_VIOLATION`
+  - category: `scope`
+  - retryable: false
+  - the requested path escapes or resolves outside the permitted workspace or
+    advertised skill scope.
+- `WORKSPACE_NOT_FOUND`
+  - category: `not_found`
+  - retryable: true
+  - the supplied workspace id is no longer available; reopen the workspace.
+- `WORKSPACE_INVALIDATED`
+  - category: `state`
+  - retryable: true
+  - the previously opened workspace root disappeared or changed identity;
+    reopen it before reading again.
+
+`read` only classifies failures that already have a typed DevSpace error or a
+stable filesystem errno. Upstream read semantics such as an out-of-range
+`offset` remain transport errors until they have a non-brittle typed contract;
+DevSpace does not classify them by parsing human-readable messages.
 
 ## apply_patch codes
 
@@ -160,7 +193,7 @@ For expected classified failures:
 - tool-specific success fields remain neutral so the declared output schema
   stays stable. Patch failures use zero diff counters and an empty file list;
   process failures report `running: false`, `wall_time_ms: 0`, and no exit
-  code or signal.
+  code or signal; read failures omit `revision`.
 
 Unexpected programmer defects, transport failures, and other uncategorized
 internal exceptions are still thrown rather than falsely classified. They remain
@@ -174,7 +207,7 @@ and other lifecycle fields with `status: "completed"` and no domain error.
 
 ## Scope
 
-This phase standardizes `apply_patch` plus Codex process-session misuse and
-the domain errors those surfaces consume. Other coding tools may migrate to the
-same payload incrementally; they should not be classified by brittle message
-matching.
+This phase standardizes `read`, `apply_patch`, plus Codex process-session
+misuse and the domain errors those surfaces consume. Other coding tools may
+migrate to the same payload incrementally; they should not be classified by
+brittle message matching.

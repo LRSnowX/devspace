@@ -14,16 +14,23 @@ import {
   type AgentToolResult,
 } from "@earendil-works/pi-coding-agent";
 import { fileRevision } from "./file-revision.js";
+import {
+  ToolOperationError,
+  toolErrorPayload,
+  type ToolErrorPayload,
+} from "./tool-errors.js";
 
 type McpContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 export type ToolResponse<TDetails = unknown> = {
   content: McpContent[];
   details?: TDetails;
   isError?: boolean;
+  toolError?: ToolErrorPayload;
 };
 
 interface ToolContext {
   cwd: string;
+  displayPath?: string;
 }
 
 interface DevspaceReadToolDetails extends ReadToolDetails {
@@ -70,29 +77,41 @@ export async function readFileTool(
   context: ToolContext,
 ): Promise<ToolResponse<DevspaceReadToolDetails | undefined>> {
   let revision: string | undefined;
+  const displayPath = context.displayPath ?? input.path;
   const tool = createReadTool(context.cwd, {
     operations: {
-      access: (path) => access(path, constants.R_OK),
+      access: (path) => readFsOperation(displayPath, () => access(path, constants.R_OK)),
       readFile: async (path) => {
-        const bytes = await readFile(path);
+        const bytes = await readFsOperation(displayPath, () => readFile(path));
         revision = fileRevision(bytes);
         return bytes;
       },
-      detectImageMimeType: detectSupportedImageMimeTypeFromFile,
+      detectImageMimeType: (path) => readFsOperation(
+        displayPath,
+        () => detectSupportedImageMimeTypeFromFile(path),
+      ),
     },
   });
 
-  const response = await runTool<ReadToolInput, ReadToolDetails | undefined>(
-    (params) => tool.execute("read_file", params),
-    {
-    path: input.path,
-    offset: input.offset,
-    limit: input.limit,
-    },
-    context,
-  );
+  let response: ToolResponse<ReadToolDetails | undefined>;
+  try {
+    const result = await tool.execute("read_file", {
+      path: input.path,
+      offset: input.offset,
+      limit: input.limit,
+    });
+    response = {
+      content: toMcpContent(result),
+      details: result.details,
+    };
+  } catch (error) {
+    const payload = toolErrorPayload(error);
+    response = payload
+      ? { content: formatToolError(error), toolError: payload }
+      : { content: formatToolError(error), isError: true };
+  }
 
-  if (response.isError || revision === undefined) return response;
+  if (response.isError || response.toolError || revision === undefined) return response;
   return {
     ...response,
     details: {
@@ -100,6 +119,33 @@ export async function readFileTool(
       revision,
     },
   };
+}
+
+async function readFsOperation<T>(
+  displayPath: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    const code = errnoCode(error);
+    if (code === "ENOENT" || code === "ENOTDIR") {
+      throw new ToolOperationError({
+        code: "FILE_NOT_FOUND",
+        category: "not_found",
+        message: `File not found: ${displayPath}`,
+        retryable: false,
+        path: displayPath,
+      }, { cause: error });
+    }
+    throw error;
+  }
+}
+
+function errnoCode(error: unknown): string | undefined {
+  return typeof error === "object" && error && "code" in error
+    ? String((error as NodeJS.ErrnoException).code)
+    : undefined;
 }
 
 export async function writeFileTool(input: WriteToolInput, context: ToolContext): Promise<ToolResponse> {
