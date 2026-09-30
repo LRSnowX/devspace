@@ -93,6 +93,21 @@ This command does not prune:
 - local-agent session or turn history;
 - OAuth clients or tokens.
 
+## Local-agent history is user-owned durable state
+
+Local-agent records are not cache entries. A logical agent id can be continued
+after the daemon restarts, and its persisted providerSessionId is the bridge
+back to the provider conversation when that provider supports resume.
+
+For that reason, idle, stopped, or error local-agent sessions are not candidates
+for age-based workspace retention. An old error record may still be a useful
+continuation point, and deleting it would also cascade its durable turn history.
+
+DevSpace currently has no agents delete/archive command. If local-agent history
+eventually needs lifecycle controls, they should be explicit user-owned
+operations that account for both the local logical record and provider session
+release semantics. A background TTL is not an acceptable substitute.
+
 ## OAuth client usage signal
 
 OAuth dynamic client registrations can also accumulate across reconnects and
@@ -138,24 +153,6 @@ The remaining product question is retention for pruned worktrees that are never
 restored. Those rows and recovery refs may represent the only remaining copy of
 isolated work, so deleting them requires an explicit recovery-aware discard
 policy rather than a background TTL.
-
-## OAuth client observation
-
-OAuth refresh and access tokens already expire independently. Dynamic OAuth
-client registrations are different: a client can have no current token and
-still be retained by the host for a later authorization flow, so an orphan
-client is not automatically disposable.
-
-DevSpace therefore records oauth_clients.last_used_at but does not prune OAuth
-clients yet. Existing databases backfill every client to the time the usage
-column is first introduced, rather than to the original issued_at value. This
-gives pre-existing registrations a fresh observation window and prevents an
-upgrade from immediately classifying old-but-still-retained clients as stale.
-
-New registrations set last_used_at at registration. Looking up a registered
-client for an OAuth flow and successful token issuance/rotation refresh that
-timestamp. A future retention policy can require both a long idle interval and
-the absence of access/refresh tokens before considering a client disposable.
 
 ## Why there is no retention config knob yet
 

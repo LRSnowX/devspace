@@ -136,12 +136,18 @@ stale. Registration, client lookup, and successful token issuance refresh the
 signal. No OAuth client deletion policy is enabled yet; expired access/refresh
 tokens continue to use their existing cleanup path.
 
-OAuth registration growth is now observable without changing authentication
-behavior. Migration 10002 adds oauth_clients.last_used_at, conservatively
-backfills existing clients to migration time, and refreshes the timestamp when
-the registration participates in OAuth lookup or token issuance. OAuth client
-deletion is intentionally deferred until enough usage history exists to combine
-an idle threshold with the absence of access/refresh tokens.
+Local-agent sessions and turns are intentionally different from disposable
+metadata. Their logical agent ids and provider session ids support explicit
+continuation across daemon restarts, including from idle/error states. They are
+therefore treated as user-owned durable history rather than age-based retention
+candidates. A future lifecycle should be an explicit agents archive/delete
+operation, not a background TTL.
+
+Priority 2 is now in an observation phase rather than an unbounded-growth
+blind spot: safe workspace metadata has explicit pruning, recoverable worktree
+state is protected and self-cleans its recovery ref after restoration, OAuth
+registrations have a last-used signal while deletion is deferred for evidence,
+and local-agent history has an explicit retain-by-design policy.
 
 ## Deliberate non-goals
 
