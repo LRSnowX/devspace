@@ -12,6 +12,7 @@ import {
 } from "./local-agent-client.js";
 import { LocalAgentDaemon, type LocalAgentDaemonManager } from "./local-agent-daemon.js";
 import {
+  ensureLocalAgentDaemonSocketDir,
   ensureLocalAgentDaemonSecret,
   LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
   LocalAgentDaemonLock,
@@ -391,6 +392,7 @@ try {
 const upgradeStateDir = join(root, "upgrade-state");
 await mkdir(upgradeStateDir, { recursive: true });
 const upgradePaths = localAgentDaemonPaths(upgradeStateDir);
+ensureLocalAgentDaemonSocketDir(upgradePaths);
 ensureLocalAgentDaemonSecret(upgradePaths);
 const legacyLock = new LocalAgentDaemonLock(upgradePaths);
 legacyLock.acquire();
@@ -490,6 +492,7 @@ try {
 const replacementRaceStateDir = join(root, "upgrade-race-state");
 await mkdir(replacementRaceStateDir, { recursive: true });
 const replacementRacePaths = localAgentDaemonPaths(replacementRaceStateDir);
+ensureLocalAgentDaemonSocketDir(replacementRacePaths);
 ensureLocalAgentDaemonSecret(replacementRacePaths);
 let replacementRaceProtocol = 1;
 const replacementRaceServer = createNetServer((socket) => {
@@ -567,6 +570,7 @@ try {
 const timeoutStateDir = join(root, "request-timeout-state");
 await mkdir(timeoutStateDir, { recursive: true });
 const timeoutPaths = localAgentDaemonPaths(timeoutStateDir);
+ensureLocalAgentDaemonSocketDir(timeoutPaths);
 ensureLocalAgentDaemonSecret(timeoutPaths);
 const timeoutServer = createNetServer((socket) => {
   let buffer = "";
@@ -618,6 +622,7 @@ try {
 const invalidStateDir = join(root, "invalid-response-state");
 await mkdir(invalidStateDir, { recursive: true });
 const invalidPaths = localAgentDaemonPaths(invalidStateDir);
+ensureLocalAgentDaemonSocketDir(invalidPaths);
 const invalidServer = createNetServer((socket) => {
   let buffer = "";
   socket.setEncoding("utf8");

@@ -16,6 +16,7 @@ import {
   LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
   LocalAgentDaemonAlreadyRunningError,
   LocalAgentDaemonLock,
+  ensureLocalAgentDaemonSocketDir,
   ensureLocalAgentDaemonStateDir,
   ensureLocalAgentDaemonSecret,
   localAgentDaemonPaths,
@@ -131,6 +132,7 @@ export class LocalAgentDaemon {
   async start(): Promise<LocalAgentDaemonStatus> {
     if (this.server) return this.status();
     ensureLocalAgentDaemonStateDir(this.paths.stateDir);
+    ensureLocalAgentDaemonSocketDir(this.paths);
     let lockAcquired = false;
     try {
       this.lock.acquire();

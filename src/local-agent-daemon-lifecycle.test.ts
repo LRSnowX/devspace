@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   LocalAgentDaemonAlreadyRunningError,
   LocalAgentDaemonLock,
+  ensureLocalAgentDaemonSocketDir,
   ensureLocalAgentDaemonStateDir,
   isProcessAlive,
   localAgentDaemonPaths,
@@ -14,7 +15,26 @@ import {
 
 const root = await mkdtemp(join(tmpdir(), "devspace-agentd-lifecycle-test-"));
 try {
+  const shortDarwinPaths = localAgentDaemonPaths("/tmp/devspace-agentd-short", "darwin");
+  assert.equal(shortDarwinPaths.socketPath, "/tmp/devspace-agentd-short/agentd.sock");
+
+  const longStateDir = join("/tmp", "x".repeat(120));
+  const longDarwinPaths = localAgentDaemonPaths(longStateDir, "darwin");
+  assert.notEqual(longDarwinPaths.socketPath, join(longStateDir, "agentd.sock"));
+  assert.equal(Buffer.byteLength(longDarwinPaths.socketPath) <= 103, true);
+  assert.equal(
+    localAgentDaemonPaths(longStateDir, "darwin").socketPath,
+    longDarwinPaths.socketPath,
+    "long-path fallback must be deterministic for one state directory",
+  );
+  if (process.platform !== "win32") {
+    const nativeLongPaths = localAgentDaemonPaths(longStateDir);
+    ensureLocalAgentDaemonSocketDir(nativeLongPaths);
+    assert.equal((await stat(dirname(nativeLongPaths.socketPath))).mode & 0o777, 0o700);
+  }
+
   const paths = localAgentDaemonPaths(join(root, "state"));
+  ensureLocalAgentDaemonSocketDir(paths);
   ensureLocalAgentDaemonStateDir(paths.stateDir);
   const lock = new LocalAgentDaemonLock(paths);
   lock.acquire();

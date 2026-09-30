@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import {
   chmodSync,
   closeSync,
+  lstatSync,
   linkSync,
   mkdirSync,
   openSync,
@@ -10,7 +11,7 @@ import {
   rmSync,
   writeSync,
 } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 export const LOCAL_AGENT_DAEMON_PROTOCOL_VERSION = 5;
 export const LOCAL_AGENT_DAEMON_SOCKET_NAME = "agentd.sock";
@@ -18,6 +19,10 @@ export const LOCAL_AGENT_DAEMON_PID_NAME = "agentd.pid";
 export const LOCAL_AGENT_DAEMON_LOCK_NAME = "agentd.lock";
 export const LOCAL_AGENT_DAEMON_SECRET_NAME = "agentd.secret";
 export const LOCAL_AGENT_DAEMON_LOG_NAME = "agentd.log";
+// Darwin reserves 104 bytes for sockaddr_un.sun_path including the NUL;
+// 103 bytes is therefore a conservative Unix pathname ceiling.
+const MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES = 103;
+const UNIX_SOCKET_RUNTIME_ROOT = "/tmp";
 
 export interface LocalAgentDaemonPaths {
   stateDir: string;
@@ -34,7 +39,10 @@ export function localAgentDaemonPaths(
   platform: NodeJS.Platform = process.platform,
 ): LocalAgentDaemonPaths {
   const resolvedStateDir = resolve(stateDir);
-  const socketPath = join(resolvedStateDir, LOCAL_AGENT_DAEMON_SOCKET_NAME);
+  const stateSocketPath = join(resolvedStateDir, LOCAL_AGENT_DAEMON_SOCKET_NAME);
+  const socketPath = platform === "win32"
+    ? stateSocketPath
+    : unixSocketPath(resolvedStateDir, stateSocketPath);
   return {
     stateDir: resolvedStateDir,
     socketPath,
@@ -51,6 +59,22 @@ export function localAgentDaemonPaths(
 export function ensureLocalAgentDaemonStateDir(stateDir: string): void {
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   chmodSync(stateDir, 0o700);
+}
+
+export function ensureLocalAgentDaemonSocketDir(paths: LocalAgentDaemonPaths): void {
+  if (process.platform === "win32") return;
+  const socketDir = dirname(paths.socketPath);
+  if (socketDir === paths.stateDir) return;
+  mkdirSync(socketDir, { recursive: true, mode: 0o700 });
+  const metadata = lstatSync(socketDir);
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+    throw new Error("Local agent daemon socket directory is not a secure directory: " + socketDir);
+  }
+  const getuid = process.getuid;
+  if (getuid && metadata.uid !== getuid()) {
+    throw new Error("Local agent daemon socket directory is not owned by the current user: " + socketDir);
+  }
+  chmodSync(socketDir, 0o700);
 }
 
 export class LocalAgentDaemonAlreadyRunningError extends Error {
@@ -208,6 +232,18 @@ function removeStaleLock(path: string): boolean {
 
 function isDaemonSecret(secret: string): boolean {
   return /^[0-9a-f]{64}$/i.test(secret);
+}
+
+function unixSocketPath(stateDir: string, stateSocketPath: string): string {
+  if (Buffer.byteLength(stateSocketPath) <= MAX_PORTABLE_UNIX_SOCKET_PATH_BYTES) {
+    return stateSocketPath;
+  }
+  const uid = process.getuid?.() ?? "user";
+  return join(
+    UNIX_SOCKET_RUNTIME_ROOT,
+    "devspace-agentd-" + uid,
+    hashStateDir(stateDir) + ".sock",
+  );
 }
 
 function hashStateDir(stateDir: string): string {

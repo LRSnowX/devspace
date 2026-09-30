@@ -24,6 +24,10 @@ runtime owner serve all clients using that configuration.
 
 Communication uses a private Unix domain socket on Linux/macOS or a named pipe
 on Windows. The endpoint is not exposed through the public MCP HTTP port.
+Normally the Unix socket lives in the configured state directory. If that
+pathname would exceed the portable Unix socket limit, DevSpace instead uses a
+deterministic short socket name inside a per-user, mode-`0700` runtime directory
+under `/tmp`; the state directory still owns the durable daemon identity.
 Provider session identifiers and logical agent records are durable; live
 provider runtimes are disposable and may be recreated after a daemon restart.
 Expected subagent failures cross the daemon boundary as structured error codes,
@@ -42,10 +46,12 @@ boundaries uses exhaustive tagged-error matching. Programmer defects and broken
 invariants remain exceptions; cleanup and shutdown also stay best-effort so a
 secondary release failure cannot replace the primary agent failure.
 
-The daemon state directory contains the socket or pipe identity, an atomic
-lock, a PID marker, and diagnostic logs. A second client cannot start another
-daemon for the same state directory. Stale lock and socket files are recovered
-only after the recorded PID is no longer alive.
+The daemon state directory contains the durable socket or pipe identity, an
+atomic lock, a PID marker, and diagnostic logs. The Unix socket file itself may
+use the protected short runtime path described above when the state directory
+is too deep. A second client cannot start another daemon for the same state
+directory. Stale lock and socket files are recovered only after the recorded
+PID is no longer alive.
 
 The daemon is started on demand and may exit after its active turns, clients,
 and warm runtime idle periods have ended. Users do not need to manage it during
