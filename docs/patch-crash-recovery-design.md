@@ -260,6 +260,11 @@ devspace recovery resolve <transaction-id> --accept-current
 - removes only transaction-owned temporary/recovery files that still exist;
 - deletes the journal entry.
 
+It is also allowed for a lingering `committed` journal whose project state is
+already final but startup could not safely clean one or more recovery
+artifacts. In that case it still never rewrites project target files; corrupt
+or unrecognized artifacts may be left in place rather than deleted blindly.
+
 It must **not** rewrite project files.
 
 An automatic `--restore-original` command should not be added in the first
@@ -293,7 +298,10 @@ should still include transaction id, root, state, created time, and updated
 time.
 
 The first migration shape should use a new schema version rather than rewriting
-prior migration history.
+prior migration history. Because this is a fork-local capability, use a
+reserved high-number extension range rather than consuming upstream's next
+sequential migration number; this keeps future upstream v9/v10-style migrations
+mergeable without rewriting an already-applied local database history.
 
 ## Runtime integration shape
 
@@ -385,6 +393,20 @@ A future power-loss-durable phase would need explicit decisions for:
   `stateDir` and the workspace live on different filesystems.
 
 That stronger guarantee should not be implied by the first recovery phase.
+
+## Empty parent-directory boundary
+
+The first recovery implementation journals file states and transaction-owned
+files, not durable provenance for parent directories created while preparing a
+new nested target.
+
+After a process crash, an empty parent directory may therefore remain even
+after all project files are restored. Startup recovery must not delete an empty
+directory merely because it did not exist when the patch began: after restart
+DevSpace cannot prove that another local process did not create that directory.
+
+This is a bounded cleanup limitation, not permission to overwrite or delete
+ambiguous external state.
 
 ## Implementation scope checkpoint
 

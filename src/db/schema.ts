@@ -21,6 +21,20 @@ export const workspaceSessions = sqliteTable(
   ],
 );
 
+export const patchTransactions = sqliteTable(
+  "patch_transactions",
+  {
+    id: text("id").primaryKey(),
+    root: text("root").notNull(),
+    state: text("state").notNull(),
+    manifestJson: text("manifest_json").notNull(),
+    diagnosticJson: text("diagnostic_json"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [index("patch_transactions_root_state_idx").on(table.root, table.state)],
+);
+
 export const loadedAgentFiles = sqliteTable(
   "loaded_agent_files",
   {

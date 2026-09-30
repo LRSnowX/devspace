@@ -57,6 +57,7 @@ import { shutdownHttpServer } from "./server-shutdown.js";
 import { logEvent } from "./logger.js";
 import { pruneStaleManagedWorktrees } from "./worktree-prune.js";
 import { ProjectRegistry } from "./project-registry.js";
+import { PatchRecoveryManager, runPatchStartupRecovery } from "./patch-recovery.js";
 
 type Command =
   | "serve"
@@ -64,6 +65,7 @@ type Command =
   | "doctor"
   | "config"
   | "projects"
+  | "recovery"
   | "worktrees"
   | "agents"
   | "show-changes"
@@ -95,6 +97,9 @@ async function main(argv: string[]): Promise<void> {
     case "projects":
       runProjectsCommand(args);
       return;
+    case "recovery":
+      await runRecoveryCommand(args);
+      return;
     case "worktrees":
       await runWorktreesCommand(args);
       return;
@@ -120,6 +125,7 @@ function normalizeCommand(command: string | undefined): Command {
     || command === "doctor"
     || command === "config"
     || command === "projects"
+    || command === "recovery"
     || command === "worktrees"
     || command === "agents"
     || command === "show-changes"
@@ -329,7 +335,15 @@ async function serve(): Promise<void> {
   }
 
   const config = loadConfig();
-  await runStartupWorktreeCleanup(config);
+  const patchRecoveryOutcomes = await runPatchStartupRecovery(config);
+  await runStartupWorktreeCleanup(
+    config,
+    new Set(
+      patchRecoveryOutcomes
+        .filter((outcome) => outcome.outcome === "recovery_required")
+        .map((outcome) => outcome.root),
+    ),
+  );
   const { createServer } = await import("./server.js");
   const { app, close, localAgentProviders } = createServer(config);
   const httpServer = app.listen(config.port, config.host, () => {
@@ -362,9 +376,12 @@ async function serve(): Promise<void> {
   process.once("SIGTERM", handleShutdown);
 }
 
-async function runStartupWorktreeCleanup(config: ServerConfig): Promise<void> {
+async function runStartupWorktreeCleanup(
+  config: ServerConfig,
+  protectedRoots: ReadonlySet<string> = new Set(),
+): Promise<void> {
   try {
-    const cleanup = await pruneStaleManagedWorktrees(config);
+    const cleanup = await pruneStaleManagedWorktrees(config, new Date(), protectedRoots);
     if (cleanup.isErr()) {
       logEvent(config.logging, "warn", "managed_worktree_cleanup_failed", {
         error: cleanup.error.message,
@@ -375,12 +392,19 @@ async function runStartupWorktreeCleanup(config: ServerConfig): Promise<void> {
 
     const result = cleanup.value;
     const preserved = result.removed.filter((entry) => entry.recoveryRef).length;
+    const skippedUntracked = result.skipped.filter(
+      (entry) => entry.reason === "untracked_files",
+    ).length;
+    const skippedPatchRecovery = result.skipped.filter(
+      (entry) => entry.reason === "patch_recovery_required",
+    ).length;
     if (result.removed.length > 0 || result.missing.length > 0 || result.skipped.length > 0) {
       logEvent(config.logging, "info", "managed_worktree_cleanup", {
         removed: result.removed.length,
         recoveryRefs: preserved,
         missingSessions: result.missing.length,
-        skippedUntracked: result.skipped.length,
+        skippedUntracked,
+        skippedPatchRecovery,
       });
     }
     for (const failure of result.failed) {
@@ -460,7 +484,15 @@ async function runWorktreesCommand(args: string[]): Promise<void> {
     throw new Error("Usage: devspace worktrees prune");
   }
 
-  const cleanup = await pruneStaleManagedWorktrees(loadConfig());
+  const config = loadConfig();
+  const patchRecovery = new PatchRecoveryManager(config.stateDir);
+  let protectedRoots: ReadonlySet<string>;
+  try {
+    protectedRoots = patchRecovery.protectedRoots();
+  } finally {
+    patchRecovery.close();
+  }
+  const cleanup = await pruneStaleManagedWorktrees(config, new Date(), protectedRoots);
   if (cleanup.isErr()) {
     console.warn(`Failed to prune managed worktrees: ${cleanup.error.message}`);
     process.exitCode = 1;
@@ -474,8 +506,21 @@ async function runWorktreesCommand(args: string[]): Promise<void> {
   if (result.missing.length > 0) {
     console.log(`Cleared ${result.missing.length} missing worktree session${result.missing.length === 1 ? "" : "s"}.`);
   }
-  if (result.skipped.length > 0) {
-    console.log(`Skipped ${result.skipped.length} worktree${result.skipped.length === 1 ? "" : "s"} with untracked files.`);
+  const skippedUntracked = result.skipped.filter(
+    (entry) => entry.reason === "untracked_files",
+  ).length;
+  const skippedPatchRecovery = result.skipped.filter(
+    (entry) => entry.reason === "patch_recovery_required",
+  ).length;
+  if (skippedUntracked > 0) {
+    console.log(
+      `Skipped ${skippedUntracked} worktree${skippedUntracked === 1 ? "" : "s"} with untracked files.`,
+    );
+  }
+  if (skippedPatchRecovery > 0) {
+    console.log(
+      `Skipped ${skippedPatchRecovery} worktree${skippedPatchRecovery === 1 ? "" : "s"} pending patch recovery.`,
+    );
   }
   for (const failure of result.failed) {
     console.warn(`Failed to prune ${failure.workspaceId}: ${failure.error.message}`);
@@ -505,6 +550,31 @@ function runProjectsCommand(args: string[]): void {
   console.log(JSON.stringify(registry.register({ name, path, aliases }), null, 2));
 }
 
+async function runRecoveryCommand(args: string[]): Promise<void> {
+  const [subcommand, id, ...rest] = args;
+  const manager = new PatchRecoveryManager(loadConfig().stateDir);
+  try {
+    if (subcommand === "list" && id === undefined) {
+      console.log(JSON.stringify(manager.list(), null, 2));
+      return;
+    }
+    if (subcommand === "show" && id && rest.length === 0) {
+      const record = manager.show(id);
+      if (!record) throw new Error(`Unknown patch transaction: ${id}`);
+      console.log(JSON.stringify(record, null, 2));
+      return;
+    }
+    if (subcommand === "resolve" && id && rest.length === 1 && rest[0] === "--accept-current") {
+      await manager.acceptCurrent(id);
+      console.log(JSON.stringify({ id, resolution: "accepted_current" }));
+      return;
+    }
+    throw new Error("Usage: devspace recovery <list|show <id>|resolve <id> --accept-current>");
+  } finally {
+    manager.close();
+  }
+}
+
 function printHelp(): void {
   console.log(
     [
@@ -519,6 +589,7 @@ function printHelp(): void {
       "  devspace config set publicBaseUrl <url|null>",
       "  devspace projects list   List canonical project registrations",
       "  devspace projects register <name> <path> [--alias <alias>]...",
+      "  devspace recovery list|show <id>|resolve <id> --accept-current",
       "  devspace worktrees prune Prune managed worktrees unused for 3 days",
       "  devspace show-changes <review-ref> [--json]",
       "  devspace agents targets [--json]  List usable subagent providers and profiles",

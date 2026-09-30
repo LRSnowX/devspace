@@ -87,15 +87,38 @@ the corresponding regression coverage in the same change.
 - Existing file mode and line-ending behavior are preserved where the current
   implementation supports them.
 - Results report affected files and aggregate addition/removal counts.
+- Patch publication has a SQLite transaction journal and same-directory
+  recovery files. Before `devspace serve` listens, interrupted transactions
+  are reconciled: safe partial publications revert to originals; committed
+  publications remain in place and only their recovery files are cleaned.
+- Once the journal is durably marked `committed`, failure to remove
+  transaction-owned cleanup artifacts does not turn the already-published patch
+  into a model-visible patch failure. The committed journal remains available
+  for startup cleanup retry.
+- Ambiguous/external states are never overwritten automatically. Their
+  canonical root is blocked from further Codex `apply_patch` until local
+  inspection and `devspace recovery resolve <id> --accept-current`; unrelated
+  roots and read-oriented tools remain available.
+- Managed-worktree cleanup also preserves roots with unresolved patch recovery
+  state, so retention pruning cannot remove the filesystem evidence required
+  for local recovery.
+- A committed transaction whose project state is already final but whose
+  recovery-artifact cleanup cannot be completed may also be explicitly cleared
+  with `--accept-current`; this never rewrites project target files.
 
 ### Current limitations
 
 - Multi-file publication is not database-style atomic visibility. Another
   process may observe intermediate file states while one patch is committing.
-- Transaction rollback is not crash-safe. Process termination, machine failure,
-  or rollback failure can leave recovery work. When rollback is blocked by an
-  external mutation, DevSpace refuses to overwrite that newer state and reports
-  the rollback failure; unused recovery files are retained where possible.
+- This is process-crash/service-restart recovery, not power-loss durability:
+  no file/directory fsync ordering or distributed multi-process lock is promised.
+  Rollback failure or external mutation can still require manual recovery;
+  recovery files are retained in that case.
+- Crash recovery journals project file state, not provenance for newly created
+  parent directories. A crash while preparing a patch whose target requires
+  previously missing parent directories can therefore leave an empty directory
+  behind. Recovery does not delete such a directory automatically because it
+  cannot prove that another local process did not create it after the crash.
 - `expected_revisions` is optional for compatibility. A caller that omits a
   revision does not receive stale-read protection for that earlier read.
 - `expected_absent_paths` is also optional for compatibility. Existing
@@ -167,7 +190,7 @@ the corresponding regression coverage in the same change.
   `status: "applied"`. This avoids current ChatGPT host behavior that converts
   MCP `isError: true` results into string exceptions and discards structured
   content. Current codes cover invalid patches, revision/path-state/concurrent conflicts,
-  rollback failure, path scope, unavailable/invalidated workspaces, and
+  rollback/recovery-required state, path scope, unavailable/invalidated workspaces, and
   repeated identical failures.
 - Codex `apply_patch` blocks the fourth and later identical request after three
   consecutive known domain failures in the same workspace. Changing the patch
@@ -250,8 +273,7 @@ When Memory is configured:
 - [ChatGPT coding workflow](chatgpt-coding-workflow.md)
 - [Development and manual QA](development.md)
 - [Transactional apply_patch design](apply-patch-transaction-design.md)
+- [Patch crash recovery design](patch-crash-recovery-design.md)
 - [File revision design](file-revision-design.md)
 - [Tool error contract](tool-error-contract.md)
 - [Runtime gap assessment](runtime-gap-assessment.md)
-- [Patch crash recovery design](patch-crash-recovery-design.md)
-

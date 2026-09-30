@@ -68,6 +68,12 @@ The Codex `apply_patch` tool currently exposes:
   - retryable: false
   - publication failed and complete automatic recovery could not be confirmed.
   - may include `recovery_files` retained for manual recovery.
+- `PATCH_RECOVERY_REQUIRED`
+  - category: `recovery`
+  - retryable: false
+  - an unresolved interrupted patch transaction blocks further Codex patches
+    for this canonical workspace root until local recovery inspection and
+    explicit operator resolution. Other roots remain usable.
 - `PATH_SCOPE_VIOLATION`
   - category: `scope`
   - retryable: false

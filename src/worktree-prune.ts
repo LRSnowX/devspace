@@ -14,6 +14,7 @@ import {
 export async function pruneStaleManagedWorktrees(
   config: ServerConfig,
   now = new Date(),
+  protectedRoots: ReadonlySet<string> = new Set(),
 ): Promise<BetterResult<ManagedWorktreeCleanupResult, WorkspaceStoreError>> {
   const opened = createWorkspaceStoreResult(config.stateDir);
   if (opened.isErr()) return opened;
@@ -26,6 +27,7 @@ export async function pruneStaleManagedWorktrees(
       worktreeRoot: config.worktreeRoot,
       allowedRoots: config.allowedRoots,
       staleBefore: new Date(now.getTime() - DEFAULT_MANAGED_WORKTREE_RETENTION_MS),
+      protectedRoots,
     });
   } finally {
     closed = closeWorkspaceStoreResult(opened.value);

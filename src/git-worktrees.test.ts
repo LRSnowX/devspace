@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdir, mkdtemp, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -127,6 +127,25 @@ test("non-ignored untracked files keep a stale worktree alive", async (t) => {
   assert.deepEqual(result.skipped, [{ workspaceId: "ws_untracked", reason: "untracked_files" }]);
   assert.equal(await pathExists(fixture.worktreePath), true);
   assert.ok(fixture.store.getSession("ws_untracked"));
+});
+
+test("patch recovery protects a stale managed worktree from cleanup", async (t) => {
+  const fixture = await worktreeFixture(t, "ws_patch_recovery");
+
+  const result = unwrap(await cleanupManagedWorktrees({
+    store: fixture.store,
+    worktreeRoot: fixture.worktreeRoot,
+    allowedRoots: [fixture.root],
+    staleBefore: futureCutoff(),
+    protectedRoots: new Set([await realpath(fixture.worktreePath)]),
+  }));
+
+  assert.deepEqual(result.skipped, [{
+    workspaceId: "ws_patch_recovery",
+    reason: "patch_recovery_required",
+  }]);
+  assert.equal(await pathExists(fixture.worktreePath), true);
+  assert.ok(fixture.store.getSession("ws_patch_recovery"));
 });
 
 test("ignored worktree files are discarded during cleanup", async (t) => {

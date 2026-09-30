@@ -85,7 +85,7 @@ function processToolResponse(snapshot: ProcessSnapshot) {
 }
 
 function registerApplyPatchTool(context: ToolRegistrationContext): void {
-  const { server, config, workspaces } = context;
+  const { server, config, workspaces, patchRecovery } = context;
   const repeatFailures = new RepeatFailureCircuitBreaker();
 
   server.registerTool(
@@ -151,6 +151,20 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
         expectedRevisions: expected_revisions,
         expectedAbsentPaths: expected_absent_paths,
       };
+      if (patchRecovery) {
+        try {
+          const workspace = await workspaces.getWorkspace(workspaceId);
+          patchRecovery.assertRootWritable(workspace.canonicalRoot);
+        } catch (error) {
+          const payload = toolErrorPayload(error);
+          if (payload) {
+            const response = patchErrorResponse(payload);
+            logFailedToolResponse(config, { tool: "apply_patch", workspaceId }, response.content, startedAt);
+            return response;
+          }
+          throw error;
+        }
+      }
       const blocked = repeatFailures.beforeAttempt(workspaceId, request);
       if (blocked) {
         const response = patchErrorResponse(blocked);
@@ -172,6 +186,7 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
           async () => {
             const workspace = await workspaces.getWorkspace(workspaceId);
             return applyPatch(workspace.root, patch, {
+              journal: patchRecovery,
               expectedRevisions: expected_revisions,
               expectedAbsentPaths: expected_absent_paths,
             });

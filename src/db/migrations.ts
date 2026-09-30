@@ -47,7 +47,31 @@ const migrations: Migration[] = [
     name: "local-agent-turns",
     up: migrateLocalAgentTurns,
   },
+  {
+    // Fork-local extension range. Keep upstream sequential migration versions
+    // available so future upstream migrations can merge without colliding with
+    // an already-applied local database history entry.
+    version: 10001,
+    name: "patch-transactions",
+    up: migratePatchTransactions,
+  },
 ];
+
+function migratePatchTransactions(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table patch_transactions (
+      id text primary key,
+      root text not null,
+      state text not null,
+      manifest_json text not null,
+      diagnostic_json text,
+      created_at text not null,
+      updated_at text not null
+    );
+    create index patch_transactions_root_state_idx
+      on patch_transactions(root, state);
+  `);
+}
 
 export function migrateDatabase(sqlite: Database.Database): void {
   const migrate = sqlite.transaction(() => {

@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { constants, type Stats } from "node:fs";
-import { access, lstat, mkdir, readFile, realpath, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, readFile, realpath, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 import { TextDecoder } from "node:util";
 import { createTwoFilesPatch, FILE_HEADERS_ONLY } from "diff";
 import { FILE_REVISION_PATTERN, fileRevision } from "./file-revision.js";
+import type { PatchFileState, PatchTransactionJournal, PatchTransactionManifest } from "./patch-transaction-types.js";
 import {
   ToolOperationError,
   type ToolErrorCode,
@@ -32,6 +33,9 @@ export interface ExpectedFileRevision {
 }
 
 export interface ApplyPatchOptions {
+  journal?: PatchTransactionJournal;
+  /** Test-only crash boundary; production never supplies this hook. */
+  afterRecoveryMilestone?: (name: string, index?: number) => Promise<void> | void;
   expectedRevisions?: readonly ExpectedFileRevision[];
   expectedAbsentPaths?: readonly string[];
   beforeCommit?: (input: {
@@ -423,7 +427,10 @@ export async function applyPatch(
   options: ApplyPatchOptions = {},
 ): Promise<ApplyPatchResult> {
   const lockKey = await realpath(root);
-  return withPatchLock(lockKey, () => applyPatchUnlocked(root, patch, options));
+  return withPatchLock(lockKey, () => {
+    options.journal?.assertRootWritable(lockKey);
+    return applyPatchUnlocked(lockKey, patch, options);
+  });
 }
 
 async function applyPatchUnlocked(
@@ -577,7 +584,7 @@ async function applyPatchUnlocked(
     }
   }
 
-  await publishStagedPatch(staged, originals, displayPaths, results, options);
+  await publishStagedPatch(root, staged, originals, displayPaths, results, options);
 
   const unifiedPatch = patches.filter(Boolean).join("\n");
   const stats = countPatchStats(unifiedPatch);
@@ -645,6 +652,7 @@ async function withPatchLock<T>(
 }
 
 async function publishStagedPatch(
+  root: string,
   staged: ReadonlyMap<string, StagedTextFile>,
   originals: ReadonlyMap<string, StagedTextFile>,
   displayPaths: ReadonlyMap<string, string>,
@@ -655,23 +663,34 @@ async function publishStagedPatch(
   const preparedOriginals = new Map<string, PreparedFile>();
   const createdDirectories = new Set<string>();
   const mutated: PublishedMutation[] = [];
+  const manifest = options.journal ? createPatchManifest(root, staged, originals) : undefined;
+  const entries = new Map(manifest?.files.map((entry) => [resolve(root, entry.path), entry]));
+  let journalCreated = false;
+  let committed = false;
 
   try {
-    for (const [absolute, file] of staged) {
+    if (manifest) {
+      options.journal!.createPreparing(manifest);
+      journalCreated = true;
+      await options.afterRecoveryMilestone?.("preparing");
+    }
+    for (const [index, [absolute, file]] of [...staged.entries()].entries()) {
       const displayPath = displayPaths.get(absolute) ?? absolute;
       const original = originals.get(absolute) ?? null;
+      const entry = entries.get(absolute);
       if (file) {
         preparedFinals.set(
           absolute,
-          await prepareTextFile(absolute, file, createdDirectories),
+          await prepareTextFile(absolute, file, createdDirectories, entry?.finalPath ? resolve(root, entry.finalPath) : undefined),
         );
       }
       if (original) {
         preparedOriginals.set(
           absolute,
-          await prepareTextFile(absolute, original, createdDirectories),
+          await prepareTextFile(absolute, original, createdDirectories, entry?.recoveryPath ? resolve(root, entry.recoveryPath) : undefined),
         );
       }
+      await options.afterRecoveryMilestone?.("prepared_file", index);
       if (!displayPaths.has(absolute)) {
         throw patchError(`missing display path for staged file: ${displayPath}`);
       }
@@ -688,6 +707,12 @@ async function publishStagedPatch(
         originals.get(absolute) ?? null,
         displayPaths.get(absolute) ?? absolute,
       );
+    }
+    if (manifest) {
+      options.journal!.markPrepared(manifest.id);
+      await options.afterRecoveryMilestone?.("prepared");
+      options.journal!.markCommitting(manifest.id);
+      await options.afterRecoveryMilestone?.("committing");
     }
 
     const publicationOrder = [
@@ -723,8 +748,16 @@ async function publishStagedPatch(
         await rm(absolute, { force: true });
         mutation.completed = true;
       }
+      await options.afterRecoveryMilestone?.("published", index);
+    }
+    await options.afterRecoveryMilestone?.("all_published");
+    if (manifest) {
+      options.journal!.markCommitted(manifest.id);
+      committed = true;
+      await options.afterRecoveryMilestone?.("committed");
     }
   } catch (error) {
+    if (committed) throw error;
     const rollbackErrors = await rollbackPublishedPatch(
       mutated,
       staged,
@@ -734,12 +767,16 @@ async function publishStagedPatch(
       options,
     );
     const cleanupErrors = [
-      ...(await cleanupPreparedFiles(preparedFinals)),
+      ...(rollbackErrors.length === 0 ? await cleanupPreparedFiles(preparedFinals) : []),
       ...(rollbackErrors.length === 0
         ? await cleanupPreparedFiles(preparedOriginals)
         : []),
-      ...(await cleanupCreatedDirectories(createdDirectories)),
+      ...(rollbackErrors.length === 0 ? await cleanupCreatedDirectories(createdDirectories) : []),
     ];
+    if (manifest && journalCreated) {
+      if (rollbackErrors.length === 0 && cleanupErrors.length === 0) options.journal!.delete(manifest.id);
+      else options.journal!.markRecoveryRequired(manifest.id, `rollback: ${rollbackErrors.join("; ")}; cleanup: ${cleanupErrors.join("; ")}`);
+    }
     const originalMessage = error instanceof Error ? error.message : String(error);
     if (rollbackErrors.length > 0) {
       const recoveryFiles = [...preparedOriginals.values()].map(({ path }) => path);
@@ -772,8 +809,43 @@ async function publishStagedPatch(
     throw error;
   }
 
-  await cleanupPreparedFiles(preparedOriginals);
-  await cleanupPreparedFiles(preparedFinals);
+  const cleanupErrors = [
+    ...await cleanupPreparedFiles(preparedOriginals),
+    ...await cleanupPreparedFiles(preparedFinals),
+  ];
+  if (manifest && cleanupErrors.length === 0) options.journal!.delete(manifest.id);
+}
+
+function createPatchManifest(
+  root: string,
+  staged: ReadonlyMap<string, StagedTextFile>,
+  originals: ReadonlyMap<string, StagedTextFile>,
+): PatchTransactionManifest {
+  const id = randomUUID();
+  return {
+    id,
+    root,
+    files: [...staged.entries()].map(([absolute, published], index) => {
+      const path = relative(root, absolute);
+      const original = originals.get(absolute) ?? null;
+      const prefix = `${path}.devspace-patch-${id}-${index}`;
+      const finalPath = published ? `${prefix}-final` : undefined;
+      const recoveryPath = original ? `${prefix}-original` : undefined;
+      return {
+        path,
+        original: patchFileState(original),
+        published: patchFileState(published),
+        finalPath,
+        recoveryPath,
+        replacementBackupPath: finalPath ? `${finalPath}.original` : undefined,
+        recoveryReplacementBackupPath: recoveryPath ? `${recoveryPath}.original` : undefined,
+      };
+    }),
+  };
+}
+
+function patchFileState(file: StagedTextFile): PatchFileState {
+  return file ? { kind: "present", revision: file.revision, mode: file.mode } : { kind: "absent" };
 }
 
 async function rollbackPublishedPatch(
@@ -871,18 +943,22 @@ async function prepareTextFile(
   destination: string,
   file: TextFile,
   createdDirectories: Set<string>,
+  plannedPath?: string,
 ): Promise<PreparedFile> {
   await ensureParentDirectory(destination, createdDirectories);
-  const temporary = `${destination}.devspace-patch-${process.pid}-${randomUUID()}`;
+  const temporary = plannedPath ?? `${destination}.devspace-patch-${process.pid}-${randomUUID()}`;
   try {
     await writeFile(
       temporary,
       file.content,
-      file.mode === undefined ? undefined : { mode: file.mode },
+      { flag: "wx", ...(file.mode === undefined ? {} : { mode: file.mode }) },
     );
+    if (file.mode !== undefined) await chmod(temporary, file.mode);
     return { path: temporary };
   } catch (error) {
-    await rm(temporary, { force: true }).catch(() => undefined);
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+      await rm(temporary, { force: true }).catch(() => undefined);
+    }
     throw error;
   }
 }

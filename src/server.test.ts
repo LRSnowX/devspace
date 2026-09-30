@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -20,6 +20,8 @@ import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 import { ProjectRegistry } from "./project-registry.js";
+import { PatchRecoveryManager } from "./patch-recovery.js";
+import { randomUUID } from "node:crypto";
 import type { MemoryClient, MemoryBootstrapContext } from "./memory-adapter.js";
 
 const execFileAsync = promisify(execFile);
@@ -329,6 +331,30 @@ test("Codex apply_patch exposes structured workspace and path errors", async (t)
     retryable: false,
     path: "../outside.txt",
   });
+});
+
+test("Codex apply_patch reports a blocked canonical root without changing the model tool inventory", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
+  const workspaceId = structuredContent(await callOpen(context.client, context.project, "recovery-block")).workspace_id;
+  assert.equal(typeof workspaceId, "string");
+  const id = randomUUID();
+  context.patchRecovery.createPreparing({
+    id,
+    root: await realpath(context.project),
+    files: [{ path: "README.md", original: { kind: "absent" }, published: { kind: "absent" } }],
+  });
+  context.patchRecovery.markRecoveryRequired(id, "manual inspection required");
+  const response = structuredContent(await context.client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspace_id: workspaceId,
+      patch: "*** Begin Patch\n*** Add File: note.txt\n+hello\n*** End Patch",
+    },
+  }));
+  assert.equal(response.status, "error");
+  assert.equal((response.error as { code: string }).code, "PATCH_RECOVERY_REQUIRED");
+  const tools = await context.client.listTools();
+  assert.equal(tools.tools.some((tool) => tool.name.includes("recovery")), false);
 });
 
 test("Codex apply_patch blocks a fourth identical domain failure and resets on a changed request", async (t) => {
@@ -1186,6 +1212,7 @@ interface ServerFixture {
   client: Client;
   project: string;
   root: string;
+  patchRecovery: PatchRecoveryManager;
 }
 
 function schemaPropertyPaths(
@@ -1343,6 +1370,7 @@ async function fixture(
     resolveProviderAvailability(),
   );
   const store = new SqliteWorkspaceStore(stateDir);
+  const patchRecovery = new PatchRecoveryManager(stateDir);
   if (options.projectRegistration) {
     new ProjectRegistry(config.projectRegistryPath, config.allowedRoots).register({
       ...options.projectRegistration,
@@ -1359,6 +1387,8 @@ async function fixture(
     [],
     undefined,
     options.memoryClient,
+    undefined,
+    patchRecovery,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -1374,6 +1404,7 @@ async function fixture(
     await client.close();
     await server.close();
     store.close();
+    patchRecovery.close();
   };
 
   t.after(async () => {
@@ -1381,7 +1412,7 @@ async function fixture(
     await rm(root, { recursive: true, force: true });
   });
 
-  return { client, project, root };
+  return { client, project, root, patchRecovery };
 }
 
 async function git(cwd: string, args: string[]): Promise<void> {

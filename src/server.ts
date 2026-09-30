@@ -51,6 +51,7 @@ import {
   type MemoryClient,
 } from "./memory-adapter.js";
 import { ProjectRegistry } from "./project-registry.js";
+import { PatchRecoveryManager, runPatchStartupRecovery } from "./patch-recovery.js";
 import { expandHomePath } from "./roots.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { conversationScopeIdFromRequestMeta } from "./request-meta.js";
@@ -373,6 +374,7 @@ export function createMcpServer(
   trackToolActivity?: TrackToolActivity,
   memoryClient?: MemoryClient,
   memoryThreadAuthorizations = new MemoryThreadAuthorizationStore(),
+  patchRecovery?: PatchRecoveryManager,
 ): McpServer {
   const toolSurface = getToolSurface(config.toolMode);
   const server = new McpServer(
@@ -393,6 +395,7 @@ export function createMcpServer(
     trackToolActivity,
     memoryClient,
     memoryThreadAuthorizations,
+    patchRecovery,
   );
   return server;
 }
@@ -408,6 +411,7 @@ function registerMcpSurface(
   trackToolActivity?: TrackToolActivity,
   memoryClient?: MemoryClient,
   memoryThreadAuthorizations = new MemoryThreadAuthorizationStore(),
+  patchRecovery?: PatchRecoveryManager,
 ): void {
   const registrationTarget = trackToolActivity
     ? withTrackedToolHandlers(server, trackToolActivity)
@@ -869,6 +873,7 @@ function registerMcpSurface(
     config,
     workspaces,
     processSessions,
+    patchRecovery,
   });
 
   registerAppTool(
@@ -990,6 +995,7 @@ export function createServer(
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
   });
   const workspaceStore = createWorkspaceStore(config.stateDir);
+  const patchRecovery = new PatchRecoveryManager(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
@@ -1017,6 +1023,7 @@ export function createServer(
       toolActivities.track,
       memoryClient,
       memoryThreadAuthorizations,
+      patchRecovery,
     );
   });
   const logMcpHandlerError = (error: Error) => logEvent(
@@ -1156,6 +1163,7 @@ export function createServer(
         processSessions.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();
+        patchRecovery.close();
       })();
       return closePromise;
     },
@@ -1171,7 +1179,9 @@ async function isMainModule(): Promise<boolean> {
 }
 
 if (await isMainModule()) {
-  const { app, config, close, localAgentProviders } = createServer();
+  const startupConfig = loadConfig();
+  await runPatchStartupRecovery(startupConfig);
+  const { app, config, close, localAgentProviders } = createServer(startupConfig);
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(
       `devspace listening on http://${config.host}:${config.port}/mcp`,

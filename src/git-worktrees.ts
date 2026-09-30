@@ -72,7 +72,7 @@ export interface ManagedWorktreeCleanupResult {
   missing: string[];
   skipped: Array<{
     workspaceId: string;
-    reason: "untracked_files";
+    reason: "untracked_files" | "patch_recovery_required";
   }>;
   failed: Array<{
     workspaceId: string;
@@ -142,6 +142,7 @@ export async function cleanupManagedWorktrees(input: {
   worktreeRoot: string;
   allowedRoots: string[];
   staleBefore: Date;
+  protectedRoots?: ReadonlySet<string>;
 }): Promise<BetterResult<ManagedWorktreeCleanupResult, WorkspaceStoreError>> {
   const result: ManagedWorktreeCleanupResult = {
     removed: [],
@@ -154,6 +155,24 @@ export async function cleanupManagedWorktrees(input: {
   if (staleSessions.isErr()) return staleSessions;
 
   for (const session of staleSessions.value) {
+    let canonicalSessionRoot = session.root;
+    if (input.protectedRoots && input.protectedRoots.size > 0) {
+      try {
+        canonicalSessionRoot = await realpath(session.root);
+      } catch {
+        // The normal cleanup path will classify missing/invalid worktrees.
+      }
+    }
+    if (
+      input.protectedRoots?.has(session.root)
+      || input.protectedRoots?.has(canonicalSessionRoot)
+    ) {
+      result.skipped.push({
+        workspaceId: session.id,
+        reason: "patch_recovery_required",
+      });
+      continue;
+    }
     const cleaned = await cleanupManagedWorktree({ ...input, session });
     if (cleaned.isErr()) {
       result.failed.push({
