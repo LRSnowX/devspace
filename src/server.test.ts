@@ -950,8 +950,11 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
 
   const tools = await context.client.listTools();
   const openTool = tools.tools.find((tool) => tool.name === "open_workspace");
-  const outputProperties = (openTool?.outputSchema as { properties?: Record<string, unknown> } | undefined)?.properties;
+  const outputProperties = (openTool?.outputSchema as {
+    properties?: Record<string, unknown>;
+  } | undefined)?.properties;
   assert.ok(outputProperties && "workspace_id" in outputProperties);
+  assert.ok(outputProperties && "status" in outputProperties);
   assert.equal(outputProperties && "workspaceId" in outputProperties, false);
   assert.equal(outputProperties && "workspaceReused" in outputProperties, false);
   assert.equal(outputProperties && "includeBootstrapContext" in outputProperties, false);
@@ -961,6 +964,7 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
   assert.ok(providerSchema?.items?.properties?.note);
 
   const firstStructured = structuredContent(first);
+  assert.equal(firstStructured.status, "opened");
   assert.equal(typeof firstStructured.workspace_id, "string");
   assert.equal("workspaceId" in firstStructured, false);
   assert.equal(firstStructured.workspace_id, structuredContent(repeated).workspace_id);
@@ -982,6 +986,7 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
   assert.equal("includeBootstrapContext" in firstStructured, false);
 
   const repeatedStructured = structuredContent(repeated);
+  assert.equal(repeatedStructured.status, "opened");
   assert.match(firstStructured.instruction as string, /workspace_id/);
   assert.match(repeatedStructured.instruction as string, /workspace_id/);
   assert.doesNotMatch(firstStructured.instruction as string, /workspaceId/);
@@ -1372,6 +1377,9 @@ test("project entry resolves paths, names and aliases with workspace reuse", asy
   const absolute = structuredContent(await callOpen(context.client, context.project, "same-session"));
   const canonical = structuredContent(await callOpen(context.client, "LEMonX", "same-session"));
   const alias = structuredContent(await callOpen(context.client, "Lemon", "same-session"));
+  assert.equal(absolute.status, "opened");
+  assert.equal(canonical.status, "opened");
+  assert.equal(alias.status, "opened");
   assert.equal(canonical.workspace_id, absolute.workspace_id);
   assert.equal(alias.workspace_id, absolute.workspace_id);
   assert.equal(alias.project_name, "LEMonX");
@@ -1379,11 +1387,49 @@ test("project entry resolves paths, names and aliases with workspace reuse", asy
   assert.equal(discovered.workspace_id, absolute.workspace_id);
   assert.equal(discovered.project_name, "LEMonX");
   const unknown = await callOpen(context.client, "missing-project");
-  assert.equal(unknown.isError, true);
-  const outside = await callOpen(context.client, join(context.root, ".."));
-  assert.equal(outside.isError, true);
+  assert.notEqual(unknown.isError, true);
+  assert.deepEqual(structuredContent(unknown), {
+    result:
+      "Unknown project 'missing-project'. Pass an absolute path inside an allowed root or register it with devspace projects register.",
+    status: "error",
+    error: {
+      code: "PROJECT_NOT_FOUND",
+      category: "not_found",
+      message:
+        "Unknown project 'missing-project'. Pass an absolute path inside an allowed root or register it with devspace projects register.",
+      retryable: false,
+      path: "missing-project",
+    },
+  });
+  const outsidePath = join(context.root, "..");
+  const outside = await callOpen(context.client, outsidePath);
+  assert.notEqual(outside.isError, true);
+  assert.equal(structuredContent(outside).status, "error");
+  assert.deepEqual(structuredContent(outside).error, {
+    code: "PATH_SCOPE_VIOLATION",
+    category: "scope",
+    message: `Path is outside allowed roots: ${outsidePath}`,
+    retryable: false,
+    path: outsidePath,
+  });
+  const notDirectoryPath = join(context.root, "not-directory.txt");
+  await writeFile(notDirectoryPath, "not a directory\n");
+  const notDirectory = await callOpen(context.client, notDirectoryPath);
+  assert.notEqual(notDirectory.isError, true);
+  assert.deepEqual(structuredContent(notDirectory), {
+    result: `Workspace root must be a directory: ${notDirectoryPath}`,
+    status: "error",
+    error: {
+      code: "PROJECT_NOT_DIRECTORY",
+      category: "invalid_request",
+      message: `Workspace root must be a directory: ${notDirectoryPath}`,
+      retryable: false,
+      path: notDirectoryPath,
+    },
+  });
   const missing = join(context.root, "new-project");
   const created = structuredContent(await callOpen(context.client, missing, "same-session"));
+  assert.equal(created.status, "opened");
   assert.equal(created.project_name, "new-project");
   assert.equal(created.root, missing);
 });
@@ -1394,8 +1440,15 @@ test("ambiguous project entry is rejected", async (t) => {
   t.after(async () => rm(extraRoot, { recursive: true, force: true }));
   const context = await fixture(t, { extraAllowedRoot: extraRoot });
   const result = await callOpen(context.client, "project");
-  assert.equal(result.isError, true);
-  assert.match(JSON.stringify(result), /ambiguous/);
+  assert.notEqual(result.isError, true);
+  const structured = structuredContent(result);
+  assert.equal(structured.status, "error");
+  assert.equal((structured.error as { code?: string }).code, "PROJECT_AMBIGUOUS");
+  assert.equal((structured.error as { path?: string }).path, "project");
+  const candidates = (structured.error as { candidate_paths?: string[] }).candidate_paths;
+  assert.equal(candidates?.length, 2);
+  assert.deepEqual(candidates, [...(candidates ?? [])].sort());
+  assert.ok(candidates?.every((candidate) => candidate.endsWith("/project")));
 });
 
 test("memory surface is bounded, fail-open and progressive", async (t) => {

@@ -9,6 +9,9 @@ export const TOOL_ERROR_CODES = [
   "PATCH_RECOVERY_REQUIRED",
   "PATH_SCOPE_VIOLATION",
   "FILE_NOT_FOUND",
+  "PROJECT_NOT_FOUND",
+  "PROJECT_AMBIGUOUS",
+  "PROJECT_NOT_DIRECTORY",
   "WORKSPACE_NOT_FOUND",
   "WORKSPACE_INVALIDATED",
   "PROCESS_SESSION_NOT_FOUND",
@@ -36,6 +39,7 @@ export interface ToolErrorPayload {
   message: string;
   retryable: boolean;
   path?: string;
+  candidate_paths?: string[];
   expected_revision?: string;
   current_revision?: string;
   expected_state?: "absent" | "present";
@@ -52,6 +56,7 @@ export const toolErrorPayloadSchema = z.object({
   message: z.string(),
   retryable: z.boolean(),
   path: z.string().optional(),
+  candidate_paths: z.array(z.string()).optional(),
   expected_revision: z.string().optional(),
   current_revision: z.string().optional(),
   expected_state: z.enum(["absent", "present"]).optional(),

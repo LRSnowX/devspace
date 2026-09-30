@@ -35,6 +35,7 @@ import {
 import { readFileTool } from "./pi-tools.js";
 import { FILE_REVISION_PATTERN } from "./file-revision.js";
 import {
+  ToolOperationError,
   toolErrorPayload,
   toolErrorPayloadSchema,
   type ToolErrorPayload,
@@ -229,6 +230,18 @@ function formatAvailableAgentProvider(provider: {
 }
 
 function readErrorResponse(payload: ToolErrorPayload) {
+  const content = [textBlock(payload.message)];
+  return {
+    content,
+    structuredContent: {
+      result: payload.message,
+      status: "error" as const,
+      error: payload,
+    },
+  };
+}
+
+function openWorkspaceErrorResponse(payload: ToolErrorPayload) {
   const content = [textBlock(payload.message)];
   return {
     content,
@@ -501,9 +514,10 @@ function registerMcpSurface(
           .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
       },
       outputSchema: {
-        workspace_id: z.string(),
-        root: z.string(),
-        mode: z.enum(["checkout", "worktree"]),
+        status: z.enum(["opened", "error"]),
+        workspace_id: z.string().optional(),
+        root: z.string().optional(),
+        mode: z.enum(["checkout", "worktree"]).optional(),
         source_root: z.string().optional(),
         worktree: z
           .object({
@@ -521,7 +535,7 @@ function registerMcpSurface(
         agent_providers: z.array(workspaceLocalAgentProviderOutputSchema).optional(),
         agents: z.array(workspaceLocalAgentOutputSchema).optional(),
         skill_diagnostics: z.array(z.unknown()).optional(),
-        project_name: z.string(),
+        project_name: z.string().optional(),
         memory_context: memoryBootstrapContextOutputSchema.optional(),
         review: z.discriminatedUnion("available", [
           z.object({ available: z.literal(true) }),
@@ -529,8 +543,10 @@ function registerMcpSurface(
             available: z.literal(false),
             reason: z.string(),
           }),
-        ]),
-        instruction: z.string(),
+        ]).optional(),
+        instruction: z.string().optional(),
+        result: z.string().optional(),
+        error: toolErrorPayloadSchema.optional(),
       },
       ...workspaceAppDescriptorMeta(config),
       annotations: { readOnlyHint: true },
@@ -540,19 +556,48 @@ function registerMcpSurface(
       const baseRef = base_ref;
       let resolvedPath = path;
       let projectName: string;
-      if (isAbsolute(path) || path === "~" || path.startsWith("~/") || path.startsWith("~\\")) {
-        resolvedPath = expandHomePath(path);
-        projectName = projects.projectNameForPath(path) ?? basename(path);
-      } else {
-        const lookup = projects.lookup(path);
-        if (lookup.status === "unknown") {
-          throw new Error(`Unknown project '${path}'. Pass an absolute path inside an allowed root or register it with devspace projects register.`);
+      let workspaceContext;
+      try {
+        if (isAbsolute(path) || path === "~" || path.startsWith("~/") || path.startsWith("~\\")) {
+          resolvedPath = expandHomePath(path);
+          projectName = projects.projectNameForPath(path) ?? basename(path);
+        } else {
+          const lookup = projects.lookup(path);
+          if (lookup.status === "unknown") {
+            throw new ToolOperationError({
+              code: "PROJECT_NOT_FOUND",
+              category: "not_found",
+              message: `Unknown project '${path}'. Pass an absolute path inside an allowed root or register it with devspace projects register.`,
+              retryable: false,
+              path,
+            });
+          }
+          if (lookup.status === "ambiguous") {
+            throw new ToolOperationError({
+              code: "PROJECT_AMBIGUOUS",
+              category: "invalid_request",
+              message: `Project '${path}' is ambiguous across allowed roots: ${lookup.paths.join(", ")}. Pass an absolute path or register it.`,
+              retryable: false,
+              path,
+              candidate_paths: lookup.paths,
+            });
+          }
+          resolvedPath = lookup.resolution.project.path;
+          projectName = lookup.resolution.project.name;
         }
-        if (lookup.status === "ambiguous") {
-          throw new Error(`Project '${path}' is ambiguous across allowed roots: ${lookup.paths.join(", ")}. Pass an absolute path or register it.`);
-        }
-        resolvedPath = lookup.resolution.project.path;
-        projectName = lookup.resolution.project.name;
+        workspaceContext = await workspaces.openWorkspace(
+          { path: resolvedPath, mode, baseRef },
+          { conversationScopeId: conversationScopeIdFromRequestMeta(_meta) },
+        );
+      } catch (error) {
+        const payload = toolErrorPayload(error);
+        if (!payload) throw error;
+        const result = openWorkspaceErrorResponse(payload);
+        logFailedToolResponse(config, {
+          tool: "open_workspace",
+          path,
+        }, result.content, startedAt);
+        return result;
       }
       const {
         workspace,
@@ -560,10 +605,7 @@ function registerMcpSurface(
         availableAgentsFiles,
         workspaceReused,
         includeBootstrapContext,
-      } = await workspaces.openWorkspace(
-        { path: resolvedPath, mode, baseRef },
-        { conversationScopeId: conversationScopeIdFromRequestMeta(_meta) },
-      );
+      } = workspaceContext;
       const review = await reviewCheckpoints.initializeWorkspace({
         workspaceId: workspace.id,
         root: workspace.root,
@@ -713,6 +755,7 @@ function registerMcpSurface(
           },
         },
         structuredContent: {
+          status: "opened" as const,
           workspace_id: workspace.id,
           root: workspace.root,
           mode: workspace.mode,

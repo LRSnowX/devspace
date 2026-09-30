@@ -1,9 +1,10 @@
 # Tool error contract
 
 DevSpace distinguishes expected tool-operation failures from MCP protocol
-failures. Expected `read`, Codex `apply_patch`, and process-session failures
-remain visible to the model as ordinary tool results with an explicit domain
-status and stable machine-readable payload.
+failures. Expected `open_workspace`, `read`, Claude mutation-path, Codex
+`apply_patch`, and process-session failures remain visible to the model as
+ordinary tool results with an explicit domain status and stable
+machine-readable payload.
 
 This is intentional host-compatibility behavior. The current ChatGPT MCP host
 converts `isError: true` tool results into connector exceptions and drops
@@ -22,6 +23,7 @@ error: {
   message,
   retryable,
   path?,
+  candidate_paths?,
   expected_revision?,
   current_revision?,
   expected_state?,
@@ -47,6 +49,46 @@ Successful reads use `status: "read"`, return the complete-file revision, and
 do not include an `error` payload.
 
 Successful Claude `write` and `edit` mutations use `status: "applied"`.
+
+Successful `open_workspace` calls use `status: "opened"`.
+
+## open_workspace project-entry codes
+
+`open_workspace` exposes:
+
+- `PROJECT_NOT_FOUND`
+  - category: `not_found`
+  - retryable: false for the unchanged entry
+  - a relative project name or alias cannot be resolved to a registered project
+    or unique top-level directory in an allowed root.
+  - includes `path` with the requested project entry.
+- `PROJECT_AMBIGUOUS`
+  - category: `invalid_request`
+  - retryable: false for the unchanged entry
+  - a relative project name resolves to more than one allowed-root candidate.
+  - includes `path` and sorted `candidate_paths`; callers should select an
+    absolute path or register an unambiguous project alias.
+- `PROJECT_NOT_DIRECTORY`
+  - category: `invalid_request`
+  - retryable: false
+  - the resolved checkout target exists but is not a directory.
+  - includes `path`.
+- `PATH_SCOPE_VIOLATION`
+  - category: `scope`
+  - retryable: false
+  - an absolute, home-relative, discovered, or canonicalized project target
+    escapes the configured allowed roots.
+
+The current MCP Apps registration path is most reliable with a single object
+output schema, so `open_workspace` advertises one envelope with `status` and
+optional success/error fields rather than a Zod union. Runtime tests enforce
+that `status: "opened"` returns the complete workspace fields, while
+`status: "error"` returns the structured error payload without inventing a
+workspace id or root.
+
+Git/worktree-specific failures such as a non-Git source or invalid base ref are
+not classified in this phase. They remain transport errors until those
+dependency-owned semantics have a stable typed signal.
 
 ## read codes
 
@@ -222,7 +264,8 @@ For expected classified failures:
   stays stable. Patch failures use zero diff counters and an empty file list;
   process failures report `running: false`, `wall_time_ms: 0`, and no exit
   code or signal; read failures omit `revision`; Claude mutation path failures
-  omit success-specific mutation details.
+  omit success-specific mutation details; `open_workspace` failures omit
+  workspace identity and review fields.
 
 Unexpected programmer defects, transport failures, and other uncategorized
 internal exceptions are still thrown rather than falsely classified. They remain
@@ -236,7 +279,8 @@ and other lifecycle fields with `status: "completed"` and no domain error.
 
 ## Scope
 
-This phase standardizes `read`, Claude mutation path failures, `apply_patch`,
-plus Codex process-session misuse and the domain errors those surfaces consume.
-Other coding tools may migrate to the same payload incrementally; they should
-not be classified by brittle message matching.
+This phase standardizes `open_workspace` project-entry failures, `read`,
+Claude mutation path failures, `apply_patch`, plus Codex process-session
+misuse and the domain errors those surfaces consume. Other coding tools may
+migrate to the same payload incrementally; they should not be classified by
+brittle message matching.

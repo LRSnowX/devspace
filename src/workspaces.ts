@@ -450,7 +450,13 @@ export class WorkspaceRegistry {
     );
     const rootStats = await ensureCheckoutWorkspaceRoot(root);
     if (!rootStats.isDirectory()) {
-      throw new Error(`Workspace root must be a directory: ${path}`);
+      throw new ToolOperationError({
+        code: "PROJECT_NOT_DIRECTORY",
+        category: "invalid_request",
+        message: `Workspace root must be a directory: ${path}`,
+        retryable: false,
+        path,
+      });
     }
 
     return this.createWorkspaceContext({ root, canonicalRoot, mode: "checkout" });

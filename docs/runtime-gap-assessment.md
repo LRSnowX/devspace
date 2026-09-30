@@ -64,13 +64,26 @@ semantics such as zero matches, multiple matches, and overlapping replacements
 remain unclassified because the dependency currently exposes them only as
 human-readable errors.
 
+## Completed after this assessment: structured project-entry errors
+
+`open_workspace` now returns ordinary structured domain results for unknown
+project names, ambiguous project names, targets that are not directories, and
+typed allowed-root scope violations. Ambiguous entries include sorted candidate
+paths so the caller can retry with an absolute path. Successful opens use
+`status: "opened"`; expected project-entry failures use `status: "error"`.
+
+The output stays a single host-compatible object envelope rather than a union
+schema because the current MCP Apps registration/adapter path does not preserve
+successful `structuredContent` reliably with the union form. Git/worktree
+semantics remain outside this slice unless they expose a stable typed signal.
+
 ## Priority 1: structured errors for the remaining coding surface
 
-`read`, Claude mutation path failures, Codex `apply_patch`, and
-process-session misuse now have a host-compatible structured domain-error
-contract. Remaining expected failures include missing/invalid project entry,
-unauthorized Memory thread expansion, and dependency-owned tool semantics that
-do not yet expose a stable typed signal.
+`open_workspace` project entry, `read`, Claude mutation path failures, Codex
+`apply_patch`, and process-session misuse now have a host-compatible
+structured domain-error contract. The remaining first-party expected failure in
+this assessment is unauthorized Memory thread expansion; dependency-owned tool
+semantics without a stable typed signal remain intentionally unclassified.
 
 Extending the taxonomy would improve model self-correction, but it is primarily
 an ergonomics and reliability improvement rather than a current data-integrity
