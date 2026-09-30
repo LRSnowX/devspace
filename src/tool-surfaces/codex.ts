@@ -58,12 +58,14 @@ function processResult(snapshot: ProcessSnapshot): string {
 
 function processOutputSchema(): z.ZodRawShape {
   return resultOutputSchema({
+    status: z.enum(["running", "completed", "error"]),
     session_id: z.number().optional(),
     running: z.boolean(),
     exit_code: z.number().int().optional(),
     signal: z.string().optional(),
     wall_time_ms: z.number().nonnegative(),
     output_truncated: z.boolean(),
+    error: toolErrorPayloadSchema.optional(),
   });
 }
 
@@ -74,12 +76,29 @@ function processToolResponse(snapshot: ProcessSnapshot) {
     content,
     structuredContent: {
       result,
+      status: snapshot.running ? "running" as const : "completed" as const,
       session_id: snapshot.sessionId,
       running: snapshot.running,
       exit_code: snapshot.exitCode,
       signal: snapshot.signal,
       wall_time_ms: snapshot.wallTimeMs,
       output_truncated: snapshot.outputTruncated,
+    },
+  };
+}
+
+function processErrorResponse(payload: NonNullable<ReturnType<typeof toolErrorPayload>>) {
+  const content = [textBlock(payload.message)];
+  return {
+    content,
+    structuredContent: {
+      result: payload.message,
+      status: "error" as const,
+      session_id: payload.session_id,
+      running: false,
+      wall_time_ms: 0,
+      output_truncated: false,
+      error: payload,
     },
   };
 }
@@ -311,36 +330,43 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       const workingDirectory = working_directory;
       const yieldTimeMs = yield_time_ms;
       const maxOutputTokens = max_output_tokens;
-      const snapshot = await runLoggedToolOperation(
-        config,
-        {
-          tool: "exec_command",
-          workspaceId,
-          workingDirectory: workingDirectory ?? ".",
-          command: cmd,
-          commandLength: cmd.length,
-        },
-        startedAt,
-        async () => {
-          const workspace = await workspaces.getWorkspace(workspaceId);
-          const cwd = await workspaces.resolveWorkingDirectory(
-            workspace,
-            workingDirectory,
-          );
-          return processSessions.start({
+      let snapshot;
+      try {
+        snapshot = await runLoggedToolOperation(
+          config,
+          {
+            tool: "exec_command",
             workspaceId,
+            workingDirectory: workingDirectory ?? ".",
             command: cmd,
-            cwd,
-            workspaceRoot: workspace.root,
-            tty,
-            columns,
-            rows,
-            yieldTimeMs,
-            maxOutputTokens,
-          });
-        },
-        processLogFields,
-      );
+            commandLength: cmd.length,
+          },
+          startedAt,
+          async () => {
+            const workspace = await workspaces.getWorkspace(workspaceId);
+            const cwd = await workspaces.resolveWorkingDirectory(
+              workspace,
+              workingDirectory,
+            );
+            return processSessions.start({
+              workspaceId,
+              command: cmd,
+              cwd,
+              workspaceRoot: workspace.root,
+              tty,
+              columns,
+              rows,
+              yieldTimeMs,
+              maxOutputTokens,
+            });
+          },
+          processLogFields,
+        );
+      } catch (error) {
+        const payload = toolErrorPayload(error);
+        if (!payload) throw error;
+        return processErrorResponse(payload);
+      }
 
       return processToolResponse(snapshot);
     },
@@ -358,6 +384,8 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
           .describe("Workspace identifier used to start the process."),
         session_id: z
           .number()
+          .int()
+          .positive()
           .describe("Process session identifier returned by exec_command."),
         chars: z
           .string()
@@ -413,24 +441,31 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
       const sessionId = session_id;
       const yieldTimeMs = yield_time_ms;
       const maxOutputTokens = max_output_tokens;
-      const snapshot = await runLoggedToolOperation(
-        config,
-        { tool: "write_stdin", workspaceId },
-        startedAt,
-        async () => {
-          await workspaces.getWorkspace(workspaceId);
-          return processSessions.write({
-            workspaceId,
-            sessionId,
-            chars,
-            columns,
-            rows,
-            yieldTimeMs,
-            maxOutputTokens,
-          });
-        },
-        processLogFields,
-      );
+      let snapshot;
+      try {
+        snapshot = await runLoggedToolOperation(
+          config,
+          { tool: "write_stdin", workspaceId },
+          startedAt,
+          async () => {
+            await workspaces.getWorkspace(workspaceId);
+            return processSessions.write({
+              workspaceId,
+              sessionId,
+              chars,
+              columns,
+              rows,
+              yieldTimeMs,
+              maxOutputTokens,
+            });
+          },
+          processLogFields,
+        );
+      } catch (error) {
+        const payload = toolErrorPayload(error);
+        if (!payload) throw error;
+        return processErrorResponse(payload);
+      }
 
       return processToolResponse(snapshot);
     },

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
+import { ToolOperationError } from "./tool-errors.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
@@ -251,7 +252,13 @@ export class ProcessSessionManager {
       session.columns = terminalSize(input.columns, session.columns);
       session.rows = terminalSize(input.rows, session.rows);
       if (!session.process?.resize) {
-        throw new Error(`Process session ${session.id} is not a PTY and cannot be resized.`);
+        throw new ToolOperationError({
+          code: "PROCESS_SESSION_NOT_INTERACTIVE",
+          category: "state",
+          message: "Process session " + session.id + " is not a PTY and cannot be resized.",
+          retryable: false,
+          session_id: session.id,
+        });
       }
       session.process.resize(session.columns, session.rows);
     }
@@ -417,9 +424,23 @@ export class ProcessSessionManager {
 
   private getOwnedSession(workspaceId: string, sessionId: number): ProcessSession {
     const session = this.sessions.get(sessionId);
-    if (!session) throw new Error(`Unknown process session: ${sessionId}`);
+    if (!session) {
+      throw new ToolOperationError({
+        code: "PROCESS_SESSION_NOT_FOUND",
+        category: "not_found",
+        message: "Unknown process session: " + sessionId + ". Start a new command with exec_command.",
+        retryable: true,
+        session_id: sessionId,
+      });
+    }
     if (session.workspaceId !== workspaceId) {
-      throw new Error(`Process session ${sessionId} does not belong to workspace ${workspaceId}.`);
+      throw new ToolOperationError({
+        code: "PROCESS_SESSION_SCOPE_MISMATCH",
+        category: "scope",
+        message: "Process session " + sessionId + " does not belong to workspace " + workspaceId + ".",
+        retryable: false,
+        session_id: sessionId,
+      });
     }
     return session;
   }

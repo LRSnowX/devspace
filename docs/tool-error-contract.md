@@ -1,9 +1,9 @@
 # Tool error contract
 
 DevSpace distinguishes expected tool-operation failures from MCP protocol
-failures. Expected Codex `apply_patch` failures remain visible to the model as
-ordinary tool results with an explicit domain status and stable machine-readable
-payload.
+failures. Expected Codex `apply_patch` and process-session failures remain
+visible to the model as ordinary tool results with an explicit domain status
+and stable machine-readable payload.
 
 This is intentional host-compatibility behavior. The current ChatGPT MCP host
 converts `isError: true` tool results into connector exceptions and drops
@@ -27,6 +27,7 @@ error: {
   expected_state?,
   current_state?,
   recovery_files?,
+  session_id?,
   repeat_count?,
   previous_error_code?
 }
@@ -37,6 +38,10 @@ error: {
 
 Successful patch application uses `status: "applied"` and does not include an
 `error` payload.
+
+Codex process tools use `status: "running"` or `status: "completed"` for
+normal process lifecycle results and `status: "error"` for classified tool
+operation failures.
 
 ## apply_patch codes
 
@@ -94,6 +99,33 @@ The Codex `apply_patch` tool currently exposes:
     already produced three consecutive known domain failures in that workspace.
   - includes `repeat_count` and `previous_error_code`.
 
+## Process-session codes
+
+The Codex `write_stdin` surface also exposes:
+
+- `PROCESS_SESSION_NOT_FOUND`
+  - category: `not_found`
+  - retryable: true
+  - the requested session no longer exists, including after its completed
+    result has already been consumed; start a new command.
+  - includes `session_id`.
+- `PROCESS_SESSION_SCOPE_MISMATCH`
+  - category: `scope`
+  - retryable: false
+  - the session belongs to a different workspace and cannot be accessed through
+    the supplied workspace id.
+  - includes `session_id`.
+- `PROCESS_SESSION_NOT_INTERACTIVE`
+  - category: `state`
+  - retryable: false
+  - a PTY-only operation, currently terminal resize, was requested for a
+    non-PTY process.
+  - includes `session_id`.
+
+Process tools also reuse existing workspace/path errors, such as
+`WORKSPACE_NOT_FOUND`, when the failure is already represented by the common
+tool-error taxonomy.
+
 ## Repeat-failure circuit breaker
 
 The Codex `apply_patch` surface has a deliberately narrow process-local
@@ -120,13 +152,15 @@ available.
 
 ## MCP behavior
 
-For these expected `apply_patch` failures:
+For expected classified failures:
 
 - the tool result has `status: "error"`;
 - text content preserves the human-readable message;
 - `structuredContent.error` contains the payload above;
-- success-shaped counters are neutral (`additions: 0`, `removals: 0`,
-  `files: []`) so the declared output schema remains stable.
+- tool-specific success fields remain neutral so the declared output schema
+  stays stable. Patch failures use zero diff counters and an empty file list;
+  process failures report `running: false`, `wall_time_ms: 0`, and no exit
+  code or signal.
 
 Unexpected programmer defects, transport failures, and other uncategorized
 internal exceptions are still thrown rather than falsely classified. They remain
@@ -134,12 +168,13 @@ true MCP/connector failures.
 
 ## Process exits
 
-A shell command that starts successfully and exits non-zero is not a tool
-protocol error. Process tools continue to report `exit_code`, `signal`, and
-other lifecycle fields as a completed command result.
+A shell command that starts successfully and exits non-zero or by signal is not
+a tool protocol error. Process tools continue to report `exit_code`, `signal`,
+and other lifecycle fields with `status: "completed"` and no domain error.
 
 ## Scope
 
-This phase standardizes `apply_patch` and the domain errors it consumes.
-Other coding tools may migrate to the same payload incrementally; they should
-not be classified by brittle message matching.
+This phase standardizes `apply_patch` plus Codex process-session misuse and
+the domain errors those surfaces consume. Other coding tools may migrate to the
+same payload incrementally; they should not be classified by brittle message
+matching.

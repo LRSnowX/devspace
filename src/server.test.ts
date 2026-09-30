@@ -89,6 +89,120 @@ test("Codex process tools bound model-facing yield windows to 12 seconds", async
   }
 });
 
+test("Codex process tools return structured session errors without connector failure", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
+  const workspaceId = structuredContent(
+    await callOpen(context.client, context.project, "process-session-errors"),
+  ).workspace_id;
+  assert.equal(typeof workspaceId, "string");
+
+  const missing = await context.client.callTool({
+    name: "write_stdin",
+    arguments: {
+      workspace_id: workspaceId,
+      session_id: 999_999,
+    },
+  });
+  assert.notEqual(missing.isError, true);
+  assert.deepEqual(structuredContent(missing), {
+    result: "Unknown process session: 999999. Start a new command with exec_command.",
+    status: "error",
+    session_id: 999_999,
+    running: false,
+    wall_time_ms: 0,
+    output_truncated: false,
+    error: {
+      code: "PROCESS_SESSION_NOT_FOUND",
+      category: "not_found",
+      message: "Unknown process session: 999999. Start a new command with exec_command.",
+      retryable: true,
+      session_id: 999_999,
+    },
+  });
+
+  const started = structuredContent(await context.client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspace_id: workspaceId,
+      cmd: `${JSON.stringify(process.execPath)} -e "setInterval(() => {}, 1000)"`,
+      yield_time_ms: 5,
+    },
+  }));
+  assert.equal(started.status, "running");
+  assert.equal(started.running, true);
+  assert.equal(typeof started.session_id, "number");
+
+  const otherProject = join(context.root, "other-process-project");
+  await mkdir(otherProject, { recursive: true });
+  const otherWorkspaceId = structuredContent(
+    await callOpen(context.client, otherProject, "process-session-other"),
+  ).workspace_id;
+  assert.equal(typeof otherWorkspaceId, "string");
+
+  const mismatched = await context.client.callTool({
+    name: "write_stdin",
+    arguments: {
+      workspace_id: otherWorkspaceId,
+      session_id: started.session_id,
+    },
+  });
+  assert.notEqual(mismatched.isError, true);
+  assert.equal(structuredContent(mismatched).status, "error");
+  assert.deepEqual(structuredContent(mismatched).error, {
+    code: "PROCESS_SESSION_SCOPE_MISMATCH",
+    category: "scope",
+    message:
+      "Process session " + started.session_id + " does not belong to workspace " + otherWorkspaceId + ".",
+    retryable: false,
+    session_id: started.session_id,
+  });
+
+  const resize = await context.client.callTool({
+    name: "write_stdin",
+    arguments: {
+      workspace_id: workspaceId,
+      session_id: started.session_id,
+      columns: 120,
+      rows: 30,
+    },
+  });
+  assert.notEqual(resize.isError, true);
+  assert.equal(structuredContent(resize).status, "error");
+  assert.deepEqual(structuredContent(resize).error, {
+    code: "PROCESS_SESSION_NOT_INTERACTIVE",
+    category: "state",
+    message: "Process session " + started.session_id + " is not a PTY and cannot be resized.",
+    retryable: false,
+    session_id: started.session_id,
+  });
+
+  const interrupted = structuredContent(await context.client.callTool({
+    name: "write_stdin",
+    arguments: {
+      workspace_id: workspaceId,
+      session_id: started.session_id,
+      chars: "\u0003",
+      yield_time_ms: 2_000,
+    },
+  }));
+  assert.equal(interrupted.status, "completed");
+  assert.equal(interrupted.running, false);
+  if (process.platform !== "win32") assert.equal(interrupted.signal, "SIGINT");
+
+  const nonZero = structuredContent(await context.client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspace_id: workspaceId,
+      cmd: `${JSON.stringify(process.execPath)} -e "process.exit(7)"`,
+      yield_time_ms: 2_000,
+    },
+  }));
+  assert.equal(nonZero.status, "completed");
+  assert.equal(nonZero.running, false);
+  assert.equal(nonZero.exit_code, 7);
+  assert.equal(nonZero.error, undefined);
+});
+
 test("Codex read and apply_patch expose the stale-read revision contract", async (t) => {
   const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
   const tools = await context.client.listTools();

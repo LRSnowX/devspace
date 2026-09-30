@@ -38,12 +38,20 @@ recovery. Power-loss durability, fsync ordering, and distributed multi-process
 locking remain out of scope. See
 [Patch crash recovery design](patch-crash-recovery-design.md).
 
+## Completed after this assessment: structured process-session errors
+
+Codex process tools now return ordinary structured domain results for expected
+session-lifecycle misuse instead of turning those cases into connector
+exceptions. Missing sessions, cross-workspace session access, and PTY-only
+resize requests have stable error codes. Normal non-zero or signaled process
+exits remain completed command results rather than tool errors.
+
 ## Priority 1: structured errors for the remaining coding surface
 
-Codex `apply_patch` has a host-compatible structured domain-error contract.
-Other tools still use legacy thrown errors for many expected failures, such as
-missing/invalid project entry, unauthorized Memory thread expansion, missing
-files, or process-session misuse.
+Codex `apply_patch` and process-session misuse now have a host-compatible
+structured domain-error contract. Other tools still use legacy thrown errors
+for many expected failures, such as missing/invalid project entry, unauthorized
+Memory thread expansion, or missing files.
 
 Extending the taxonomy would improve model self-correction, but it is primarily
 an ergonomics and reliability improvement rather than a current data-integrity

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { HeadTailBuffer, ProcessSessionManager } from "./process-sessions.js";
+import { ToolOperationError } from "./tool-errors.js";
 
 const smallBuffer = new HeadTailBuffer(100);
 smallBuffer.append("hello\n");
@@ -74,7 +75,17 @@ await assert.rejects(
     sessionId: background.sessionId,
     yieldTimeMs: 1,
   }),
-  /does not belong to workspace/,
+  (error: unknown) => {
+    assert.equal(error instanceof ToolOperationError, true);
+    assert.deepEqual((error as ToolOperationError).payload, {
+      code: "PROCESS_SESSION_SCOPE_MISMATCH",
+      category: "scope",
+      message: "Process session " + background.sessionId + " does not belong to workspace workspace-b.",
+      retryable: false,
+      session_id: background.sessionId,
+    });
+    return true;
+  },
 );
 
 const completed = await manager.write({
@@ -85,6 +96,60 @@ const completed = await manager.write({
 assert.equal(completed.running, false);
 assert.equal(completed.exitCode, 0);
 assert.match(completed.output, /finished/);
+
+await assert.rejects(
+  manager.write({
+    workspaceId: "workspace-a",
+    sessionId: background.sessionId,
+    yieldTimeMs: 1,
+  }),
+  (error: unknown) => {
+    assert.equal(error instanceof ToolOperationError, true);
+    assert.deepEqual((error as ToolOperationError).payload, {
+      code: "PROCESS_SESSION_NOT_FOUND",
+      category: "not_found",
+      message: "Unknown process session: " + background.sessionId + ". Start a new command with exec_command.",
+      retryable: true,
+      session_id: background.sessionId,
+    });
+    return true;
+  },
+);
+
+const nonPty = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "setInterval(() => {}, 1000)"`,
+  yieldTimeMs: 5,
+});
+assert.equal(nonPty.running, true);
+assert.ok(nonPty.sessionId);
+await assert.rejects(
+  manager.write({
+    workspaceId: "workspace-a",
+    sessionId: nonPty.sessionId,
+    columns: 120,
+    rows: 30,
+    yieldTimeMs: 1,
+  }),
+  (error: unknown) => {
+    assert.equal(error instanceof ToolOperationError, true);
+    assert.deepEqual((error as ToolOperationError).payload, {
+      code: "PROCESS_SESSION_NOT_INTERACTIVE",
+      category: "state",
+      message: "Process session " + nonPty.sessionId + " is not a PTY and cannot be resized.",
+      retryable: false,
+      session_id: nonPty.sessionId,
+    });
+    return true;
+  },
+);
+await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: nonPty.sessionId,
+  chars: "\u0003",
+  yieldTimeMs: 2_000,
+});
 
 const interactive = await manager.start({
   workspaceId: "workspace-a",
