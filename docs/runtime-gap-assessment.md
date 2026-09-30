@@ -98,7 +98,7 @@ Extending the taxonomy would improve model self-correction, but it is primarily
 an ergonomics and reliability improvement rather than a current data-integrity
 gap.
 
-## Priority 2 in progress: persistent metadata retention
+## Priority 2 observation phase: persistent metadata retention
 
 Stale workspace metadata now has a conservative product policy:
 
@@ -148,6 +148,10 @@ blind spot: safe workspace metadata has explicit pruning, recoverable worktree
 state is protected and self-cleans its recovery ref after restoration, OAuth
 registrations have a last-used signal while deletion is deferred for evidence,
 and local-agent history has an explicit retain-by-design policy.
+
+Further runtime hardening should pause unless new evidence identifies a concrete
+integrity or compatibility gap. Fork maintenance and early upstream-sync review
+now take priority; see [Upstream maintenance](upstream-maintenance.md).
 
 ## Deliberate non-goals
 
