@@ -100,19 +100,23 @@ gap.
 
 ## Priority 2 in progress: persistent metadata retention
 
-Stale checkout workspace metadata now has a conservative product policy:
+Stale workspace metadata now has a conservative product policy:
 
-- devspace retention inspect reports checkout sessions idle for more than
-  90 days;
-- devspace retention prune explicitly removes eligible checkout sessions;
+- devspace retention inspect reports safe metadata candidates idle for more
+  than 90 days;
+- devspace retention prune explicitly removes eligible checkout sessions and
+  pruned managed-worktree sessions that have neither recovery metadata nor a
+  recovery ref;
 - conversation bindings and loaded-agent-file state cascade with the session;
 - matching review refs are cleaned best-effort;
 - roots protected by unresolved patch recovery are skipped;
-- managed worktree sessions are excluded entirely;
+- recoverable or unverifiable pruned worktree sessions are protected;
+- deletion rechecks lifecycle state in SQLite so a concurrently reused or
+  reactivated candidate is skipped;
 - no automatic startup retention is enabled.
 
-This addresses the largest monotonically growing workspace class without
-mixing it with recoverable worktree state.
+This addresses the safe monotonically growing workspace classes without
+mixing retention with recoverable worktree state.
 
 Managed-worktree recovery refs now retire best-effort after a pruned worktree
 has been restored and its persisted session has successfully returned to the

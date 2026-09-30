@@ -1,6 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { Result, type Result as BetterResult } from "better-result";
 import type { ServerConfig } from "./config.js";
+import { managedWorktreeRecoveryRefExists } from "./git-worktrees.js";
 import { deleteWorkspaceReviewRefs } from "./review-checkpoints.js";
 import { resolveCanonicalAllowedPath } from "./roots.js";
 import {
@@ -10,28 +11,36 @@ import {
   type WorkspaceStoreError,
 } from "./workspace-store.js";
 
-export const DEFAULT_CHECKOUT_SESSION_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+export const DEFAULT_WORKSPACE_METADATA_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
 
-export interface CheckoutRetentionCandidate {
+export interface WorkspaceMetadataRetentionCandidate {
   workspaceId: string;
   root: string;
+  reviewRoot: string;
   lastUsedAt: string;
+  kind: "stale_checkout" | "disposable_pruned_worktree";
 }
 
-export interface CheckoutRetentionSkipped {
+export interface WorkspaceMetadataRetentionSkipped {
   workspaceId: string;
   root: string;
-  reason: "patch_recovery_required" | "root_invalid";
+  reason:
+    | "patch_recovery_required"
+    | "root_invalid"
+    | "recovery_metadata_present"
+    | "recovery_ref_present"
+    | "recovery_state_unverifiable";
 }
 
-export interface CheckoutRetentionInspection {
+export interface WorkspaceMetadataRetentionInspection {
   cutoff: string;
-  eligible: CheckoutRetentionCandidate[];
-  skipped: CheckoutRetentionSkipped[];
+  eligible: WorkspaceMetadataRetentionCandidate[];
+  skipped: WorkspaceMetadataRetentionSkipped[];
 }
 
-export interface CheckoutRetentionPruneResult extends CheckoutRetentionInspection {
+export interface WorkspaceMetadataRetentionPruneResult extends WorkspaceMetadataRetentionInspection {
   pruned: string[];
+  stateChanged: string[];
   failed: Array<{ workspaceId: string; error: string }>;
   reviewRefsDeleted: number;
   reviewCleanupFailed: Array<{ workspaceId: string; error: string }>;
@@ -39,60 +48,98 @@ export interface CheckoutRetentionPruneResult extends CheckoutRetentionInspectio
 
 type RetentionConfig = Pick<ServerConfig, "stateDir" | "allowedRoots">;
 
-export async function inspectCheckoutRetention(
+export async function inspectWorkspaceMetadataRetention(
   config: RetentionConfig,
   now = new Date(),
   protectedRoots: ReadonlySet<string> = new Set(),
-): Promise<BetterResult<CheckoutRetentionInspection, WorkspaceStoreError>> {
+): Promise<BetterResult<WorkspaceMetadataRetentionInspection, WorkspaceStoreError>> {
   const opened = createWorkspaceStoreResult(config.stateDir);
   if (opened.isErr()) return opened;
 
-  const cutoff = new Date(now.getTime() - DEFAULT_CHECKOUT_SESSION_RETENTION_MS);
-  let listed!: ReturnType<typeof opened.value.listStaleCheckoutSessions>;
+  const cutoff = new Date(now.getTime() - DEFAULT_WORKSPACE_METADATA_RETENTION_MS);
+  let listedCheckouts!: ReturnType<typeof opened.value.listStaleCheckoutSessions>;
+  let listedPrunedWorktrees!: ReturnType<
+    typeof opened.value.listStalePrunedManagedWorktrees
+  >;
   let closed!: ReturnType<typeof closeWorkspaceStoreResult>;
   try {
-    listed = opened.value.listStaleCheckoutSessions(cutoff);
+    listedCheckouts = opened.value.listStaleCheckoutSessions(cutoff);
+    listedPrunedWorktrees = opened.value.listStalePrunedManagedWorktrees(cutoff);
   } finally {
     closed = closeWorkspaceStoreResult(opened.value);
   }
-  if (listed.isErr()) return listed;
+  if (listedCheckouts.isErr()) return listedCheckouts;
+  if (listedPrunedWorktrees.isErr()) return listedPrunedWorktrees;
   if (closed.isErr()) return closed;
 
-  const classified = await classifyCandidates(
-    listed.value,
+  const classifiedCheckouts = await classifyCheckoutCandidates(
+    listedCheckouts.value,
+    config.allowedRoots,
+    protectedRoots,
+  );
+  const classifiedPrunedWorktrees = await classifyPrunedWorktreeCandidates(
+    listedPrunedWorktrees.value,
     config.allowedRoots,
     protectedRoots,
   );
   return Result.ok({
     cutoff: cutoff.toISOString(),
-    ...classified,
+    eligible: [
+      ...classifiedCheckouts.eligible,
+      ...classifiedPrunedWorktrees.eligible,
+    ],
+    skipped: [
+      ...classifiedCheckouts.skipped,
+      ...classifiedPrunedWorktrees.skipped,
+    ],
   });
 }
 
-export async function pruneCheckoutRetention(
+export async function pruneWorkspaceMetadataRetention(
   config: RetentionConfig,
   now = new Date(),
   protectedRoots: ReadonlySet<string> = new Set(),
-): Promise<BetterResult<CheckoutRetentionPruneResult, WorkspaceStoreError>> {
+): Promise<BetterResult<WorkspaceMetadataRetentionPruneResult, WorkspaceStoreError>> {
   const opened = createWorkspaceStoreResult(config.stateDir);
   if (opened.isErr()) return opened;
 
-  const cutoff = new Date(now.getTime() - DEFAULT_CHECKOUT_SESSION_RETENTION_MS);
-  const listed = opened.value.listStaleCheckoutSessions(cutoff);
-  if (listed.isErr()) {
+  const cutoff = new Date(now.getTime() - DEFAULT_WORKSPACE_METADATA_RETENTION_MS);
+  const listedCheckouts = opened.value.listStaleCheckoutSessions(cutoff);
+  if (listedCheckouts.isErr()) {
     closeWorkspaceStoreResult(opened.value);
-    return listed;
+    return listedCheckouts;
+  }
+  const listedPrunedWorktrees = opened.value.listStalePrunedManagedWorktrees(cutoff);
+  if (listedPrunedWorktrees.isErr()) {
+    closeWorkspaceStoreResult(opened.value);
+    return listedPrunedWorktrees;
   }
 
-  const classified = await classifyCandidates(
-    listed.value,
+  const classifiedCheckouts = await classifyCheckoutCandidates(
+    listedCheckouts.value,
     config.allowedRoots,
     protectedRoots,
   );
-  const result: CheckoutRetentionPruneResult = {
+  const classifiedPrunedWorktrees = await classifyPrunedWorktreeCandidates(
+    listedPrunedWorktrees.value,
+    config.allowedRoots,
+    protectedRoots,
+  );
+  const classified = {
+    eligible: [
+      ...classifiedCheckouts.eligible,
+      ...classifiedPrunedWorktrees.eligible,
+    ],
+    skipped: [
+      ...classifiedCheckouts.skipped,
+      ...classifiedPrunedWorktrees.skipped,
+    ],
+  };
+  const result: WorkspaceMetadataRetentionPruneResult = {
     cutoff: cutoff.toISOString(),
     ...classified,
     pruned: [],
+    stateChanged: [],
     failed: [],
     reviewRefsDeleted: 0,
     reviewCleanupFailed: [],
@@ -100,7 +147,12 @@ export async function pruneCheckoutRetention(
 
   try {
     for (const candidate of classified.eligible) {
-      const deleted = opened.value.deleteSession(candidate.workspaceId);
+      const deleted = candidate.kind === "stale_checkout"
+        ? opened.value.deleteStaleCheckoutSession(candidate.workspaceId, cutoff)
+        : opened.value.deleteDisposablePrunedWorktreeSession(
+            candidate.workspaceId,
+            cutoff,
+          );
       if (deleted.isErr()) {
         result.failed.push({
           workspaceId: candidate.workspaceId,
@@ -108,11 +160,15 @@ export async function pruneCheckoutRetention(
         });
         continue;
       }
+      if (!deleted.value) {
+        result.stateChanged.push(candidate.workspaceId);
+        continue;
+      }
       result.pruned.push(candidate.workspaceId);
 
       try {
         result.reviewRefsDeleted += await deleteWorkspaceReviewRefs(
-          candidate.root,
+          candidate.reviewRoot,
           candidate.workspaceId,
         );
       } catch (error) {
@@ -130,13 +186,13 @@ export async function pruneCheckoutRetention(
   return Result.ok(result);
 }
 
-async function classifyCandidates(
+async function classifyCheckoutCandidates(
   sessions: readonly WorkspaceSession[],
   allowedRoots: readonly string[],
   protectedRoots: ReadonlySet<string>,
-): Promise<Pick<CheckoutRetentionInspection, "eligible" | "skipped">> {
-  const eligible: CheckoutRetentionCandidate[] = [];
-  const skipped: CheckoutRetentionSkipped[] = [];
+): Promise<Pick<WorkspaceMetadataRetentionInspection, "eligible" | "skipped">> {
+  const eligible: WorkspaceMetadataRetentionCandidate[] = [];
+  const skipped: WorkspaceMetadataRetentionSkipped[] = [];
 
   for (const session of sessions) {
     let canonicalRoot: string;
@@ -177,7 +233,80 @@ async function classifyCandidates(
     eligible.push({
       workspaceId: session.id,
       root: session.root,
+      reviewRoot: session.root,
       lastUsedAt: session.lastUsedAt,
+      kind: "stale_checkout",
+    });
+  }
+
+  return { eligible, skipped };
+}
+
+async function classifyPrunedWorktreeCandidates(
+  sessions: readonly WorkspaceSession[],
+  allowedRoots: readonly string[],
+  protectedRoots: ReadonlySet<string>,
+): Promise<Pick<WorkspaceMetadataRetentionInspection, "eligible" | "skipped">> {
+  const eligible: WorkspaceMetadataRetentionCandidate[] = [];
+  const skipped: WorkspaceMetadataRetentionSkipped[] = [];
+
+  for (const session of sessions) {
+    if (
+      protectedRoots.has(session.root)
+      || (session.sourceRoot ? protectedRoots.has(session.sourceRoot) : false)
+    ) {
+      skipped.push({
+        workspaceId: session.id,
+        root: session.root,
+        reason: "patch_recovery_required",
+      });
+      continue;
+    }
+
+    if (session.recoveryKind) {
+      skipped.push({
+        workspaceId: session.id,
+        root: session.root,
+        reason: "recovery_metadata_present",
+      });
+      continue;
+    }
+
+    const recoveryRef = await managedWorktreeRecoveryRefExists({
+      session,
+      allowedRoots: [...allowedRoots],
+    });
+    if (recoveryRef.isErr()) {
+      skipped.push({
+        workspaceId: session.id,
+        root: session.root,
+        reason: "recovery_state_unverifiable",
+      });
+      continue;
+    }
+    if (recoveryRef.value) {
+      skipped.push({
+        workspaceId: session.id,
+        root: session.root,
+        reason: "recovery_ref_present",
+      });
+      continue;
+    }
+    if (!session.sourceRoot) {
+      skipped.push({
+        workspaceId: session.id,
+        root: session.root,
+        reason: "recovery_state_unverifiable",
+      });
+      continue;
+    }
+
+    eligible.push({
+      workspaceId: session.id,
+      root: session.root,
+      reviewRoot: session.sourceRoot,
+      lastUsedAt: session.lastUsedAt,
+      kind: "disposable_pruned_worktree",
     });
   }
 

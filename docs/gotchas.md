@@ -157,14 +157,16 @@ shows the combined changes and advances the review point automatically.
 
 ## Data Retention
 
-DevSpace does not automatically prune checkout workspace metadata. Use
-devspace retention inspect to see checkout sessions idle for more than 90
-days, then devspace retention prune to remove those sessions explicitly.
+DevSpace does not automatically prune workspace metadata. Use
+devspace retention inspect to see safe candidates idle for more than 90 days,
+then devspace retention prune to remove those candidates explicitly.
 Conversation bindings and loaded agent files for a pruned checkout session are
 removed by SQLite cascade, and matching review refs are cleaned best-effort.
 
-Managed worktree sessions and recovery refs are deliberately outside this
-command because they may still be needed to restore isolated work. See
+Recoverable managed worktree sessions and recovery refs are deliberately
+protected because they may still be needed to restore isolated work. An
+already-pruned managed worktree can become eligible only when it has neither
+recovery metadata nor a recovery ref. See
 [Persistent metadata retention](retention-policy.md).
 
 ## MCP Workspace Path Rejected

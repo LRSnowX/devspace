@@ -59,8 +59,9 @@ import { pruneStaleManagedWorktrees } from "./worktree-prune.js";
 import { ProjectRegistry } from "./project-registry.js";
 import { PatchRecoveryManager, runPatchStartupRecovery } from "./patch-recovery.js";
 import {
-  inspectCheckoutRetention,
-  pruneCheckoutRetention,
+  type WorkspaceMetadataRetentionInspection,
+  inspectWorkspaceMetadataRetention,
+  pruneWorkspaceMetadataRetention,
 } from "./retention.js";
 
 type Command =
@@ -557,7 +558,7 @@ async function runRetentionCommand(args: string[]): Promise<void> {
   }
 
   if (subcommand === "inspect") {
-    const result = await inspectCheckoutRetention(config, new Date(), protectedRoots);
+    const result = await inspectWorkspaceMetadataRetention(config, new Date(), protectedRoots);
     if (result.isErr()) {
       console.warn("Retention inspect failed: " + result.error.message);
       process.exitCode = 1;
@@ -571,7 +572,7 @@ async function runRetentionCommand(args: string[]): Promise<void> {
     return;
   }
 
-  const result = await pruneCheckoutRetention(config, new Date(), protectedRoots);
+  const result = await pruneWorkspaceMetadataRetention(config, new Date(), protectedRoots);
   if (result.isErr()) {
     console.warn("Retention prune failed: " + result.error.message);
     process.exitCode = 1;
@@ -583,8 +584,14 @@ async function runRetentionCommand(args: string[]): Promise<void> {
   }
 
   printRetentionInspection(result.value);
-  console.log("Pruned " + result.value.pruned.length + " stale checkout session(s).");
+  console.log("Pruned " + result.value.pruned.length + " workspace metadata candidate(s).");
   console.log("Deleted " + result.value.reviewRefsDeleted + " matching review ref(s).");
+  if (result.value.stateChanged.length > 0) {
+    console.log(
+      "Skipped " + result.value.stateChanged.length
+        + " candidate(s) whose persisted state changed before deletion.",
+    );
+  }
   if (result.value.failed.length > 0) {
     console.warn("Failed to prune " + result.value.failed.length + " checkout session(s).");
     process.exitCode = 1;
@@ -599,18 +606,32 @@ async function runRetentionCommand(args: string[]): Promise<void> {
   }
 }
 
-function printRetentionInspection(result: {
-  cutoff: string;
-  eligible: Array<{ workspaceId: string }>;
-  skipped: Array<{ reason: "patch_recovery_required" | "root_invalid" }>;
-}): void {
-  console.log("Checkout retention cutoff: " + result.cutoff);
-  console.log("Eligible stale checkout sessions: " + result.eligible.length + ".");
+function printRetentionInspection(result: WorkspaceMetadataRetentionInspection): void {
+  console.log("Workspace metadata retention cutoff: " + result.cutoff);
+  const checkoutCount = result.eligible.filter(
+    (entry) => entry.kind === "stale_checkout",
+  ).length;
+  const disposableWorktreeCount = result.eligible.filter(
+    (entry) => entry.kind === "disposable_pruned_worktree",
+  ).length;
+  console.log("Eligible stale checkout sessions: " + checkoutCount + ".");
+  console.log(
+    "Eligible disposable pruned worktree sessions: " + disposableWorktreeCount + ".",
+  );
   const protectedCount = result.skipped.filter(
     (entry) => entry.reason === "patch_recovery_required",
   ).length;
   const invalidRootCount = result.skipped.filter(
     (entry) => entry.reason === "root_invalid",
+  ).length;
+  const recoveryMetadataCount = result.skipped.filter(
+    (entry) => entry.reason === "recovery_metadata_present",
+  ).length;
+  const recoveryRefCount = result.skipped.filter(
+    (entry) => entry.reason === "recovery_ref_present",
+  ).length;
+  const unverifiableCount = result.skipped.filter(
+    (entry) => entry.reason === "recovery_state_unverifiable",
   ).length;
   if (protectedCount > 0) {
     console.log(
@@ -622,7 +643,21 @@ function printRetentionInspection(result: {
       "Skipped " + invalidRootCount + " checkout session(s) whose root is no longer valid under allowedRoots.",
     );
   }
-  console.log("Managed worktree sessions are outside this retention command.");
+  if (recoveryMetadataCount > 0) {
+    console.log(
+      "Protected " + recoveryMetadataCount + " pruned worktree session(s) with recovery metadata.",
+    );
+  }
+  if (recoveryRefCount > 0) {
+    console.log(
+      "Protected " + recoveryRefCount + " pruned worktree session(s) with a recovery ref.",
+    );
+  }
+  if (unverifiableCount > 0) {
+    console.log(
+      "Skipped " + unverifiableCount + " pruned worktree session(s) whose recovery state could not be verified.",
+    );
+  }
 }
 
 function runProjectsCommand(args: string[]): void {
@@ -687,7 +722,7 @@ function printHelp(): void {
       "  devspace projects list   List canonical project registrations",
       "  devspace projects register <name> <path> [--alias <alias>]...",
       "  devspace recovery list|show <id>|resolve <id> --accept-current",
-      "  devspace retention inspect|prune [--json]  Inspect or prune checkout sessions idle for 90 days",
+      "  devspace retention inspect|prune [--json]  Inspect or prune safe workspace metadata idle for 90 days",
       "  devspace worktrees prune Prune managed worktrees unused for 3 days",
       "  devspace show-changes <review-ref> [--json]",
       "  devspace agents targets [--json]  List usable subagent providers and profiles",

@@ -1,4 +1,4 @@
-import { and, eq, lt } from "drizzle-orm";
+import { and, eq, isNull, lt } from "drizzle-orm";
 import { Result, TaggedError, type Result as BetterResult } from "better-result";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
@@ -67,10 +67,21 @@ export interface WorkspaceStore {
   getSessionResult(id: string): BetterResult<WorkspaceSession | undefined, WorkspaceStoreError>;
   listStaleManagedWorktrees(before: Date): BetterResult<WorkspaceSession[], WorkspaceStoreError>;
   listStaleCheckoutSessions(before: Date): BetterResult<WorkspaceSession[], WorkspaceStoreError>;
+  listStalePrunedManagedWorktrees(
+    before: Date,
+  ): BetterResult<WorkspaceSession[], WorkspaceStoreError>;
   markSessionPruned(id: string, recoveryKind?: WorkspaceRecoveryKind): BetterResult<void, WorkspaceStoreError>;
   reactivateSession(id: string): BetterResult<boolean, WorkspaceStoreError>;
   touchSession(id: string): BetterResult<boolean, WorkspaceStoreError>;
   deleteSession(id: string): BetterResult<void, WorkspaceStoreError>;
+  deleteStaleCheckoutSession(
+    id: string,
+    before: Date,
+  ): BetterResult<boolean, WorkspaceStoreError>;
+  deleteDisposablePrunedWorktreeSession(
+    id: string,
+    before: Date,
+  ): BetterResult<boolean, WorkspaceStoreError>;
   getConversationBinding(
     conversationScopeId: string,
     targetKey: string,
@@ -184,6 +195,26 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     ));
   }
 
+  listStalePrunedManagedWorktrees(
+    before: Date,
+  ): BetterResult<WorkspaceSession[], WorkspaceStoreError> {
+    return workspaceStoreResult("list_stale_pruned_managed_worktrees", () => (
+      this.database.db
+        .select()
+        .from(workspaceSessions)
+        .where(
+          and(
+            eq(workspaceSessions.status, "pruned"),
+            eq(workspaceSessions.mode, "worktree"),
+            eq(workspaceSessions.managed, "true"),
+            lt(workspaceSessions.lastUsedAt, before.toISOString()),
+          ),
+        )
+        .all()
+        .map(rowToWorkspaceSession)
+    ));
+  }
+
   markSessionPruned(
     id: string,
     recoveryKind?: WorkspaceRecoveryKind,
@@ -242,6 +273,49 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
         .delete(workspaceSessions)
         .where(eq(workspaceSessions.id, id))
         .run();
+    }, id);
+  }
+
+  deleteStaleCheckoutSession(
+    id: string,
+    before: Date,
+  ): BetterResult<boolean, WorkspaceStoreError> {
+    return workspaceStoreResult("delete_stale_checkout_session", () => {
+      const deleted = this.database.db
+        .delete(workspaceSessions)
+        .where(
+          and(
+            eq(workspaceSessions.id, id),
+            eq(workspaceSessions.status, "active"),
+            eq(workspaceSessions.mode, "checkout"),
+            eq(workspaceSessions.managed, "false"),
+            lt(workspaceSessions.lastUsedAt, before.toISOString()),
+          ),
+        )
+        .run();
+      return deleted.changes > 0;
+    }, id);
+  }
+
+  deleteDisposablePrunedWorktreeSession(
+    id: string,
+    before: Date,
+  ): BetterResult<boolean, WorkspaceStoreError> {
+    return workspaceStoreResult("delete_disposable_pruned_worktree_session", () => {
+      const deleted = this.database.db
+        .delete(workspaceSessions)
+        .where(
+          and(
+            eq(workspaceSessions.id, id),
+            eq(workspaceSessions.status, "pruned"),
+            eq(workspaceSessions.mode, "worktree"),
+            eq(workspaceSessions.managed, "true"),
+            isNull(workspaceSessions.recoveryKind),
+            lt(workspaceSessions.lastUsedAt, before.toISOString()),
+          ),
+        )
+        .run();
+      return deleted.changes > 0;
     }, id);
   }
 

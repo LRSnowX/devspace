@@ -460,6 +460,44 @@ export async function deleteManagedWorktreeRecoveryRef(input: {
   });
 }
 
+export async function managedWorktreeRecoveryRefExists(input: {
+  session: WorkspaceSession;
+  allowedRoots: string[];
+}): Promise<BetterResult<boolean, ManagedWorktreeError>> {
+  const { session } = input;
+  if (!session.sourceRoot) {
+    return Result.err(worktreeError(
+      session.id,
+      "WORKTREE_INVALID_STATE",
+      "inspect_recovery_ref",
+      "Cannot inspect managed worktree recovery ref without sourceRoot: " + session.id,
+    ));
+  }
+
+  return captureManagedWorktreeResult(session.id, "inspect_recovery_ref", async () => {
+    const sourceRoot = await assertCleanupSourceRootAllowed(
+      session.sourceRoot!,
+      input.allowedRoots,
+    );
+    try {
+      await execFileAsync(
+        "git",
+        ["show-ref", "--verify", "--quiet", managedWorktreeRecoveryRef(session.id)],
+        { cwd: sourceRoot, maxBuffer: 10 * 1024 * 1024 },
+      );
+      return true;
+    } catch (error) {
+      if (
+        typeof error === "object"
+        && error
+        && "code" in error
+        && (error as { code?: unknown }).code === 1
+      ) return false;
+      throw error;
+    }
+  });
+}
+
 async function assertManagedWorktreePath(worktreePath: string, worktreeRoot: string): Promise<void> {
   const entry = await lstat(worktreePath);
   if (entry.isSymbolicLink()) {

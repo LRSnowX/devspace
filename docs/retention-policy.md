@@ -4,8 +4,9 @@ DevSpace persists workspace identity so MCP clients can resume work across
 server restarts. That state is useful, but it should not grow forever without
 an explicit lifecycle.
 
-This policy deliberately starts with the safest class of persistent metadata:
-stale checkout workspace sessions.
+This policy deliberately handles only workspace metadata whose removal does not
+discard recoverable user work: stale checkout sessions and already-pruned
+managed worktrees that have no recovery metadata or recovery ref.
 
 ## Checkout session policy
 
@@ -16,23 +17,26 @@ Local commands:
     devspace retention prune
     devspace retention prune --json
 
-The default checkout retention window is 90 days since
+The default workspace metadata retention window is 90 days since
 workspace_sessions.last_used_at.
 
 inspect is read-only. prune is always an explicit local operator action;
-DevSpace does not run checkout retention automatically during server startup.
+DevSpace does not run workspace metadata retention automatically during server
+startup.
 
 An eligible record must be:
 
-- an active workspace session;
-- mode = checkout;
-- not a managed worktree;
-- idle longer than 90 days;
-- still valid under the current allowedRoots;
-- not rooted at a location protected by unresolved patch recovery.
+- either an active checkout session idle longer than 90 days, or a pruned
+  managed worktree session idle longer than 90 days;
+- still valid under the current allowedRoots or have a verifiable allowed
+  source repository;
+- not protected by unresolved patch recovery;
+- for a pruned managed worktree, recovery_kind must be empty and
+  refs/devspace/recovery/<workspace-id> must not exist.
 
-Managed worktree sessions, including already-pruned worktrees, are never
-considered by this command.
+A pruned managed worktree with recovery metadata, a recovery ref, or recovery
+state that cannot be verified is reported as protected/skipped and is not
+deleted.
 
 ## What pruning removes
 
@@ -55,6 +59,13 @@ command reports the incomplete cleanup and exits unsuccessfully. Leaving an
 orphan review ref is safer than trying to restore a database row after its
 dependent records have already been removed.
 
+Before deleting a candidate, prune rechecks the persisted lifecycle predicates
+inside the SQLite DELETE itself. A checkout that was touched again, or a
+pruned worktree that was reactivated or gained recovery metadata, is not
+deleted. Such candidates are reported as stateChanged, and their review refs
+are left untouched. This protects an explicit retention command from racing
+with a running DevSpace server.
+
 ## User-visible consequence
 
 A model or old conversation that later reuses a pruned workspace_id receives
@@ -62,24 +73,31 @@ the normal structured WORKSPACE_NOT_FOUND result and can reopen the project
 with open_workspace.
 
 Historical review cards that depend on review history removed by retention may
-no longer be reloadable. This is why checkout retention is explicit rather
-than an invisible startup task.
+no longer be reloadable. This is why workspace metadata retention is explicit
+rather than an invisible startup task.
 
-The project files themselves are never deleted by checkout retention.
+Project files themselves are never deleted by workspace metadata retention. A
+disposable pruned managed worktree has already had its managed worktree
+directory removed by the separate worktree-cleanup lifecycle.
 
 ## Protected and deferred state
 
 This command does not prune:
 
-- active or pruned managed worktree sessions;
+- active managed worktree sessions;
+- pruned managed worktree sessions that carry recovery_kind;
+- pruned managed worktree sessions with a recovery ref;
+- pruned managed worktree sessions whose recovery state cannot be verified;
 - refs/devspace/recovery/*;
 - unresolved patch transactions or their recovery artifacts;
 - local-agent session or turn history;
 - OAuth clients or tokens.
 
-Managed worktree sessions can carry the metadata needed to restore an isolated
-workspace at its prior base commit or from a preserved recovery ref. Their
-lifecycle therefore requires a separate recovery-aware policy.
+Recoverable managed worktree sessions can carry the metadata needed to restore
+an isolated workspace from a preserved recovery ref. Those sessions remain
+outside destructive retention. Only already-pruned sessions proven to have no
+recovery metadata/ref are treated as disposable metadata; reopening the project
+can create a fresh equivalent worktree.
 
 When a pruned managed worktree is successfully restored and its persisted
 session is successfully reactivated, DevSpace now best-effort retires the old

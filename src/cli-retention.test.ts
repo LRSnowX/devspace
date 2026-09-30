@@ -7,13 +7,13 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { databasePath } from "./db/client.js";
-import { DEFAULT_CHECKOUT_SESSION_RETENTION_MS } from "./retention.js";
+import { DEFAULT_WORKSPACE_METADATA_RETENTION_MS } from "./retention.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 
 const cliPath = fileURLToPath(new URL("./cli.ts", import.meta.url));
 
-test("retention CLI inspects and explicitly prunes stale checkout sessions", () => {
+test("retention CLI inspects and explicitly prunes safe stale workspace metadata", () => {
   const root = mkdtempSync(join(tmpdir(), "devspace-cli-retention-test-"));
   try {
     const stateDir = join(root, "state");
@@ -37,7 +37,7 @@ test("retention CLI inspects and explicitly prunes stale checkout sessions", () 
     store.close();
 
     const staleAt = new Date(
-      Date.now() - DEFAULT_CHECKOUT_SESSION_RETENTION_MS - 60_000,
+      Date.now() - DEFAULT_WORKSPACE_METADATA_RETENTION_MS - 60_000,
     ).toISOString();
     const sqlite = new Database(databasePath(stateDir));
     sqlite.prepare(
