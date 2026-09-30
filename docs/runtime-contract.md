@@ -102,6 +102,9 @@ the corresponding regression coverage in the same change.
 - Managed-worktree cleanup also preserves roots with unresolved patch recovery
   state, so retention pruning cannot remove the filesystem evidence required
   for local recovery.
+- After a pruned managed worktree is restored and its session is reactivated,
+  the old managed-worktree recovery ref is deleted best-effort. Failure to
+  delete that now-redundant ref does not invalidate the successful restore.
 - A committed transaction whose project state is already final but whose
   recovery-artifact cleanup cannot be completed may also be explicitly cleared
   with `--accept-current`; this never rewrites project target files.

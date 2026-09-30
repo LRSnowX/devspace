@@ -114,11 +114,16 @@ Stale checkout workspace metadata now has a conservative product policy:
 This addresses the largest monotonically growing workspace class without
 mixing it with recoverable worktree state.
 
-The remaining retention gap is managed-worktree recovery metadata. A pruned
-worktree can depend on both its persisted session and
-refs/devspace/recovery/<workspace-id>, and successful restoration currently
-does not retire an existing recovery ref. That lifecycle needs its own
-recovery-aware slice before any automatic deletion policy is considered.
+Managed-worktree recovery refs now retire best-effort after a pruned worktree
+has been restored and its persisted session has successfully returned to the
+active state. Cleanup deliberately happens after reactivation so a persistence
+failure cannot destroy the only recovery anchor.
+
+The remaining retention question is aged pruned worktrees that are never
+restored. Their session plus refs/devspace/recovery/<workspace-id> may be the
+only surviving copy of isolated work. Any policy that discards that state must
+therefore be explicit and recovery-aware; it is not suitable for automatic
+startup TTL cleanup.
 
 ## Deliberate non-goals
 

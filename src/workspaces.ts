@@ -13,11 +13,13 @@ import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
 import {
   createManagedWorktree,
+  deleteManagedWorktreeRecoveryRef,
   discardRestoredManagedWorktree,
   ManagedWorktreeError,
   restoreManagedWorktree,
   type ManagedWorktreeFeatureError,
 } from "./git-worktrees.js";
+import { logEvent } from "./logger.js";
 import {
   AccessDeniedError,
   assertAllowedPath,
@@ -400,6 +402,20 @@ export class WorkspaceRegistry {
         operation: "reactivate",
         message: `Restored workspace ${session.id}, but its persisted session could not be reactivated.`,
       }));
+    }
+
+    if (session.recoveryKind) {
+      const cleanup = await deleteManagedWorktreeRecoveryRef({
+        session,
+        allowedRoots: this.config.allowedRoots,
+      });
+      if (cleanup.isErr()) {
+        logEvent(this.config.logging, "warn", "managed_worktree_recovery_ref_cleanup_failed", {
+          workspaceId: session.id,
+          error: cleanup.error.message,
+          operation: cleanup.error.operation,
+        });
+      }
     }
 
     return Result.ok(undefined);

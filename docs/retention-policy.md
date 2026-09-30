@@ -81,10 +81,20 @@ Managed worktree sessions can carry the metadata needed to restore an isolated
 workspace at its prior base commit or from a preserved recovery ref. Their
 lifecycle therefore requires a separate recovery-aware policy.
 
-Likewise, successful managed-worktree restoration currently does not retire an
-existing refs/devspace/recovery/<workspace-id> ref. Recovery-ref lifecycle is
-the next retention problem to solve independently rather than folding it into
-checkout-session pruning.
+When a pruned managed worktree is successfully restored and its persisted
+session is successfully reactivated, DevSpace now best-effort retires the old
+refs/devspace/recovery/<workspace-id> ref. Cleanup happens only after the live
+worktree and active session are both established, so a database reactivation
+failure cannot strand the recovery data.
+
+If that final ref deletion fails, the restored workspace remains usable and a
+warning is logged; the redundant ref is safer to retain than to turn a
+successful restore into a failure.
+
+The remaining product question is retention for pruned worktrees that are never
+restored. Those rows and recovery refs may represent the only remaining copy of
+isolated work, so deleting them requires an explicit recovery-aware discard
+policy rather than a background TTL.
 
 ## Why there is no retention config knob yet
 

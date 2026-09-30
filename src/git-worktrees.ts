@@ -437,6 +437,29 @@ export function managedWorktreeRecoveryRef(workspaceId: string): string {
   return `refs/devspace/recovery/${workspaceId}`;
 }
 
+export async function deleteManagedWorktreeRecoveryRef(input: {
+  session: WorkspaceSession;
+  allowedRoots: string[];
+}): Promise<BetterResult<void, ManagedWorktreeError>> {
+  const { session } = input;
+  if (!session.sourceRoot) {
+    return Result.err(worktreeError(
+      session.id,
+      "WORKTREE_INVALID_STATE",
+      "delete_recovery_ref",
+      "Cannot delete managed worktree recovery ref without sourceRoot: " + session.id,
+    ));
+  }
+
+  return captureManagedWorktreeResult(session.id, "delete_recovery_ref", async () => {
+    const sourceRoot = await assertCleanupSourceRootAllowed(
+      session.sourceRoot!,
+      input.allowedRoots,
+    );
+    await git(["update-ref", "-d", managedWorktreeRecoveryRef(session.id)], sourceRoot);
+  });
+}
+
 async function assertManagedWorktreePath(worktreePath: string, worktreeRoot: string): Promise<void> {
   const entry = await lstat(worktreePath);
   if (entry.isSymbolicLink()) {

@@ -7,7 +7,11 @@ import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { Result, type Result as BetterResult } from "better-result";
 import { loadConfig, type ServerConfig } from "./config.js";
-import { cleanupManagedWorktrees, GitWorktreeError } from "./git-worktrees.js";
+import {
+  cleanupManagedWorktrees,
+  GitWorktreeError,
+  managedWorktreeRecoveryRef,
+} from "./git-worktrees.js";
 import {
   SqliteWorkspaceStore,
   type WorkspaceStoreError,
@@ -187,12 +191,18 @@ test("using a pruned workspace id restores its tracked worktree state", async (t
 
   assert.equal(store.getSession(workspaceId)?.status, "pruned");
   await assert.rejects(() => stat(worktreePath), /ENOENT/);
+  const recoveryRef = managedWorktreeRecoveryRef(workspaceId);
+  assert.ok(
+    (await git(gitRoot, ["show-ref", "--verify", recoveryRef]))
+      .endsWith(" " + recoveryRef),
+  );
 
   const restored = await registry.getWorkspace(workspaceId);
   assert.equal(restored.id, workspaceId);
   assert.equal(restored.root, worktreePath);
   assert.equal(store.getSession(workspaceId)?.status, "active");
   assert.equal(await git(worktreePath, ["status", "--short"]), "MM README.md");
+  await assert.rejects(() => git(gitRoot, ["show-ref", "--verify", recoveryRef]));
 });
 
 test("concurrent lookups share one pruned workspace restoration", async (t) => {
