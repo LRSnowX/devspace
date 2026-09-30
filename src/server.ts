@@ -229,19 +229,7 @@ function formatAvailableAgentProvider(provider: {
   return `${provider.id}${details ? ` (${details})` : ""}`;
 }
 
-function readErrorResponse(payload: ToolErrorPayload) {
-  const content = [textBlock(payload.message)];
-  return {
-    content,
-    structuredContent: {
-      result: payload.message,
-      status: "error" as const,
-      error: payload,
-    },
-  };
-}
-
-function openWorkspaceErrorResponse(payload: ToolErrorPayload) {
+function toolErrorResponse(payload: ToolErrorPayload) {
   const content = [textBlock(payload.message)];
   return {
     content,
@@ -592,7 +580,7 @@ function registerMcpSurface(
       } catch (error) {
         const payload = toolErrorPayload(error);
         if (!payload) throw error;
-        const result = openWorkspaceErrorResponse(payload);
+        const result = toolErrorResponse(payload);
         logFailedToolResponse(config, {
           tool: "open_workspace",
           path,
@@ -803,7 +791,15 @@ function registerMcpSurface(
         annotations: { readOnlyHint: true },
       },
       async ({ workspace_id, query, limit }) => {
-        const { project, authorizationKey } = await memoryProjectForWorkspace(workspace_id);
+        let memoryWorkspace;
+        try {
+          memoryWorkspace = await memoryProjectForWorkspace(workspace_id);
+        } catch (error) {
+          const payload = toolErrorPayload(error);
+          if (!payload) throw error;
+          return toolErrorResponse(payload);
+        }
+        const { project, authorizationKey } = memoryWorkspace;
         const result = await memory.call("memory_search", { project, query, limit });
         memoryThreadAuthorizations.authorize(
           authorizationKey,
@@ -826,9 +822,24 @@ function registerMcpSurface(
         annotations: { readOnlyHint: true },
       },
       async ({ workspace_id, conversation_id, message_offset, message_limit }) => {
-        const { authorizationKey } = await memoryProjectForWorkspace(workspace_id);
+        let memoryWorkspace;
+        try {
+          memoryWorkspace = await memoryProjectForWorkspace(workspace_id);
+        } catch (error) {
+          const payload = toolErrorPayload(error);
+          if (!payload) throw error;
+          return toolErrorResponse(payload);
+        }
+        const { authorizationKey } = memoryWorkspace;
         if (!memoryThreadAuthorizations.isAuthorized(authorizationKey, conversation_id)) {
-          throw new Error("Memory thread is not authorized by this project's memory discovery. Search again after a server restart.");
+          return toolErrorResponse({
+            code: "MEMORY_THREAD_NOT_AUTHORIZED",
+            category: "scope",
+            message:
+              `Memory thread is not authorized for this project: ${conversation_id}. Run memory_search for this project and retry only with a returned conversation/evidence ID.`,
+            retryable: true,
+            conversation_id,
+          });
         }
         return memory.call("memory_get_thread", {
           conversation_id,
@@ -903,7 +914,7 @@ function registerMcpSurface(
       } catch (error) {
         const payload = toolErrorPayload(error);
         if (!payload) throw error;
-        const result = readErrorResponse(payload);
+        const result = toolErrorResponse(payload);
         logFailedToolResponse(config, {
           tool: toolNames.read,
           workspaceId,
@@ -913,7 +924,7 @@ function registerMcpSurface(
       }
 
       if (response.toolError) {
-        const result = readErrorResponse(response.toolError);
+        const result = toolErrorResponse(response.toolError);
         logFailedToolResponse(config, {
           tool: toolNames.read,
           workspaceId,

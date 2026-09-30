@@ -258,6 +258,8 @@ When Memory is configured:
 - `memory_get_thread` expands only evidence IDs authorized by the current
   project's bootstrap/search discovery. Authorization is bounded,
   process-local, and reset by server restart.
+- An expansion outside that authorization boundary returns the structured
+  `MEMORY_THREAD_NOT_AUTHORIZED` scope error without exposing thread contents.
 
 ### Current limitation
 

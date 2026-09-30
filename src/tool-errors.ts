@@ -14,6 +14,7 @@ export const TOOL_ERROR_CODES = [
   "PROJECT_NOT_DIRECTORY",
   "WORKSPACE_NOT_FOUND",
   "WORKSPACE_INVALIDATED",
+  "MEMORY_THREAD_NOT_AUTHORIZED",
   "PROCESS_SESSION_NOT_FOUND",
   "PROCESS_SESSION_SCOPE_MISMATCH",
   "PROCESS_SESSION_NOT_INTERACTIVE",
@@ -45,6 +46,7 @@ export interface ToolErrorPayload {
   expected_state?: "absent" | "present";
   current_state?: "absent" | "present";
   recovery_files?: string[];
+  conversation_id?: string;
   session_id?: number;
   repeat_count?: number;
   previous_error_code?: ToolErrorCode;
@@ -62,6 +64,7 @@ export const toolErrorPayloadSchema = z.object({
   expected_state: z.enum(["absent", "present"]).optional(),
   current_state: z.enum(["absent", "present"]).optional(),
   recovery_files: z.array(z.string()).optional(),
+  conversation_id: z.string().optional(),
   session_id: z.number().int().positive().optional(),
   repeat_count: z.number().int().positive().optional(),
   previous_error_code: z.enum(TOOL_ERROR_CODES).optional(),

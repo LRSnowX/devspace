@@ -106,8 +106,10 @@ entry. The default budget is 12288 bytes, and no full thread is injected.
 When enabled, the only model-facing Memory tools are `memory_search` and
 `memory_get_thread`. The latter accepts only conversation/evidence IDs previously
 discovered for the current workspace project in this server process. This
-bounded authorization expires on restart. CHIM project search is a relevance
-filter, not a strict project-membership security boundary.
+bounded authorization expires on restart; attempts to expand another ID return
+`MEMORY_THREAD_NOT_AUTHORIZED` and should be retried only after project-scoped
+discovery returns that ID. CHIM project search is a relevance filter, not a
+strict project-membership security boundary.
 
 `oauth.allowedResourceUrls` accepts exact alternate MCP resource URLs for
 clients that connect through a resource alias, such as a secure MCP tunnel.

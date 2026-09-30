@@ -1,10 +1,10 @@
 # Tool error contract
 
 DevSpace distinguishes expected tool-operation failures from MCP protocol
-failures. Expected `open_workspace`, `read`, Claude mutation-path, Codex
-`apply_patch`, and process-session failures remain visible to the model as
-ordinary tool results with an explicit domain status and stable
-machine-readable payload.
+failures. Expected `open_workspace`, Memory authorization/workspace,
+`read`, Claude mutation-path, Codex `apply_patch`, and process-session
+failures remain visible to the model as ordinary tool results with an explicit
+domain status and stable machine-readable payload.
 
 This is intentional host-compatibility behavior. The current ChatGPT MCP host
 converts `isError: true` tool results into connector exceptions and drops
@@ -29,6 +29,7 @@ error: {
   expected_state?,
   current_state?,
   recovery_files?,
+  conversation_id?,
   session_id?,
   repeat_count?,
   previous_error_code?
@@ -51,6 +52,9 @@ do not include an `error` payload.
 Successful Claude `write` and `edit` mutations use `status: "applied"`.
 
 Successful `open_workspace` calls use `status: "opened"`.
+
+Memory success results remain the read-only CHIM payload unchanged. Classified
+local Memory failures use the common `status: "error"` envelope.
 
 ## open_workspace project-entry codes
 
@@ -89,6 +93,28 @@ workspace id or root.
 Git/worktree-specific failures such as a non-Git source or invalid base ref are
 not classified in this phase. They remain transport errors until those
 dependency-owned semantics have a stable typed signal.
+
+## Memory codes
+
+`memory_search` and `memory_get_thread` reuse typed workspace lifecycle
+errors such as `WORKSPACE_NOT_FOUND` and `WORKSPACE_INVALIDATED`.
+
+`memory_get_thread` additionally exposes:
+
+- `MEMORY_THREAD_NOT_AUTHORIZED`
+  - category: `scope`
+  - retryable: true after discovery
+  - the requested conversation/evidence ID was not authorized for the current
+    project by this process's bounded bootstrap/search discovery.
+  - includes `conversation_id`.
+  - callers should run `memory_search` for the current project (or reopen the
+    workspace when bootstrap discovery is appropriate) and retry only with an
+    ID actually returned by discovery.
+
+This error does not change CHIM's relevance semantics. DevSpace still treats
+project relevance as a heuristic and enforces only the existing bounded,
+process-local expansion authorization boundary. CHIM transport/tool failures
+remain unclassified and are still surfaced as MCP failures.
 
 ## read codes
 
@@ -265,7 +291,8 @@ For expected classified failures:
   process failures report `running: false`, `wall_time_ms: 0`, and no exit
   code or signal; read failures omit `revision`; Claude mutation path failures
   omit success-specific mutation details; `open_workspace` failures omit
-  workspace identity and review fields.
+  workspace identity and review fields; Memory authorization failures preserve
+  the requested `conversation_id` but do not expose thread contents.
 
 Unexpected programmer defects, transport failures, and other uncategorized
 internal exceptions are still thrown rather than falsely classified. They remain
@@ -279,8 +306,8 @@ and other lifecycle fields with `status: "completed"` and no domain error.
 
 ## Scope
 
-This phase standardizes `open_workspace` project-entry failures, `read`,
-Claude mutation path failures, `apply_patch`, plus Codex process-session
-misuse and the domain errors those surfaces consume. Other coding tools may
-migrate to the same payload incrementally; they should not be classified by
+This phase standardizes `open_workspace` project-entry failures, local Memory
+authorization/workspace failures, `read`, Claude mutation path failures,
+`apply_patch`, plus Codex process-session misuse and the domain errors those
+surfaces consume. Dependency-owned tool semantics should not be classified by
 brittle message matching.

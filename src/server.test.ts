@@ -1266,8 +1266,25 @@ test("modern MCP memory discovery authorizes evidence across stateless requests"
     arguments: { workspace_id: workspaceId, conversation_id: "foreign-id" },
   });
   assert.equal(denied.status, 200, await denied.clone().text());
-  const deniedBody = await denied.json() as { result?: { isError?: boolean } };
-  assert.equal(deniedBody.result?.isError, true);
+  const deniedBody = await denied.json() as {
+    result?: {
+      isError?: boolean;
+      structuredContent?: {
+        status?: string;
+        error?: { code?: string; conversation_id?: string };
+      };
+    };
+  };
+  assert.notEqual(deniedBody.result?.isError, true);
+  assert.equal(deniedBody.result?.structuredContent?.status, "error");
+  assert.equal(
+    deniedBody.result?.structuredContent?.error?.code,
+    "MEMORY_THREAD_NOT_AUTHORIZED",
+  );
+  assert.equal(
+    deniedBody.result?.structuredContent?.error?.conversation_id,
+    "foreign-id",
+  );
 });
 
 test("server shutdown waits for an active MCP tool call", async (t) => {
@@ -1458,6 +1475,20 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   });
   const names = (await context.client.listTools()).tools.map((tool) => tool.name);
   assert.deepEqual(names.filter((name) => name.startsWith("memory_")).sort(), ["memory_get_thread", "memory_search"]);
+  for (const name of ["memory_search", "memory_get_thread"] as const) {
+    const missingWorkspace = await context.client.callTool({
+      name,
+      arguments: name === "memory_search"
+        ? { workspace_id: "ws_missing", query: "history" }
+        : { workspace_id: "ws_missing", conversation_id: "foreign-id" },
+    });
+    assert.notEqual(missingWorkspace.isError, true);
+    assert.equal(structuredContent(missingWorkspace).status, "error");
+    assert.equal(
+      (structuredContent(missingWorkspace).error as { code?: string }).code,
+      "WORKSPACE_NOT_FOUND",
+    );
+  }
   const opened = structuredContent(await callOpen(context.client, "Lemon", "memory-session"));
   const workspaceId = opened.workspace_id as string;
   const bootstrap = opened.memory_context as Record<string, unknown>;
@@ -1469,7 +1500,20 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
     name: "memory_get_thread",
     arguments: { workspace_id: workspaceId, conversation_id: "foreign-id" },
   });
-  assert.equal(denied.isError, true);
+  assert.notEqual(denied.isError, true);
+  assert.deepEqual(structuredContent(denied), {
+    result:
+      "Memory thread is not authorized for this project: foreign-id. Run memory_search for this project and retry only with a returned conversation/evidence ID.",
+    status: "error",
+    error: {
+      code: "MEMORY_THREAD_NOT_AUTHORIZED",
+      category: "scope",
+      message:
+        "Memory thread is not authorized for this project: foreign-id. Run memory_search for this project and retry only with a returned conversation/evidence ID.",
+      retryable: true,
+      conversation_id: "foreign-id",
+    },
+  });
   const bootstrapThread = await context.client.callTool({
     name: "memory_get_thread",
     arguments: { workspace_id: workspaceId, conversation_id: "LEMonX-evidence", message_offset: 0, message_limit: 1 },
@@ -1494,7 +1538,16 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
     name: "memory_get_thread",
     arguments: { workspace_id: other.workspace_id, conversation_id: "LEMonX-search-evidence" },
   });
-  assert.equal(crossProject.isError, true);
+  assert.notEqual(crossProject.isError, true);
+  assert.equal(structuredContent(crossProject).status, "error");
+  assert.deepEqual(structuredContent(crossProject).error, {
+    code: "MEMORY_THREAD_NOT_AUTHORIZED",
+    category: "scope",
+    message:
+      "Memory thread is not authorized for this project: LEMonX-search-evidence. Run memory_search for this project and retry only with a returned conversation/evidence ID.",
+    retryable: true,
+    conversation_id: "LEMonX-search-evidence",
+  });
 });
 
 test("memory tools remain common to both upstream tool surfaces", async (t) => {

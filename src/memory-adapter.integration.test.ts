@@ -101,7 +101,11 @@ test(
             message_limit: 1,
           },
         });
-        assert.equal(denied.isError, true);
+        assert.notEqual(denied.isError, true);
+        assert.equal(readString(denied.structuredContent, "status"), "error");
+        const error = readRecord(readRecord(denied.structuredContent)?.error);
+        assert.equal(readString(error, "code"), "MEMORY_THREAD_NOT_AUTHORIZED");
+        assert.equal(readString(error, "conversation_id"), foreignConversationId);
       }
 
       const search = await client.callTool({

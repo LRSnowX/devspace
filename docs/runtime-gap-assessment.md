@@ -77,13 +77,22 @@ schema because the current MCP Apps registration/adapter path does not preserve
 successful `structuredContent` reliably with the union form. Git/worktree
 semantics remain outside this slice unless they expose a stable typed signal.
 
-## Priority 1: structured errors for the remaining coding surface
+## Completed after this assessment: structured Memory authorization errors
 
-`open_workspace` project entry, `read`, Claude mutation path failures, Codex
-`apply_patch`, and process-session misuse now have a host-compatible
-structured domain-error contract. The remaining first-party expected failure in
-this assessment is unauthorized Memory thread expansion; dependency-owned tool
-semantics without a stable typed signal remain intentionally unclassified.
+`memory_get_thread` now returns `MEMORY_THREAD_NOT_AUTHORIZED` as an ordinary
+structured domain result when a conversation/evidence ID was not discovered for
+the current project. The payload includes `conversation_id` and is retryable
+only after project-scoped discovery. Both Memory tools also preserve existing
+typed workspace lifecycle failures as domain results. CHIM failures themselves
+remain untouched.
+
+## Priority 1 complete: structured first-party expected failures
+
+`open_workspace` project entry, local Memory authorization/workspace failures,
+`read`, Claude mutation path failures, Codex `apply_patch`, and
+process-session misuse now have a host-compatible structured domain-error
+contract. Dependency-owned tool semantics without a stable typed signal remain
+intentionally unclassified.
 
 Extending the taxonomy would improve model self-correction, but it is primarily
 an ergonomics and reliability improvement rather than a current data-integrity
