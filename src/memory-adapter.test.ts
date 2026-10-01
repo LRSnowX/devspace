@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   MemoryAdapter,
   MemoryThreadAuthorizationStore,
@@ -9,7 +10,7 @@ import {
   memoryEvidenceIdsFromSearchResult,
 } from "./memory-adapter.js";
 
-function projectContext(snippet = "state"): Record<string, unknown> {
+function projectContext(snippet = "state"): CallToolResult {
   const hit = {
     result: {
       conversation_id: "parent-1",
@@ -48,35 +49,55 @@ test("memory bootstrap rejects malformed responses", () => {
   );
 });
 
-test("memory bootstrap prioritizes the latest continuation tail within its byte budget", () => {
+test("memory bootstrap preserves recent continuation tails within its byte budget", () => {
   const raw = projectContext() as {
     structuredContent: Record<string, unknown>;
   };
-  raw.structuredContent.continuation = {
-    conversation_id: "continuation-1",
-    source: "chatgpt",
-    title: "Latest project chat",
-    update_time: 99,
-    message_offset: 10,
-    returned_messages: 8,
-    total_messages: 18,
-    messages: Array.from({ length: 8 }, (_, index) => ({
-      role: index % 2 === 0 ? "user" : "assistant",
-      create_time: 90 + index,
-      turn_index: 10 + index,
-      text: `message-${index}-${"x".repeat(1_000)}`,
-    })),
-  };
+  raw.structuredContent.continuations = [
+    {
+      conversation_id: "continuation-1",
+      source: "chatgpt",
+      title: "Current project chat",
+      update_time: 100,
+      message_offset: 0,
+      returned_messages: 3,
+      total_messages: 3,
+      messages: Array.from({ length: 3 }, (_, index) => ({
+        role: index % 2 === 0 ? "user" : "assistant",
+        create_time: 100 + index,
+        turn_index: index,
+        text: `current-${index}-${"x".repeat(200)}`,
+      })),
+    },
+    {
+      conversation_id: "continuation-2",
+      source: "chatgpt",
+      title: "Previous project chat",
+      update_time: 99,
+      message_offset: 10,
+      returned_messages: 8,
+      total_messages: 18,
+      messages: Array.from({ length: 8 }, (_, index) => ({
+        role: index % 2 === 0 ? "user" : "assistant",
+        create_time: 90 + index,
+        turn_index: 10 + index,
+        text: `previous-${index}-${"x".repeat(1_000)}`,
+      })),
+    },
+  ];
 
   const context = compactMemoryBootstrapContext(raw, "Jack", 4_096);
   assert.ok(Buffer.byteLength(JSON.stringify(context), "utf8") <= 4_096);
-  assert.ok(context.continuation);
-  assert.equal(context.continuation.conversationId, "continuation-1");
-  assert.equal(context.continuation.messages.at(-1)?.turnIndex, 17);
-  assert.ok(context.continuation.messages.length > 0);
-  assert.ok(context.continuation.messageOffset >= 10);
+  assert.equal(context.continuations.length, 2);
+  assert.equal(context.continuations[0]?.conversationId, "continuation-1");
+  assert.equal(context.continuations[0]?.messages.length, 3);
+  assert.equal(context.continuations[1]?.conversationId, "continuation-2");
+  assert.equal(context.continuations[1]?.messages.at(-1)?.turnIndex, 17);
+  assert.ok((context.continuations[1]?.messages.length ?? 0) > 0);
+  assert.ok((context.continuations[1]?.messageOffset ?? 0) >= 10);
   assert.equal(context.truncated, true);
   assert.ok(memoryEvidenceIdsFromBootstrapContext(context).includes("continuation-1"));
+  assert.ok(memoryEvidenceIdsFromBootstrapContext(context).includes("continuation-2"));
 });
 
 test("memory adapter removes rmcp mirrored JSON text when structured content is identical", () => {
@@ -143,6 +164,26 @@ test("memory thread authorization evicts old projects", () => {
   assert.equal(store.isAuthorized("first", "one"), false);
   assert.equal(store.isAuthorized("second", "two"), true);
   assert.equal(store.isAuthorized("third", "three"), true);
+});
+
+test("memory bootstrap skips semantic retrieval and requests only recent continuation context", async () => {
+  const adapter = new MemoryAdapter({
+    enabled: true,
+    command: "/bin/false",
+    bootstrapTimeoutMs: 5_000,
+    bootstrapByteBudget: 12_288,
+  });
+  let observedArgs: Record<string, unknown> | undefined;
+  adapter.call = async (_toolName, args) => {
+    observedArgs = args;
+    return projectContext();
+  };
+
+  await adapter.bootstrapProjectContext("Jack");
+  assert.equal(observedArgs?.project, "Jack");
+  assert.equal(observedArgs?.relevant_limit, 0);
+  assert.equal(observedArgs?.recent_limit, 3);
+  assert.equal(observedArgs?.continuation_message_limit, 8);
 });
 
 test("memory bootstrap enforces its timeout", async () => {

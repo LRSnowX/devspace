@@ -187,7 +187,7 @@ const memoryBootstrapContinuationOutputSchema = z.object({
 const memoryBootstrapContextOutputSchema = z.object({
   project: z.string(),
   source_policy: z.string(),
-  continuation: memoryBootstrapContinuationOutputSchema.optional(),
+  continuations: z.array(memoryBootstrapContinuationOutputSchema),
   relevant: z.array(memoryBootstrapHitOutputSchema),
   recent: z.array(memoryBootstrapHitOutputSchema),
   truncated: z.boolean(),
@@ -207,23 +207,21 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
   const output = {
     project: context.project,
     source_policy: context.sourcePolicy,
-    continuation: context.continuation
-      ? {
-          conversation_id: context.continuation.conversationId,
-          source: context.continuation.source,
-          title: context.continuation.title,
-          update_time: context.continuation.updateTime,
-          message_offset: context.continuation.messageOffset,
-          returned_messages: context.continuation.messages.length,
-          total_messages: context.continuation.totalMessages,
-          messages: context.continuation.messages.map((message) => ({
+    continuations: context.continuations.map((continuation) => ({
+          conversation_id: continuation.conversationId,
+          source: continuation.source,
+          title: continuation.title,
+          update_time: continuation.updateTime,
+          message_offset: continuation.messageOffset,
+          returned_messages: continuation.messages.length,
+          total_messages: continuation.totalMessages,
+          messages: continuation.messages.map((message) => ({
             role: message.role,
             create_time: message.createTime,
             turn_index: message.turnIndex,
             text: message.text,
           })),
-        }
-      : undefined,
+        })),
     relevant: context.relevant.map(mapHit),
     recent: context.recent.map(mapHit),
     truncated: context.truncated,
@@ -232,12 +230,15 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
   while (Buffer.byteLength(JSON.stringify(output), "utf8") > byteBudget) {
     if (output.recent.length > 0) output.recent.pop();
     else if (output.relevant.length > 0) output.relevant.pop();
-    else if (output.continuation && output.continuation.messages.length > 1) {
-      output.continuation.messages.shift();
-      output.continuation.message_offset += 1;
-      output.continuation.returned_messages = output.continuation.messages.length;
+    else {
+      const continuation = [...output.continuations]
+        .reverse()
+        .find((candidate) => candidate.messages.length > 1);
+      if (!continuation) throw new Error("Memory bootstrap byte budget is too small for its envelope");
+      continuation.messages.shift();
+      continuation.message_offset += 1;
+      continuation.returned_messages = continuation.messages.length;
     }
-    else throw new Error("Memory bootstrap byte budget is too small for its envelope");
     output.truncated = true;
   }
   return output;
@@ -743,8 +744,8 @@ function registerMcpSurface(
           });
         }
       }
-      const memoryInstruction = memoryContext?.continuation
-        ? "Treat structuredContent.memory_context.continuation as prior-conversation context for this project. Continue from it without waiting for the user to ask you to search memory; use memory_search only when additional history is needed."
+      const memoryInstruction = memoryContext?.continuations.length
+        ? "Treat structuredContent.memory_context.continuations as prior-conversation context for this project. Continue from them without waiting for the user to ask you to search memory; use memory_search only when additional history is needed."
         : memoryContext
           ? "Use structuredContent.memory_context as bounded prior project context; use memory_search when additional history is needed."
           : undefined;
@@ -802,8 +803,8 @@ function registerMcpSurface(
             visibleAgents.length > 0
               ? `Available subagent profiles: ${visibleAgents.map(formatVisibleAgent).join(", ")}`
               : undefined,
-            memoryContext?.continuation
-              ? "Automatic continuation memory from the latest project conversation is available in structuredContent.memory_context.continuation."
+            memoryContext?.continuations.length
+              ? "Automatic continuation memory from recent project conversations is available in structuredContent.memory_context.continuations."
               : memoryContext
                 ? "Bounded project memory context is available in structuredContent.memory_context."
                 : undefined,
@@ -923,7 +924,7 @@ function registerMcpSurface(
           workspace_id: z.string().describe(workspaceIdDescription),
           conversation_id: z.string().trim().min(1),
           message_offset: z.number().int().nonnegative().optional(),
-          message_limit: z.number().int().positive().max(250).optional(),
+          message_limit: z.number().int().positive().max(16).optional(),
         },
         annotations: { readOnlyHint: true },
       },

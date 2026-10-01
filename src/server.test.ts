@@ -1373,28 +1373,46 @@ function fakeMemory(bootstrapFailure?: Error): MemoryClient {
       return {
         project,
         sourcePolicy: "relevance-filter",
-        continuation: {
-          conversationId: `${project}-continuation`,
-          source: "chatgpt",
-          title: "Latest project conversation",
-          updateTime: 43,
-          messageOffset: 5,
-          totalMessages: 7,
-          messages: [
-            {
-              role: "user",
-              createTime: 42,
-              turnIndex: 5,
-              text: "Continue the implementation from the accepted plan.",
-            },
-            {
-              role: "assistant",
-              createTime: 43,
-              turnIndex: 6,
-              text: "The next step is the bounded implementation slice.",
-            },
-          ],
-        },
+        continuations: [
+          {
+            conversationId: `${project}-continuation`,
+            source: "chatgpt",
+            title: "Latest project conversation",
+            updateTime: 43,
+            messageOffset: 5,
+            totalMessages: 7,
+            messages: [
+              {
+                role: "user",
+                createTime: 42,
+                turnIndex: 5,
+                text: "Continue the implementation from the accepted plan.",
+              },
+              {
+                role: "assistant",
+                createTime: 43,
+                turnIndex: 6,
+                text: "The next step is the bounded implementation slice.",
+              },
+            ],
+          },
+          {
+            conversationId: `${project}-previous`,
+            source: "chatgpt",
+            title: "Previous project conversation",
+            updateTime: 41,
+            messageOffset: 8,
+            totalMessages: 10,
+            messages: [
+              {
+                role: "assistant",
+                createTime: 41,
+                turnIndex: 9,
+                text: "The previous conversation ended after the preflight was accepted.",
+              },
+            ],
+          },
+        ],
         relevant: [{
           conversationId: `${project}-parent`,
           evidenceConversationId: `${project}-evidence`,
@@ -1543,10 +1561,12 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.ok(Buffer.byteLength(JSON.stringify(bootstrap), "utf8") <= 12_288);
   assert.equal(bootstrap.byte_budget, 12_288);
   assert.equal("messages" in bootstrap, false);
-  const continuation = bootstrap.continuation as Record<string, unknown>;
-  assert.equal(continuation.conversation_id, "LEMonX-continuation");
-  assert.equal(continuation.returned_messages, 2);
-  assert.ok(Array.isArray(continuation.messages));
+  const continuations = bootstrap.continuations as Array<Record<string, unknown>>;
+  assert.equal(continuations.length, 2);
+  assert.equal(continuations[0]?.conversation_id, "LEMonX-continuation");
+  assert.equal(continuations[0]?.returned_messages, 2);
+  assert.ok(Array.isArray(continuations[0]?.messages));
+  assert.equal(continuations[1]?.conversation_id, "LEMonX-previous");
   const denied = await context.client.callTool({
     name: "memory_get_thread",
     arguments: { workspace_id: workspaceId, conversation_id: "foreign-id" },
@@ -1578,6 +1598,11 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.equal(structuredContent(latestThread).message_limit, 8);
   assert.equal(structuredContent(latestThread).tail, true);
   assert.equal(structuredContent(latestThread).message_offset, undefined);
+  const previousThread = await context.client.callTool({
+    name: "memory_get_thread",
+    arguments: { workspace_id: workspaceId, conversation_id: "LEMonX-previous" },
+  });
+  assert.notEqual(previousThread.isError, true);
   const search = await context.client.callTool({
     name: "memory_search",
     arguments: { workspace_id: workspaceId, query: "历史决策", limit: 2 },

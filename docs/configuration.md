@@ -102,10 +102,15 @@ Memory is opt-in through the `memory` section of the versioned config. Set
 `open_workspace` returns at most `bootstrapByteBudget` bytes of compact
 `memory_context` after a `bootstrapTimeoutMs` (default 5000 ms) attempt;
 unavailable, timed-out, or malformed Memory responses do not block workspace
-entry. The default budget is 12288 bytes, and no full thread is injected.
+entry. The default budget is 12288 bytes. The bootstrap may include bounded
+`continuations` from the most recent project conversations so a new host
+conversation can continue recent work without an explicit history lookup; full
+threads are never injected automatically.
 When enabled, the only model-facing Memory tools are `memory_search` and
 `memory_get_thread`. The latter accepts only conversation/evidence IDs previously
-discovered for the current workspace project in this server process. This
+discovered for the current workspace project in this server process, returns a
+small latest-message page by default, and requires explicit pagination for older
+history. This
 bounded authorization expires on restart; attempts to expand another ID return
 `MEMORY_THREAD_NOT_AUTHORIZED` and should be retried only after project-scoped
 discovery returns that ID. CHIM project search is a relevance filter, not a
@@ -125,10 +130,10 @@ After restarting, refresh tokens for removed aliases can no longer mint tokens.
 
 `tools.mode` accepts two values:
 
-| Value | Tool surface |
-| --- | --- |
-| `codex` | Default. `open_workspace`, `read`, `apply_patch`, `exec_command`, `write_stdin`, and `show_changes`. |
-| `claude` | `open_workspace`, `read`, `write`, `edit`, `bash`, and `show_changes`. |
+| Value    | Tool surface                                                                                         |
+| -------- | ---------------------------------------------------------------------------------------------------- |
+| `codex`  | Default. `open_workspace`, `read`, `apply_patch`, `exec_command`, `write_stdin`, and `show_changes`. |
+| `claude` | `open_workspace`, `read`, `write`, `edit`, `bash`, and `show_changes`.                               |
 
 The dedicated MCP tools `grep`, `glob`, and `ls` are not exposed. Each mode uses
 its shell tool with programs such as `rg`, `find`, and `ls` when it needs those
@@ -183,10 +188,10 @@ Subagent providers are explicit. Omitted providers are disabled:
 
 `subagents.instructions` controls when ChatGPT receives the managed workflow:
 
-| Value | Behavior |
-| --- | --- |
-| `on-demand` | Default. `open_workspace` advertises the `subagents` skill and the model reads it only when the task benefits from delegation. |
-| `preload` | `open_workspace` includes the `subagents` workflow in its initial workspace instructions instead of advertising that skill for a separate read. |
+| Value       | Behavior                                                                                                                                        |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `on-demand` | Default. `open_workspace` advertises the `subagents` skill and the model reads it only when the task benefits from delegation.                  |
+| `preload`   | `open_workspace` includes the `subagents` workflow in its initial workspace instructions instead of advertising that skill for a separate read. |
 
 Both modes only make the workflow available; neither tells the model to prefer
 subagents for routine work.
@@ -231,41 +236,41 @@ Windows; the tool is not registered on BSD.
 
 Only two user-facing DevSpace environment variables remain:
 
-| Variable | Purpose |
-| --- | --- |
-| `DEVSPACE_CONFIG_DIR` | Bootstrap location for `config.jsonc`, `auth.json`, skills, and profiles. |
-| `DEVSPACE_OAUTH_OWNER_TOKEN` | Optional secret override for the owner token stored in `auth.json`. |
+| Variable                     | Purpose                                                                   |
+| ---------------------------- | ------------------------------------------------------------------------- |
+| `DEVSPACE_CONFIG_DIR`        | Bootstrap location for `config.jsonc`, `auth.json`, skills, and profiles. |
+| `DEVSPACE_OAUTH_OWNER_TOKEN` | Optional secret override for the owner token stored in `auth.json`.       |
 
 Durable environment settings were removed in v1.1. Move existing deployment
 values to these JSONC keys:
 
-| Removed setting | JSONC key |
-| --- | --- |
-| `HOST`, `PORT` | `server.host`, `server.port` |
-| `DEVSPACE_PUBLIC_BASE_URL` | `server.publicBaseUrl` |
-| `DEVSPACE_ALLOWED_HOSTS` | `server.allowedHosts` |
-| `DEVSPACE_TRUST_PROXY` | `server.trustProxy` |
-| `DEVSPACE_ALLOWED_ROOTS` | `workspaces.allowedRoots` |
-| `DEVSPACE_WORKTREE_ROOT` | `workspaces.worktreeRoot` |
-| `DEVSPACE_STATE_DIR` | `storage.stateDir` |
-| `DEVSPACE_TOOL_MODE`, `DEVSPACE_MINIMAL_TOOLS` | `tools.mode` |
-| `DEVSPACE_WIDGETS` | `ui.enabled` |
-| `DEVSPACE_ARTIFACTS` | `artifacts.enabled` |
-| `DEVSPACE_ARTIFACT_MAX_FILE_BYTES` | `artifacts.maxFileBytes` |
-| `DEVSPACE_SKILLS` | `skills.enabled` |
-| `DEVSPACE_SKILL_PATHS` | `skills.paths` |
-| `DEVSPACE_AGENT_DIR` | `skills.agentDir` |
-| `DEVSPACE_SUBAGENTS` | `subagents.enabled` |
-| `DEVSPACE_LOG_LEVEL` | `logging.level` |
-| `DEVSPACE_LOG_FORMAT` | `logging.format` |
-| `DEVSPACE_LOG_REQUESTS` | `logging.requests` |
-| `DEVSPACE_LOG_ASSETS` | `logging.assets` |
-| `DEVSPACE_LOG_TOOL_CALLS` | `logging.toolCalls` |
-| `DEVSPACE_LOG_SHELL_COMMANDS` | `logging.shellCommands` |
-| `DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS` | `oauth.accessTokenTtlSeconds` |
-| `DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS` | `oauth.refreshTokenTtlSeconds` |
-| `DEVSPACE_OAUTH_SCOPES` | `oauth.scopes` |
-| `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS` | `oauth.allowedRedirectHosts` |
+| Removed setting                                | JSONC key                      |
+| ---------------------------------------------- | ------------------------------ |
+| `HOST`, `PORT`                                 | `server.host`, `server.port`   |
+| `DEVSPACE_PUBLIC_BASE_URL`                     | `server.publicBaseUrl`         |
+| `DEVSPACE_ALLOWED_HOSTS`                       | `server.allowedHosts`          |
+| `DEVSPACE_TRUST_PROXY`                         | `server.trustProxy`            |
+| `DEVSPACE_ALLOWED_ROOTS`                       | `workspaces.allowedRoots`      |
+| `DEVSPACE_WORKTREE_ROOT`                       | `workspaces.worktreeRoot`      |
+| `DEVSPACE_STATE_DIR`                           | `storage.stateDir`             |
+| `DEVSPACE_TOOL_MODE`, `DEVSPACE_MINIMAL_TOOLS` | `tools.mode`                   |
+| `DEVSPACE_WIDGETS`                             | `ui.enabled`                   |
+| `DEVSPACE_ARTIFACTS`                           | `artifacts.enabled`            |
+| `DEVSPACE_ARTIFACT_MAX_FILE_BYTES`             | `artifacts.maxFileBytes`       |
+| `DEVSPACE_SKILLS`                              | `skills.enabled`               |
+| `DEVSPACE_SKILL_PATHS`                         | `skills.paths`                 |
+| `DEVSPACE_AGENT_DIR`                           | `skills.agentDir`              |
+| `DEVSPACE_SUBAGENTS`                           | `subagents.enabled`            |
+| `DEVSPACE_LOG_LEVEL`                           | `logging.level`                |
+| `DEVSPACE_LOG_FORMAT`                          | `logging.format`               |
+| `DEVSPACE_LOG_REQUESTS`                        | `logging.requests`             |
+| `DEVSPACE_LOG_ASSETS`                          | `logging.assets`               |
+| `DEVSPACE_LOG_TOOL_CALLS`                      | `logging.toolCalls`            |
+| `DEVSPACE_LOG_SHELL_COMMANDS`                  | `logging.shellCommands`        |
+| `DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS`      | `oauth.accessTokenTtlSeconds`  |
+| `DEVSPACE_OAUTH_REFRESH_TOKEN_TTL_SECONDS`     | `oauth.refreshTokenTtlSeconds` |
+| `DEVSPACE_OAUTH_SCOPES`                        | `oauth.scopes`                 |
+| `DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS`        | `oauth.allowedRedirectHosts`   |
 
 These environment values are not read or auto-imported in v1.1. Environment is
 process state, so there is no reliable file DevSpace can migrate on the user's
@@ -288,15 +293,15 @@ actionable error instead of being silently discarded.
 
 The persisted fields map as follows:
 
-| v1.0 JSON field | v1.1 JSONC key |
-| --- | --- |
-| `host`, `port` | `server.host`, `server.port` |
-| `publicBaseUrl`, `allowedHosts` | `server.publicBaseUrl`, `server.allowedHosts` |
-| `allowedRoots`, `worktreeRoot` | `workspaces.allowedRoots`, `workspaces.worktreeRoot` |
-| `stateDir` | `storage.stateDir` |
-| `artifactsEnabled`, `artifactMaxFileBytes` | `artifacts.enabled`, `artifacts.maxFileBytes` |
-| `agentDir` | `skills.agentDir` |
-| `subagents` | `subagents` |
-| `tools.mode`, `ui.enabled` | unchanged nested keys |
+| v1.0 JSON field                            | v1.1 JSONC key                                       |
+| ------------------------------------------ | ---------------------------------------------------- |
+| `host`, `port`                             | `server.host`, `server.port`                         |
+| `publicBaseUrl`, `allowedHosts`            | `server.publicBaseUrl`, `server.allowedHosts`        |
+| `allowedRoots`, `worktreeRoot`             | `workspaces.allowedRoots`, `workspaces.worktreeRoot` |
+| `stateDir`                                 | `storage.stateDir`                                   |
+| `artifactsEnabled`, `artifactMaxFileBytes` | `artifacts.enabled`, `artifacts.maxFileBytes`        |
+| `agentDir`                                 | `skills.agentDir`                                    |
+| `subagents`                                | `subagents`                                          |
+| `tools.mode`, `ui.enabled`                 | unchanged nested keys                                |
 
 `auth.json` is unchanged.

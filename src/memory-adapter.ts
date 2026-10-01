@@ -42,7 +42,7 @@ export interface MemoryBootstrapContinuation {
 export interface MemoryBootstrapContext {
   project: string;
   sourcePolicy: string;
-  continuation?: MemoryBootstrapContinuation;
+  continuations: MemoryBootstrapContinuation[];
   relevant: MemoryBootstrapHit[];
   recent: MemoryBootstrapHit[];
   truncated: boolean;
@@ -103,7 +103,7 @@ export function memoryEvidenceIdsFromBootstrapContext(
   context: MemoryBootstrapContext,
 ): string[] {
   const ids: string[] = [];
-  if (context.continuation) ids.push(context.continuation.conversationId);
+  for (const continuation of context.continuations) ids.push(continuation.conversationId);
   for (const hit of [...context.relevant, ...context.recent]) {
     ids.push(hit.conversationId);
     if (hit.evidenceConversationId) ids.push(hit.evidenceConversationId);
@@ -179,7 +179,7 @@ export class MemoryAdapter {
       {
         project,
         query: "current project state decisions blockers and recent implementation work",
-        relevant_limit: 4,
+        relevant_limit: 0,
         recent_limit: 3,
         continuation_message_limit: 8,
       },
@@ -216,38 +216,36 @@ export function compactMemoryBootstrapContext(
     relevant: structured.relevant.map(compactHit),
     recent: structured.recent.map(compactHit),
   };
-  const continuationCandidate =
-    structured.continuation === undefined || structured.continuation === null
-      ? undefined
-      : compactContinuation(structured.continuation);
+  const continuationCandidates = Array.isArray(structured.continuations)
+    ? structured.continuations.map(compactContinuation)
+    : structured.continuation === undefined || structured.continuation === null
+      ? []
+      : [compactContinuation(structured.continuation)];
   const context: MemoryBootstrapContext = {
     project: expectedProject,
     sourcePolicy: clip(structured.source_policy, 80),
-    ...(continuationCandidate
-      ? {
-          continuation: {
-            ...continuationCandidate,
-            messages: [],
-          },
-        }
-      : {}),
+    continuations: continuationCandidates.map((continuation) => ({
+      ...continuation,
+      messages: [],
+    })),
     relevant: [],
     recent: [],
     truncated: false,
     byteBudget,
   };
-  if (continuationCandidate && context.continuation) {
-    for (const message of [...continuationCandidate.messages].reverse()) {
-      context.continuation.messages.unshift(message);
+  for (let index = 0; index < continuationCandidates.length; index += 1) {
+    const candidate = continuationCandidates[index]!;
+    const continuation = context.continuations[index]!;
+    for (const message of [...candidate.messages].reverse()) {
+      continuation.messages.unshift(message);
       if (byteLength(context) > byteBudget) {
-        context.continuation.messages.shift();
+        continuation.messages.shift();
         context.truncated = true;
         break;
       }
     }
-    const omitted =
-      continuationCandidate.messages.length - context.continuation.messages.length;
-    context.continuation.messageOffset += omitted;
+    const omitted = candidate.messages.length - continuation.messages.length;
+    continuation.messageOffset += omitted;
     context.truncated ||= omitted > 0;
   }
   for (const group of ["relevant", "recent"] as const) {

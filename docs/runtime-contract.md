@@ -271,11 +271,15 @@ When Memory is configured:
 - Memory remains a read-only optional extension to the coding surface.
 - `open_workspace` may return bounded bootstrap `memory_context`; Memory
   unavailable, malformed, or timed-out bootstrap does not prevent workspace
-  entry.
+  entry. Bootstrap continuity is limited by the configured byte budget and may
+  include tails from multiple recent project conversations rather than one full
+  transcript.
 - `memory_search` performs project-relevant retrieval.
 - `memory_get_thread` expands only evidence IDs authorized by the current
   project's bootstrap/search discovery. Authorization is bounded,
-  process-local, and reset by server restart.
+  process-local, and reset by server restart. The model-facing surface returns
+  the latest eight messages by default, caps one request at sixteen messages,
+  and uses explicit offsets for older pagination.
 - An expansion outside that authorization boundary returns the structured
   `MEMORY_THREAD_NOT_AUTHORIZED` scope error without exposing thread contents.
 
