@@ -154,7 +154,7 @@ function serverInstructions(
     : "";
   const agents = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in available_agents_files, use ${toolNames.read} to inspect that instruction file and follow it. `;
   const common = `Call ${toolNames.openWorkspace} when starting work in a project folder or isolated worktree without a usable workspace_id, then reuse the returned workspace_id for subsequent operations in that workspace.`;
-  const projectMemory = " open_workspace also accepts an unambiguous project name or registered alias. When memory is configured it may return bounded memory_context; verify it against current files. Use memory_search for explicit history questions and memory_get_thread only for discovered evidence.";
+  const projectMemory = " open_workspace also accepts an unambiguous project name or registered alias. When memory is configured it may return bounded memory_context including an automatic continuation tail from the latest project conversation; treat that as prior-conversation context and verify repository facts against current files. Use memory_search for additional history questions and memory_get_thread only for discovered evidence.";
 
   return `${common}${projectMemory} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}`;
 }
@@ -168,9 +168,26 @@ const memoryBootstrapHitOutputSchema = z.object({
   snippet: z.string().optional(),
   topic_tags: z.array(z.string()),
 });
+const memoryBootstrapMessageOutputSchema = z.object({
+  role: z.string(),
+  create_time: z.number().optional(),
+  turn_index: z.number(),
+  text: z.string(),
+});
+const memoryBootstrapContinuationOutputSchema = z.object({
+  conversation_id: z.string(),
+  source: z.string(),
+  title: z.string(),
+  update_time: z.number().optional(),
+  message_offset: z.number().int().nonnegative(),
+  returned_messages: z.number().int().nonnegative(),
+  total_messages: z.number().int().nonnegative(),
+  messages: z.array(memoryBootstrapMessageOutputSchema),
+});
 const memoryBootstrapContextOutputSchema = z.object({
   project: z.string(),
   source_policy: z.string(),
+  continuation: memoryBootstrapContinuationOutputSchema.optional(),
   relevant: z.array(memoryBootstrapHitOutputSchema),
   recent: z.array(memoryBootstrapHitOutputSchema),
   truncated: z.boolean(),
@@ -190,6 +207,23 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
   const output = {
     project: context.project,
     source_policy: context.sourcePolicy,
+    continuation: context.continuation
+      ? {
+          conversation_id: context.continuation.conversationId,
+          source: context.continuation.source,
+          title: context.continuation.title,
+          update_time: context.continuation.updateTime,
+          message_offset: context.continuation.messageOffset,
+          returned_messages: context.continuation.messages.length,
+          total_messages: context.continuation.totalMessages,
+          messages: context.continuation.messages.map((message) => ({
+            role: message.role,
+            create_time: message.createTime,
+            turn_index: message.turnIndex,
+            text: message.text,
+          })),
+        }
+      : undefined,
     relevant: context.relevant.map(mapHit),
     recent: context.recent.map(mapHit),
     truncated: context.truncated,
@@ -198,6 +232,11 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
   while (Buffer.byteLength(JSON.stringify(output), "utf8") > byteBudget) {
     if (output.recent.length > 0) output.recent.pop();
     else if (output.relevant.length > 0) output.relevant.pop();
+    else if (output.continuation && output.continuation.messages.length > 1) {
+      output.continuation.messages.shift();
+      output.continuation.message_offset += 1;
+      output.continuation.returned_messages = output.continuation.messages.length;
+    }
     else throw new Error("Memory bootstrap byte budget is too small for its envelope");
     output.truncated = true;
   }
@@ -250,6 +289,8 @@ const workspaceSkillOutputSchema = z.object({
 const workspaceAgentsFileOutputSchema = z.object({
   path: z.string(),
   content: z.string(),
+  truncated: z.boolean().optional(),
+  original_bytes: z.number().int().positive().optional(),
 });
 
 const workspaceLocalAgentOutputSchema = z.object({
@@ -270,6 +311,52 @@ const workspaceLocalAgentProviderOutputSchema = z.object({
 const workspaceAvailableAgentsFileOutputSchema = z.object({
   path: z.string(),
 });
+
+const MODEL_INSTRUCTION_FILE_MAX_BYTES = 48 * 1024;
+const MODEL_INSTRUCTION_FILE_HEAD_BYTES = 34 * 1024;
+const MODEL_INSTRUCTION_FILE_TAIL_BYTES = 12 * 1024;
+
+function compactInstructionFileForModel(content: string) {
+  const originalBytes = Buffer.byteLength(content, "utf8");
+  if (originalBytes <= MODEL_INSTRUCTION_FILE_MAX_BYTES) {
+    return { content };
+  }
+  const head = utf8Prefix(content, MODEL_INSTRUCTION_FILE_HEAD_BYTES);
+  const tail = utf8Suffix(content, MODEL_INSTRUCTION_FILE_TAIL_BYTES);
+  const omittedBytes = Math.max(
+    0,
+    originalBytes
+      - Buffer.byteLength(head, "utf8")
+      - Buffer.byteLength(tail, "utf8"),
+  );
+  return {
+    content: [
+      head,
+      "",
+      "[... DevSpace omitted " + omittedBytes + " bytes from the middle of this oversized instruction file. Read the file by range if an omitted section is relevant. ...]",
+      "",
+      tail,
+    ].join("\n"),
+    truncated: true as const,
+    original_bytes: originalBytes,
+  };
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  const buffer = Buffer.from(value, "utf8");
+  if (buffer.length <= maxBytes) return value;
+  let end = maxBytes;
+  while (end > 0 && end < buffer.length && (buffer[end]! & 0xc0) === 0x80) end -= 1;
+  return buffer.subarray(0, end).toString("utf8");
+}
+
+function utf8Suffix(value: string, maxBytes: number): string {
+  const buffer = Buffer.from(value, "utf8");
+  if (buffer.length <= maxBytes) return value;
+  let start = buffer.length - maxBytes;
+  while (start < buffer.length && (buffer[start]! & 0xc0) === 0x80) start += 1;
+  return buffer.subarray(start).toString("utf8");
+}
 
 function sendJsonRpcError(
   res: Response,
@@ -628,7 +715,7 @@ function registerMcpSurface(
       const cardAgents = agentCatalog.profiles;
       const cardAgentsFiles = agentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
-        content: file.content,
+        ...compactInstructionFileForModel(file.content),
       }));
       const cardAvailableAgentsFiles = availableAgentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
@@ -637,6 +724,7 @@ function registerMcpSurface(
       const visibleAgentProviders = includeBootstrapContext ? cardAgentProviders : [];
       const visibleAgents = includeBootstrapContext ? cardAgents : [];
       const loadedAgentsFiles = includeBootstrapContext ? cardAgentsFiles : [];
+      const truncatedAgentsFiles = loadedAgentsFiles.filter((file) => file.truncated);
       const availableAgentsFileOutputs = includeBootstrapContext ? cardAvailableAgentsFiles : [];
       let memoryContext: ReturnType<typeof modelMemoryContext> | undefined;
       if (memory.enabled && includeBootstrapContext) {
@@ -655,9 +743,20 @@ function registerMcpSurface(
           });
         }
       }
-      const cardInstruction = config.skillsEnabled
-        ? "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
-        : "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file.";
+      const memoryInstruction = memoryContext?.continuation
+        ? "Treat structuredContent.memory_context.continuation as prior-conversation context for this project. Continue from it without waiting for the user to ask you to search memory; use memory_search only when additional history is needed."
+        : memoryContext
+          ? "Use structuredContent.memory_context as bounded prior project context; use memory_search when additional history is needed."
+          : undefined;
+      const cardInstruction = [
+        config.skillsEnabled
+          ? "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
+          : "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file.",
+        memoryInstruction,
+        truncatedAgentsFiles.length > 0
+          ? "Some oversized instruction files were context-bounded to their beginning and latest tail. Treat the visible content as authoritative for those portions and use read on the returned path when an omitted middle section is relevant."
+          : undefined,
+      ].filter(Boolean).join(" ");
       const workspaceInstruction = workspaceReused
         ? [
             `Workspace already open as ${workspace.id}.`,
@@ -688,6 +787,9 @@ function registerMcpSurface(
             loadedAgentsFiles.length > 0
               ? `Loaded project instructions: ${loadedAgentsFiles.map((file) => file.path).join(", ")}`
               : undefined,
+            truncatedAgentsFiles.length > 0
+              ? `Context-bounded oversized instructions: ${truncatedAgentsFiles.map((file) => `${file.path} (${file.original_bytes} bytes)`).join(", ")}`
+              : undefined,
             availableAgentsFileOutputs.length > 0
               ? `Available nested instructions: ${availableAgentsFileOutputs.map((file) => file.path).join(", ")}`
               : undefined,
@@ -700,7 +802,11 @@ function registerMcpSurface(
             visibleAgents.length > 0
               ? `Available subagent profiles: ${visibleAgents.map(formatVisibleAgent).join(", ")}`
               : undefined,
-            memoryContext ? "Bounded project memory context is available in structuredContent.memory_context." : undefined,
+            memoryContext?.continuation
+              ? "Automatic continuation memory from the latest project conversation is available in structuredContent.memory_context.continuation."
+              : memoryContext
+                ? "Bounded project memory context is available in structuredContent.memory_context."
+                : undefined,
             instruction,
           ].filter(Boolean).join("\n"),
         },
@@ -812,7 +918,7 @@ function registerMcpSurface(
       "memory_get_thread",
       {
         title: "Read discovered memory thread",
-        description: "Expand a conversation or evidence ID previously returned for this project by open_workspace or memory_search. Authorization is process-local and expires on server restart.",
+        description: "Expand a conversation or evidence ID previously returned for this project by open_workspace or memory_search. Without message_offset, returns the latest messages; use message_offset for explicit older pagination. Authorization is process-local and expires on server restart.",
         inputSchema: {
           workspace_id: z.string().describe(workspaceIdDescription),
           conversation_id: z.string().trim().min(1),
@@ -844,7 +950,8 @@ function registerMcpSurface(
         return memory.call("memory_get_thread", {
           conversation_id,
           message_offset,
-          message_limit,
+          message_limit: message_limit ?? 8,
+          ...(message_offset === undefined ? { tail: true } : {}),
         });
       },
     );

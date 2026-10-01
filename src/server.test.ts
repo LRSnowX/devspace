@@ -1014,6 +1014,30 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
   assert.ok(Array.isArray(card.agents));
 });
 
+test("open_workspace bounds oversized instruction files while preserving their head and latest tail", async (t) => {
+  const projectAgentsContent = [
+    "HEAD-INSTRUCTIONS\n",
+    "A".repeat(40_000),
+    "\nOMITTED-MIDDLE-SENTINEL\n",
+    "B".repeat(70_000),
+    "\nTAIL-INSTRUCTIONS\n",
+  ].join("");
+  const context = await fixture(t, { projectAgentsContent });
+  const opened = structuredContent(await callOpen(context.client, context.project, "large-agents"));
+  const files = opened.agents_files as Array<Record<string, unknown>>;
+  const projectFile = files.find((file) => file.path === "AGENTS.md");
+  assert.ok(projectFile);
+  assert.equal(projectFile.truncated, true);
+  assert.equal(projectFile.original_bytes, Buffer.byteLength(projectAgentsContent, "utf8"));
+  const content = projectFile.content as string;
+  assert.ok(Buffer.byteLength(content, "utf8") <= 48 * 1024);
+  assert.match(content, /HEAD-INSTRUCTIONS/);
+  assert.match(content, /TAIL-INSTRUCTIONS/);
+  assert.match(content, /DevSpace omitted/);
+  assert.doesNotMatch(content, /OMITTED-MIDDLE-SENTINEL/);
+  assert.match(opened.instruction as string, /context-bounded/);
+});
+
 test("open_workspace refreshes provider availability for each catalog", async (t) => {
   let available = false;
   const context = await fixture(t, {
@@ -1349,6 +1373,28 @@ function fakeMemory(bootstrapFailure?: Error): MemoryClient {
       return {
         project,
         sourcePolicy: "relevance-filter",
+        continuation: {
+          conversationId: `${project}-continuation`,
+          source: "chatgpt",
+          title: "Latest project conversation",
+          updateTime: 43,
+          messageOffset: 5,
+          totalMessages: 7,
+          messages: [
+            {
+              role: "user",
+              createTime: 42,
+              turnIndex: 5,
+              text: "Continue the implementation from the accepted plan.",
+            },
+            {
+              role: "assistant",
+              createTime: 43,
+              turnIndex: 6,
+              text: "The next step is the bounded implementation slice.",
+            },
+          ],
+        },
         relevant: [{
           conversationId: `${project}-parent`,
           evidenceConversationId: `${project}-evidence`,
@@ -1379,6 +1425,7 @@ function fakeMemory(bootstrapFailure?: Error): MemoryClient {
           conversation_id: args.conversation_id,
           message_offset: args.message_offset,
           message_limit: args.message_limit,
+          tail: args.tail,
           returned_messages: 1,
         } };
       }
@@ -1496,6 +1543,10 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.ok(Buffer.byteLength(JSON.stringify(bootstrap), "utf8") <= 12_288);
   assert.equal(bootstrap.byte_budget, 12_288);
   assert.equal("messages" in bootstrap, false);
+  const continuation = bootstrap.continuation as Record<string, unknown>;
+  assert.equal(continuation.conversation_id, "LEMonX-continuation");
+  assert.equal(continuation.returned_messages, 2);
+  assert.ok(Array.isArray(continuation.messages));
   const denied = await context.client.callTool({
     name: "memory_get_thread",
     arguments: { workspace_id: workspaceId, conversation_id: "foreign-id" },
@@ -1519,6 +1570,14 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
     arguments: { workspace_id: workspaceId, conversation_id: "LEMonX-evidence", message_offset: 0, message_limit: 1 },
   });
   assert.notEqual(bootstrapThread.isError, true);
+  const latestThread = await context.client.callTool({
+    name: "memory_get_thread",
+    arguments: { workspace_id: workspaceId, conversation_id: "LEMonX-continuation" },
+  });
+  assert.notEqual(latestThread.isError, true);
+  assert.equal(structuredContent(latestThread).message_limit, 8);
+  assert.equal(structuredContent(latestThread).tail, true);
+  assert.equal(structuredContent(latestThread).message_offset, undefined);
   const search = await context.client.callTool({
     name: "memory_search",
     arguments: { workspace_id: workspaceId, query: "历史决策", limit: 2 },
@@ -1683,6 +1742,7 @@ async function fixture(
     memoryClient?: MemoryClient;
     projectRegistration?: { name: string; aliases?: string[] };
     extraAllowedRoot?: string;
+    projectAgentsContent?: string;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -1693,7 +1753,7 @@ async function fixture(
   await mkdir(join(project, ".devspace", "agents"), { recursive: true });
   await mkdir(agentDir, { recursive: true });
   await writeFile(join(agentDir, "AGENTS.md"), "global instructions\n");
-  await writeFile(join(project, "AGENTS.md"), "project instructions\n");
+  await writeFile(join(project, "AGENTS.md"), options.projectAgentsContent ?? "project instructions\n");
   await writeFile(join(project, ".devspace", "agents", "reviewer.md"), [
     "---",
     "name: reviewer",

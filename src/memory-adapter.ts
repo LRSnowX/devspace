@@ -22,9 +22,27 @@ export interface MemoryBootstrapHit {
   topicTags: string[];
 }
 
+export interface MemoryBootstrapMessage {
+  role: string;
+  createTime?: number;
+  turnIndex: number;
+  text: string;
+}
+
+export interface MemoryBootstrapContinuation {
+  conversationId: string;
+  source: string;
+  title: string;
+  updateTime?: number;
+  messageOffset: number;
+  totalMessages: number;
+  messages: MemoryBootstrapMessage[];
+}
+
 export interface MemoryBootstrapContext {
   project: string;
   sourcePolicy: string;
+  continuation?: MemoryBootstrapContinuation;
   relevant: MemoryBootstrapHit[];
   recent: MemoryBootstrapHit[];
   truncated: boolean;
@@ -85,6 +103,7 @@ export function memoryEvidenceIdsFromBootstrapContext(
   context: MemoryBootstrapContext,
 ): string[] {
   const ids: string[] = [];
+  if (context.continuation) ids.push(context.continuation.conversationId);
   for (const hit of [...context.relevant, ...context.recent]) {
     ids.push(hit.conversationId);
     if (hit.evidenceConversationId) ids.push(hit.evidenceConversationId);
@@ -148,7 +167,7 @@ export class MemoryAdapter {
         CallToolResultSchema,
         options.timeoutMs ? { timeout: options.timeoutMs } : undefined,
       );
-      return CallToolResultSchema.parse(rawResult);
+      return compactMirroredMemoryResult(CallToolResultSchema.parse(rawResult));
     } finally {
       await client.close().catch(() => undefined);
     }
@@ -162,6 +181,7 @@ export class MemoryAdapter {
         query: "current project state decisions blockers and recent implementation work",
         relevant_limit: 4,
         recent_limit: 3,
+        continuation_message_limit: 8,
       },
       { timeoutMs: this.config.bootstrapTimeoutMs },
     );
@@ -196,14 +216,40 @@ export function compactMemoryBootstrapContext(
     relevant: structured.relevant.map(compactHit),
     recent: structured.recent.map(compactHit),
   };
+  const continuationCandidate =
+    structured.continuation === undefined || structured.continuation === null
+      ? undefined
+      : compactContinuation(structured.continuation);
   const context: MemoryBootstrapContext = {
     project: expectedProject,
     sourcePolicy: clip(structured.source_policy, 80),
+    ...(continuationCandidate
+      ? {
+          continuation: {
+            ...continuationCandidate,
+            messages: [],
+          },
+        }
+      : {}),
     relevant: [],
     recent: [],
     truncated: false,
     byteBudget,
   };
+  if (continuationCandidate && context.continuation) {
+    for (const message of [...continuationCandidate.messages].reverse()) {
+      context.continuation.messages.unshift(message);
+      if (byteLength(context) > byteBudget) {
+        context.continuation.messages.shift();
+        context.truncated = true;
+        break;
+      }
+    }
+    const omitted =
+      continuationCandidate.messages.length - context.continuation.messages.length;
+    context.continuation.messageOffset += omitted;
+    context.truncated ||= omitted > 0;
+  }
   for (const group of ["relevant", "recent"] as const) {
     for (const hit of candidates[group]) {
       context[group].push(hit);
@@ -221,6 +267,66 @@ export function compactMemoryBootstrapContext(
     throw new Error("Memory bootstrap byte budget is too small for its envelope");
   }
   return context;
+}
+
+export function compactMirroredMemoryResult(result: CallToolResult): CallToolResult {
+  if (!result.structuredContent || result.content.length !== 1) return result;
+  const only = result.content[0];
+  if (only?.type !== "text") return result;
+  try {
+    const parsed = JSON.parse(only.text) as unknown;
+    if (JSON.stringify(parsed) !== JSON.stringify(result.structuredContent)) return result;
+  } catch {
+    return result;
+  }
+  return {
+    ...result,
+    content: [],
+  };
+}
+
+function compactContinuation(value: unknown): MemoryBootstrapContinuation {
+  const continuation = record(value);
+  if (
+    !continuation
+    || typeof continuation.conversation_id !== "string"
+    || typeof continuation.source !== "string"
+    || typeof continuation.title !== "string"
+    || typeof continuation.message_offset !== "number"
+    || typeof continuation.total_messages !== "number"
+    || !Array.isArray(continuation.messages)
+  ) {
+    throw new Error("Malformed memory continuation");
+  }
+  return {
+    conversationId: clip(continuation.conversation_id, 200),
+    source: clip(continuation.source, 40),
+    title: clip(continuation.title, 240),
+    ...(typeof continuation.update_time === "number"
+      ? { updateTime: continuation.update_time }
+      : {}),
+    messageOffset: continuation.message_offset,
+    totalMessages: continuation.total_messages,
+    messages: continuation.messages.map(compactMessage),
+  };
+}
+
+function compactMessage(value: unknown): MemoryBootstrapMessage {
+  const message = record(value);
+  if (
+    !message
+    || typeof message.role !== "string"
+    || typeof message.turn_index !== "number"
+    || typeof message.text !== "string"
+  ) {
+    throw new Error("Malformed memory continuation message");
+  }
+  return {
+    role: clip(message.role, 32),
+    ...(typeof message.create_time === "number" ? { createTime: message.create_time } : {}),
+    turnIndex: message.turn_index,
+    text: clipContinuationMessage(message.text, 2_400),
+  };
 }
 
 function compactHit(value: unknown): MemoryBootstrapHit {
@@ -258,6 +364,15 @@ function record(value: unknown): Record<string, unknown> | undefined {
 
 function clip(value: string, maxCharacters: number): string {
   return value.length <= maxCharacters ? value : `${value.slice(0, maxCharacters - 1)}…`;
+}
+
+function clipContinuationMessage(value: string, maxCharacters: number): string {
+  if (value.length <= maxCharacters) return value;
+  const marker = "\n[… middle of this prior message omitted …]\n";
+  const remaining = maxCharacters - marker.length;
+  const head = Math.floor(remaining * 0.4);
+  const tail = remaining - head;
+  return `${value.slice(0, head)}${marker}${value.slice(-tail)}`;
 }
 
 function byteLength(value: unknown): number {

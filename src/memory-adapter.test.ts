@@ -4,6 +4,7 @@ import {
   MemoryAdapter,
   MemoryThreadAuthorizationStore,
   compactMemoryBootstrapContext,
+  compactMirroredMemoryResult,
   memoryEvidenceIdsFromBootstrapContext,
   memoryEvidenceIdsFromSearchResult,
 } from "./memory-adapter.js";
@@ -45,6 +46,55 @@ test("memory bootstrap rejects malformed responses", () => {
     () => compactMemoryBootstrapContext({ structuredContent: { project: "Jack" } }, "Jack", 12_288),
     /Malformed memory project context response/,
   );
+});
+
+test("memory bootstrap prioritizes the latest continuation tail within its byte budget", () => {
+  const raw = projectContext() as {
+    structuredContent: Record<string, unknown>;
+  };
+  raw.structuredContent.continuation = {
+    conversation_id: "continuation-1",
+    source: "chatgpt",
+    title: "Latest project chat",
+    update_time: 99,
+    message_offset: 10,
+    returned_messages: 8,
+    total_messages: 18,
+    messages: Array.from({ length: 8 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      create_time: 90 + index,
+      turn_index: 10 + index,
+      text: `message-${index}-${"x".repeat(1_000)}`,
+    })),
+  };
+
+  const context = compactMemoryBootstrapContext(raw, "Jack", 4_096);
+  assert.ok(Buffer.byteLength(JSON.stringify(context), "utf8") <= 4_096);
+  assert.ok(context.continuation);
+  assert.equal(context.continuation.conversationId, "continuation-1");
+  assert.equal(context.continuation.messages.at(-1)?.turnIndex, 17);
+  assert.ok(context.continuation.messages.length > 0);
+  assert.ok(context.continuation.messageOffset >= 10);
+  assert.equal(context.truncated, true);
+  assert.ok(memoryEvidenceIdsFromBootstrapContext(context).includes("continuation-1"));
+});
+
+test("memory adapter removes rmcp mirrored JSON text when structured content is identical", () => {
+  const structuredContent = {
+    hits: [{ result: { conversation_id: "conversation-1" } }],
+  };
+  const compacted = compactMirroredMemoryResult({
+    content: [{ type: "text", text: JSON.stringify(structuredContent) }],
+    structuredContent,
+  });
+  assert.deepEqual(compacted.content, []);
+  assert.deepEqual(compacted.structuredContent, structuredContent);
+
+  const nonMirrored = compactMirroredMemoryResult({
+    content: [{ type: "text", text: "human-readable summary" }],
+    structuredContent,
+  });
+  assert.equal(nonMirrored.content[0]?.type, "text");
 });
 
 test("memory evidence ids include bootstrap and search evidence anchors", () => {
