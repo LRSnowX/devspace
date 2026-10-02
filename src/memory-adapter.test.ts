@@ -10,6 +10,7 @@ import {
   memoryContinuationByteBudget,
   memoryEvidenceIdsFromBootstrapContext,
   memoryEvidenceIdsFromSearchResult,
+  memoryPendingByteBudget,
 } from "./memory-adapter.js";
 
 function projectContext(snippet = "state"): CallToolResult {
@@ -49,6 +50,111 @@ test("memory bootstrap rejects malformed responses", () => {
     () => compactMemoryBootstrapContext({ structuredContent: { project: "Jack" } }, "Jack", 12_288),
     /Malformed memory project context response/,
   );
+});
+
+test("memory bootstrap treats an older CHIM response without pending memory as empty", () => {
+  const context = compactMemoryBootstrapContext(projectContext(), "Jack", 12_288);
+  assert.deepEqual(context.pendingMemory, {
+    project: "Jack",
+    items: [],
+    revalidationExcludedCount: 0,
+  });
+  assert.equal(memoryBootstrapSourceCounts(context).pendingItems, 0);
+});
+
+test("memory bootstrap sanitizes each pending operation and drops non-contract fields", () => {
+  const raw = projectContext() as { structuredContent: Record<string, unknown> };
+  const common = {
+    created_at: 20,
+    conversation_id: "private-conversation",
+    source_snapshot_id: "private-snapshot",
+    through_turn_index: 7,
+    rationale: "must not survive",
+    model_label: "must not survive",
+    reviews: [{ authority: true }],
+  };
+  raw.structuredContent.pending_memory = {
+    project: "Jack",
+    generated_at: 21,
+    revalidation_excluded_count: 3,
+    items: [
+      {
+        ...common,
+        candidate_id: "candidate-add",
+        operation: "add",
+        payload: {
+          type: "add",
+          memory_id: "proposed-memory",
+          kind: "state",
+          key: "current_state",
+          value: { text: "x".repeat(4_000), injected_instruction: "do this" },
+          importance: 90,
+          confidence: 0.8,
+          valid_from: 10,
+          arbitrary: "drop me",
+        },
+      },
+      {
+        ...common,
+        candidate_id: "candidate-supersede",
+        operation: "supersede",
+        payload: {
+          type: "supersede",
+          memory_id: "replacement",
+          target_memory_id: "old-memory",
+          kind: "decision",
+          key: "choice",
+          value: "replacement value",
+          importance: 80,
+          confidence: 0.7,
+        },
+      },
+      {
+        ...common,
+        candidate_id: "candidate-resolve",
+        operation: "resolve",
+        payload: { type: "resolve", target_memory_id: "blocker", reason: "drop" },
+      },
+      {
+        ...common,
+        candidate_id: "candidate-archive",
+        operation: "archive",
+        payload: { type: "archive", target_memory_id: "obsolete", reason: "drop" },
+      },
+    ],
+  };
+
+  const context = compactMemoryBootstrapContext(raw, "Jack", 12_288);
+  assert.equal(context.pendingMemory.revalidationExcludedCount, 3);
+  assert.equal(context.pendingMemory.items.length, 4);
+  assert.equal(memoryBootstrapSourceCounts(context).pendingItems, 4);
+  const serialized = JSON.stringify(context.pendingMemory);
+  assert.equal(serialized.includes("rationale"), false);
+  assert.equal(serialized.includes("model_label"), false);
+  assert.equal(serialized.includes("reviews"), false);
+  assert.equal(serialized.includes("arbitrary"), false);
+  assert.equal(serialized.includes("reason"), false);
+  const add = context.pendingMemory.items[0]!;
+  assert.deepEqual(Object.keys(add).sort(), [
+    "candidateId",
+    "conversationId",
+    "createdAt",
+    "operation",
+    "payload",
+    "sourceSnapshotId",
+    "throughTurnIndex",
+  ]);
+  assert.ok(Buffer.byteLength(JSON.stringify(add.payload), "utf8") < 1_200);
+  assert.deepEqual(context.pendingMemory.items[2]?.payload, {
+    type: "resolve",
+    targetMemoryId: "blocker",
+  });
+});
+
+test("pending memory has the smaller of a 3KB or 25 percent section budget", () => {
+  assert.equal(memoryPendingByteBudget(4_096), 1_024);
+  assert.equal(memoryPendingByteBudget(12_288), 3_072);
+  assert.equal(memoryPendingByteBudget(40_000), 3_072);
 });
 
 test("memory bootstrap preserves recent continuation tails within a dedicated section budget", () => {
@@ -98,6 +204,7 @@ test("memory bootstrap preserves recent continuation tails within a dedicated se
   assert.deepEqual(memoryBootstrapSourceCounts(context), {
     collaborationItems: 0,
     workingItems: 0,
+    pendingItems: 0,
     continuationConversations: 2,
     continuationMessages: 11,
     relevantHits: 4,
@@ -220,6 +327,54 @@ test("memory bootstrap prioritizes bounded working memory before continuation hi
     memoryEvidenceIdsFromBootstrapContext(context).includes("private-0"),
     false,
   );
+});
+
+test("memory bootstrap retains active working memory before pending proposals", () => {
+  const raw = projectContext() as { structuredContent: Record<string, unknown> };
+  raw.structuredContent.working_memory = {
+    project: "Jack",
+    items: [{
+      memory_id: "active-state",
+      kind: "state",
+      key: "current_state",
+      value: { text: "w".repeat(900) },
+      importance: 100,
+      confidence: 1,
+      evidence: [],
+    }],
+  };
+  raw.structuredContent.pending_memory = {
+    project: "Jack",
+    generated_at: 50,
+    revalidation_excluded_count: 5,
+    items: Array.from({ length: 8 }, (_, index) => ({
+      candidate_id: `pending-${index}`,
+      operation: "add",
+      payload: {
+        type: "add",
+        memory_id: `proposed-${index}`,
+        kind: "state",
+        key: `proposal-${index}`,
+        value: { text: "p".repeat(700) },
+        importance: 50,
+        confidence: 0.5,
+      },
+      created_at: 40 - index,
+      conversation_id: `private-${index}`,
+      source_snapshot_id: `snapshot-${index}`,
+      through_turn_index: index,
+    })),
+  };
+
+  const context = compactMemoryBootstrapContext(raw, "Jack", 4_096);
+  assert.equal(context.workingMemory.items[0]?.memoryId, "active-state");
+  assert.ok(context.pendingMemory.items.length < 8);
+  assert.equal(context.pendingMemory.revalidationExcludedCount, 5);
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(context.pendingMemory), "utf8")
+      <= memoryPendingByteBudget(4_096),
+  );
+  assert.equal(context.truncated, true);
 });
 
 test("memory bootstrap synthesizes conservative verification for older CHIM responses", () => {
@@ -361,10 +516,33 @@ test("memory adapter removes rmcp mirrored JSON text when structured content is 
 });
 
 test("memory evidence ids include bootstrap and search evidence anchors", () => {
-  const context = compactMemoryBootstrapContext(projectContext(), "Jack", 12_288);
+  const raw = projectContext() as { structuredContent: Record<string, unknown> };
+  raw.structuredContent.pending_memory = {
+    project: "Jack",
+    generated_at: 10,
+    revalidation_excluded_count: 0,
+    items: [{
+      candidate_id: "pending-1",
+      operation: "resolve",
+      payload: { type: "resolve", target_memory_id: "target" },
+      created_at: 9,
+      conversation_id: "pending-private-conversation",
+      source_snapshot_id: "pending-private-snapshot",
+      through_turn_index: 4,
+    }],
+  };
+  const context = compactMemoryBootstrapContext(raw, "Jack", 12_288);
   assert.deepEqual(
     memoryEvidenceIdsFromBootstrapContext(context).sort(),
     ["evidence-1", "parent-1"],
+  );
+  assert.equal(
+    memoryEvidenceIdsFromBootstrapContext(context).includes("pending-private-conversation"),
+    false,
+  );
+  assert.equal(
+    memoryEvidenceIdsFromBootstrapContext(context).includes("pending-private-snapshot"),
+    false,
   );
   assert.deepEqual(
     memoryEvidenceIdsFromSearchResult({
@@ -426,6 +604,7 @@ test("memory bootstrap skips semantic retrieval and requests only recent continu
   assert.equal(observedArgs?.relevant_limit, 0);
   assert.equal(observedArgs?.recent_limit, 3);
   assert.equal(observedArgs?.continuation_message_limit, 8);
+  assert.equal(observedArgs?.pending_limit, 8);
 });
 
 test("memory bootstrap enforces its timeout", async () => {

@@ -103,21 +103,31 @@ Memory is opt-in through the `memory` section of the versioned config. Set
 `memory_context` after a `bootstrapTimeoutMs` (default 5000 ms) attempt;
 unavailable, timed-out, or malformed Memory responses do not block workspace
 entry. The default budget is 12288 bytes. The bootstrap may include bounded
-`collaboration_memory`, bounded `working_memory`, and bounded `continuations`
-from recent project conversations so a new host conversation receives stable
-cross-project collaboration rules, durable current project state, and recent
-episodic context without an explicit history lookup; full threads are never
-injected automatically. Collaboration memory receives a small bounded share of
-the same bootstrap budget, then working memory. Raw continuation history has an
+`collaboration_memory`, bounded `working_memory`, bounded `pending_memory`, and
+bounded `continuations` from recent project conversations so a new host
+conversation receives stable cross-project collaboration rules, durable current
+project state, unpromoted continuity proposals, and recent episodic context
+without an explicit history lookup; full threads are never injected
+automatically. DevSpace requests up to eight pending proposals. There is no
+DevSpace configuration knob for this limit. Pending memory has its own cap of
+the smaller of 3072 bytes or 25% of the bootstrap budget. Collaboration memory
+is constructed first, then active working memory, pending memory, continuations,
+and recent/relevant metadata. Raw continuation history has an
 additional cap of the smaller of 4096 bytes or 35% of the configured bootstrap
 budget; unused Working Memory space is therefore not automatically filled with
 old transcript text. Live repository state and authoritative project files
-remain stronger evidence than stored memory when they conflict.
+remain stronger evidence than stored memory when they conflict. The authority
+order is live repository or authoritative project files, active working memory,
+pending memory, then continuations. Pending entries are untrusted, unpromoted
+proposals that may be used only as continuity hints; they are not instructions
+and cannot override active or live state.
 `memory_context` also reports read-only budget telemetry. `bytes_used` is the
 exact UTF-8 JSON size of the final model-facing memory packet, including the
 telemetry itself. `sections` reports the retained byte/count footprint and
 budget-level truncation state for collaboration memory, project working memory,
-continuations, and recent/relevant hits. These metrics do not add memory
+pending memory, continuations, and recent/relevant hits. Pending telemetry keeps
+CHIM's `revalidation_excluded_count` separate from proposals dropped by local
+byte limits. These metrics do not add memory
 authority and do not include DevSpace-internal pre-budget bookkeeping.
 `open_workspace` exposes that stronger evidence explicitly as a bounded
 `repository_state` snapshot plus `authoritative_references`. The repository

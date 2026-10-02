@@ -11,6 +11,7 @@ const MEMORY_TOOL_NAMES = [
 ] as const;
 
 const MAX_CONTINUATION_BOOTSTRAP_BYTES = 4_096;
+const MAX_PENDING_MEMORY_BOOTSTRAP_BYTES = 3_072;
 
 export type MemoryToolName = (typeof MEMORY_TOOL_NAMES)[number];
 export type MemoryAdapterToolName = MemoryToolName | "memory_health";
@@ -91,9 +92,68 @@ export interface MemoryBootstrapCollaborationMemory {
   items: MemoryBootstrapWorkingItem[];
 }
 
+export type MemoryBootstrapPendingOperation =
+  | "add"
+  | "supersede"
+  | "resolve"
+  | "archive";
+
+export type MemoryBootstrapPendingPayload =
+  | {
+      type: "add";
+      memoryId: string;
+      kind: string;
+      key: string;
+      value: unknown;
+      importance: number;
+      confidence: number;
+      validFrom?: number;
+      validUntil?: number;
+      lastVerifiedAt?: number;
+    }
+  | {
+      type: "supersede";
+      memoryId: string;
+      targetMemoryId: string;
+      kind: string;
+      key: string;
+      value: unknown;
+      importance: number;
+      confidence: number;
+      validFrom?: number;
+      validUntil?: number;
+      lastVerifiedAt?: number;
+    }
+  | {
+      type: "resolve";
+      targetMemoryId: string;
+    }
+  | {
+      type: "archive";
+      targetMemoryId: string;
+    };
+
+export interface MemoryBootstrapPendingItem {
+  candidateId: string;
+  operation: MemoryBootstrapPendingOperation;
+  payload: MemoryBootstrapPendingPayload;
+  createdAt: number;
+  conversationId: string;
+  sourceSnapshotId: string;
+  throughTurnIndex: number;
+}
+
+export interface MemoryBootstrapPendingMemory {
+  project: string;
+  generatedAt?: number;
+  items: MemoryBootstrapPendingItem[];
+  revalidationExcludedCount: number;
+}
+
 export interface MemoryBootstrapSourceCounts {
   collaborationItems: number;
   workingItems: number;
+  pendingItems: number;
   continuationConversations: number;
   continuationMessages: number;
   relevantHits: number;
@@ -105,6 +165,7 @@ export interface MemoryBootstrapContext {
   sourcePolicy: string;
   collaborationMemory: MemoryBootstrapCollaborationMemory;
   workingMemory: MemoryBootstrapWorkingMemory;
+  pendingMemory: MemoryBootstrapPendingMemory;
   continuations: MemoryBootstrapContinuation[];
   relevant: MemoryBootstrapHit[];
   recent: MemoryBootstrapHit[];
@@ -123,6 +184,7 @@ export function memoryBootstrapSourceCounts(
   return memoryBootstrapSourceCountsByContext.get(context) ?? {
     collaborationItems: context.collaborationMemory.items.length,
     workingItems: context.workingMemory.items.length,
+    pendingItems: context.pendingMemory.items.length,
     continuationConversations: context.continuations.length,
     continuationMessages: context.continuations.reduce(
       (sum, continuation) => sum + continuation.messages.length,
@@ -137,6 +199,13 @@ export function memoryContinuationByteBudget(byteBudget: number): number {
   return Math.min(
     MAX_CONTINUATION_BOOTSTRAP_BYTES,
     Math.floor(byteBudget * 0.35),
+  );
+}
+
+export function memoryPendingByteBudget(byteBudget: number): number {
+  return Math.min(
+    MAX_PENDING_MEMORY_BOOTSTRAP_BYTES,
+    Math.floor(byteBudget * 0.25),
   );
 }
 
@@ -273,6 +342,7 @@ export class MemoryAdapter {
         relevant_limit: 0,
         recent_limit: 3,
         continuation_message_limit: 8,
+        pending_limit: 8,
       },
       { timeoutMs: this.config.bootstrapTimeoutMs },
     );
@@ -311,6 +381,10 @@ export function compactMemoryBootstrapContext(
     structured.collaboration_memory,
   );
   const workingMemoryCandidate = compactWorkingMemory(structured.working_memory, expectedProject);
+  const pendingMemoryCandidate = compactPendingMemory(
+    structured.pending_memory,
+    expectedProject,
+  );
   const continuationCandidates = Array.isArray(structured.continuations)
     ? structured.continuations.map(compactContinuation)
     : structured.continuation === undefined || structured.continuation === null
@@ -333,6 +407,14 @@ export function compactMemoryBootstrapContext(
       items: [],
       verification: [],
     },
+    pendingMemory: {
+      project: expectedProject,
+      ...(pendingMemoryCandidate.generatedAt === undefined
+        ? {}
+        : { generatedAt: pendingMemoryCandidate.generatedAt }),
+      items: [],
+      revalidationExcludedCount: pendingMemoryCandidate.revalidationExcludedCount,
+    },
     continuations: [],
     relevant: [],
     recent: [],
@@ -342,6 +424,7 @@ export function compactMemoryBootstrapContext(
   memoryBootstrapSourceCountsByContext.set(context, {
     collaborationItems: collaborationMemoryCandidate.items.length,
     workingItems: workingMemoryCandidate.items.length,
+    pendingItems: pendingMemoryCandidate.items.length,
     continuationConversations: continuationCandidates.length,
     continuationMessages: continuationCandidates.reduce(
       (sum, continuation) => sum + continuation.messages.length,
@@ -383,6 +466,20 @@ export function compactMemoryBootstrapContext(
     }
   }
   context.truncated ||= context.workingMemory.items.length < workingMemoryCandidate.items.length;
+
+  const pendingMemoryBudget = memoryPendingByteBudget(byteBudget);
+  for (const item of pendingMemoryCandidate.items) {
+    context.pendingMemory.items.push(item);
+    if (
+      byteLength(context.pendingMemory) > pendingMemoryBudget
+      || byteLength(context) > byteBudget
+    ) {
+      context.pendingMemory.items.pop();
+      context.truncated = true;
+      break;
+    }
+  }
+  context.truncated ||= context.pendingMemory.items.length < pendingMemoryCandidate.items.length;
 
   const continuationBudget = memoryContinuationByteBudget(byteBudget);
   for (const candidate of continuationCandidates) {
@@ -506,6 +603,126 @@ function compactCollaborationMemory(value: unknown): MemoryBootstrapCollaboratio
     ...(typeof memory.generated_at === "number" ? { generatedAt: memory.generated_at } : {}),
     items: memory.items.map(compactWorkingMemoryItem),
   };
+}
+
+function compactPendingMemory(
+  value: unknown,
+  expectedProject: string,
+): MemoryBootstrapPendingMemory {
+  if (value === undefined || value === null) {
+    return {
+      project: expectedProject,
+      items: [],
+      revalidationExcludedCount: 0,
+    };
+  }
+  const pending = record(value);
+  if (
+    !pending
+    || pending.project !== expectedProject
+    || !Array.isArray(pending.items)
+    || !Number.isInteger(pending.revalidation_excluded_count)
+    || (pending.revalidation_excluded_count as number) < 0
+  ) {
+    throw new Error("Malformed pending project memory");
+  }
+  return {
+    project: expectedProject,
+    ...(typeof pending.generated_at === "number"
+      ? { generatedAt: pending.generated_at }
+      : {}),
+    items: pending.items.map(compactPendingMemoryItem),
+    revalidationExcludedCount: pending.revalidation_excluded_count as number,
+  };
+}
+
+function compactPendingMemoryItem(value: unknown): MemoryBootstrapPendingItem {
+  const item = record(value);
+  if (
+    !item
+    || typeof item.candidate_id !== "string"
+    || !isPendingOperation(item.operation)
+    || typeof item.created_at !== "number"
+    || typeof item.conversation_id !== "string"
+    || typeof item.source_snapshot_id !== "string"
+    || !Number.isInteger(item.through_turn_index)
+  ) {
+    throw new Error("Malformed pending project memory item");
+  }
+  return {
+    candidateId: clip(item.candidate_id, 200),
+    operation: item.operation,
+    payload: compactPendingMemoryPayload(item.payload, item.operation),
+    createdAt: item.created_at,
+    conversationId: clip(item.conversation_id, 200),
+    sourceSnapshotId: clip(item.source_snapshot_id, 200),
+    throughTurnIndex: item.through_turn_index as number,
+  };
+}
+
+function compactPendingMemoryPayload(
+  value: unknown,
+  operation: MemoryBootstrapPendingOperation,
+): MemoryBootstrapPendingPayload {
+  const payload = record(value);
+  if (!payload || payload.type !== operation) {
+    throw new Error("Malformed pending project memory payload");
+  }
+  if (operation === "resolve" || operation === "archive") {
+    if (typeof payload.target_memory_id !== "string") {
+      throw new Error("Malformed pending project memory payload");
+    }
+    return {
+      type: operation,
+      targetMemoryId: clip(payload.target_memory_id, 200),
+    };
+  }
+  if (
+    typeof payload.memory_id !== "string"
+    || typeof payload.kind !== "string"
+    || typeof payload.key !== "string"
+    || typeof payload.importance !== "number"
+    || typeof payload.confidence !== "number"
+    || (operation === "supersede" && typeof payload.target_memory_id !== "string")
+  ) {
+    throw new Error("Malformed pending project memory payload");
+  }
+  const common = {
+    memoryId: clip(payload.memory_id, 200),
+    kind: clip(payload.kind, 40),
+    key: clip(payload.key, 160),
+    value: compactPendingJsonValue(payload.value),
+    importance: payload.importance,
+    confidence: payload.confidence,
+    ...(typeof payload.valid_from === "number" ? { validFrom: payload.valid_from } : {}),
+    ...(typeof payload.valid_until === "number" ? { validUntil: payload.valid_until } : {}),
+    ...(typeof payload.last_verified_at === "number"
+      ? { lastVerifiedAt: payload.last_verified_at }
+      : {}),
+  };
+  return operation === "supersede"
+    ? {
+        type: "supersede",
+        ...common,
+        targetMemoryId: clip(payload.target_memory_id as string, 200),
+      }
+    : { type: "add", ...common };
+}
+
+function compactPendingJsonValue(value: unknown): unknown {
+  const compacted = compactJsonValue(value, 0);
+  if (byteLength(compacted) <= 900) return compacted;
+  return {
+    truncated: true,
+    preview: clip(JSON.stringify(compacted), 600),
+  };
+}
+
+function isPendingOperation(value: unknown): value is MemoryBootstrapPendingOperation {
+  return value === "add"
+    || value === "supersede"
+    || value === "resolve"
+    || value === "archive";
 }
 
 function compactWorkingMemoryItem(value: unknown): MemoryBootstrapWorkingItem {

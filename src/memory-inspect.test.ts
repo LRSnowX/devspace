@@ -50,6 +50,7 @@ test("memory inspection combines live repository freshness, handoff and CHIM hea
     1,
   );
   assert.match(formatProjectMemoryInspection(inspection), /working items 1 · flagged 1/);
+  assert.match(formatProjectMemoryInspection(inspection), /pending 1 items\/\d+ bytes/);
 });
 
 test("memory inspection still reports repository state when memory is disabled", async (t) => {
@@ -122,6 +123,19 @@ function fakeMemory(): MemoryClient {
         evidenceStrength: "conversation_only",
         sourceState: "current_by_evidence",
       }],
+    },
+    pendingMemory: {
+      project: "LEMonX",
+      items: [{
+        candidateId: "pending-next-step",
+        operation: "resolve",
+        payload: { type: "resolve", targetMemoryId: "old-blocker" },
+        createdAt: 2,
+        conversationId: "private-pending-conversation",
+        sourceSnapshotId: "private-pending-snapshot",
+        throughTurnIndex: 3,
+      }],
+      revalidationExcludedCount: 0,
     },
     continuations: [],
     relevant: [],

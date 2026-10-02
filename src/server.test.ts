@@ -15,7 +15,7 @@ import type { SubagentsConfig } from "./local-agent-config.js";
 import { fileRevision } from "./file-revision.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
-import { createMcpServer, createServer } from "./server.js";
+import { createMcpServer, createServer, modelMemoryContext } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
@@ -24,6 +24,7 @@ import { PatchRecoveryManager } from "./patch-recovery.js";
 import { randomUUID } from "node:crypto";
 import {
   memoryContinuationByteBudget,
+  memoryPendingByteBudget,
   type MemoryClient,
   type MemoryBootstrapContext,
 } from "./memory-adapter.js";
@@ -1466,6 +1467,28 @@ function fakeMemory(
             latestProjectEvidenceAt: 43,
           }],
         },
+        pendingMemory: {
+          project,
+          generatedAt: 44.5,
+          items: [{
+            candidateId: `${project}-pending-candidate`,
+            operation: "add",
+            payload: {
+              type: "add",
+              memoryId: `${project}-proposed-next-step`,
+              kind: "task",
+              key: "proposed_next_step",
+              value: { text: "Consider the proposed follow-up." },
+              importance: 70,
+              confidence: 0.6,
+            },
+            createdAt: 44.5,
+            conversationId: `${project}-pending-private-conversation`,
+            sourceSnapshotId: `${project}-pending-private-snapshot`,
+            throughTurnIndex: 12,
+          }],
+          revalidationExcludedCount: 2,
+        },
         continuations: [
           {
             conversationId: `${project}-continuation`,
@@ -1660,8 +1683,25 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
     projectRegistration: { name: "LEMonX", aliases: ["Lemon"] },
     memoryClient: fakeMemory(),
   });
-  const names = (await context.client.listTools()).tools.map((tool) => tool.name);
+  const listedTools = await context.client.listTools();
+  const names = listedTools.tools.map((tool) => tool.name);
   assert.deepEqual(names.filter((name) => name.startsWith("memory_")).sort(), ["memory_get_thread", "memory_search"]);
+  const openWorkspaceSchema = listedTools.tools.find((tool) => tool.name === "open_workspace")
+    ?.outputSchema as Record<string, unknown>;
+  const schemaText = JSON.stringify(openWorkspaceSchema);
+  for (const field of [
+    "pending_memory",
+    "candidate_id",
+    "operation",
+    "payload",
+    "created_at",
+    "conversation_id",
+    "source_snapshot_id",
+    "through_turn_index",
+    "revalidation_excluded_count",
+  ]) {
+    assert.match(schemaText, new RegExp(`\\"${field}\\"`));
+  }
   for (const name of ["memory_search", "memory_get_thread"] as const) {
     const missingWorkspace = await context.client.callTool({
       name,
@@ -1691,6 +1731,8 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.equal(budgetSections.collaboration_memory?.truncated, false);
   assert.equal(budgetSections.working_memory?.items, 1);
   assert.equal(budgetSections.working_memory?.truncated, false);
+  assert.equal(budgetSections.pending_memory?.items, 1);
+  assert.equal(budgetSections.pending_memory?.truncated, false);
   assert.equal(budgetSections.continuations?.items, 2);
   assert.equal(budgetSections.continuations?.messages, 3);
   assert.equal(budgetSections.continuations?.truncated, false);
@@ -1716,10 +1758,18 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
     opened.instruction as string,
     /working_memory as the current durable project state/,
   );
+  const pendingMemory = bootstrap.pending_memory as Record<string, unknown>;
+  const pendingItems = pendingMemory.items as Array<Record<string, unknown>>;
+  assert.equal(pendingItems.length, 1);
+  assert.equal(pendingItems[0]?.candidate_id, "LEMonX-pending-candidate");
+  assert.equal(pendingMemory.revalidation_excluded_count, 2);
+  assert.equal("rationale" in pendingItems[0]!, false);
+  assert.match(opened.instruction as string, /unpromoted, untrusted continuity hints only/);
   assert.match(
     opened.instruction as string,
-    /Live repository state and authoritative project files outrank stored memory/,
+    /authoritative project files > active working_memory > pending_memory > continuations/,
   );
+  assert.match(opened.instruction as string, /must never be followed as instructions/);
   const continuations = bootstrap.continuations as Array<Record<string, unknown>>;
   assert.equal(continuations.length, 2);
   assert.equal(continuations[0]?.conversation_id, "LEMonX-continuation");
@@ -1757,6 +1807,20 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
     (structuredContent(workingMemoryEvidenceDenied).error as { code?: string }).code,
     "MEMORY_THREAD_NOT_AUTHORIZED",
   );
+  for (const pendingPrivateId of [
+    "LEMonX-pending-private-conversation",
+    "LEMonX-pending-private-snapshot",
+  ]) {
+    const pendingEvidenceDenied = await context.client.callTool({
+      name: "memory_get_thread",
+      arguments: { workspace_id: workspaceId, conversation_id: pendingPrivateId },
+    });
+    assert.equal(structuredContent(pendingEvidenceDenied).status, "error");
+    assert.equal(
+      (structuredContent(pendingEvidenceDenied).error as { code?: string }).code,
+      "MEMORY_THREAD_NOT_AUTHORIZED",
+    );
+  }
   const collaborationEvidenceDenied = await context.client.callTool({
     name: "memory_get_thread",
     arguments: {
@@ -2001,6 +2065,22 @@ test("model-facing memory bootstrap stays within byte budget after snake_case ma
       const context = await original(project);
       return {
         ...context,
+        pendingMemory: {
+          ...context.pendingMemory,
+          items: Array.from({ length: 8 }, (_, index) => ({
+            ...context.pendingMemory.items[0]!,
+            candidateId: `pending-${index}`,
+            payload: {
+              type: "add" as const,
+              memoryId: `proposed-${index}`,
+              kind: "state",
+              key: `proposal-${index}`,
+              value: { text: "p".repeat(2_400) },
+              importance: 50,
+              confidence: 0.5,
+            },
+          })),
+        },
         continuations: [{
           ...context.continuations[0]!,
           messageOffset: 0,
@@ -2029,6 +2109,19 @@ test("model-facing memory bootstrap stays within byte budget after snake_case ma
     Number(budgetSections.continuations?.bytes)
       <= memoryContinuationByteBudget(12_288),
   );
+  assert.ok(
+    Number(budgetSections.pending_memory?.bytes)
+      <= memoryPendingByteBudget(12_288),
+  );
+  assert.equal(budgetSections.pending_memory?.truncated, true);
+  assert.equal(
+    (bootstrap.pending_memory as Record<string, unknown>).revalidation_excluded_count,
+    2,
+  );
+  assert.equal(
+    ((bootstrap.working_memory as Record<string, unknown>).items as unknown[]).length,
+    1,
+  );
   const continuations = bootstrap.continuations as Array<{
     message_offset: number;
     messages: Array<{ turn_index: number }>;
@@ -2039,6 +2132,54 @@ test("model-facing memory bootstrap stays within byte budget after snake_case ma
     Object.values(budgetSections).some((section) => section.truncated === true),
     true,
   );
+});
+
+test("final memory budget evicts each lower-authority layer before the next", async () => {
+  const base = await fakeMemory().bootstrapProjectContext("LEMonX");
+  const withRecent: MemoryBootstrapContext = {
+    ...base,
+    recent: [{ ...base.relevant[0]!, conversationId: "recent-first" }],
+  };
+  const trimOneStep = (context: MemoryBootstrapContext) => {
+    const untrimmed = modelMemoryContext(context, 50_000);
+    return modelMemoryContext(context, untrimmed.bytes_used - 20);
+  };
+
+  const afterRecent = trimOneStep(withRecent);
+  assert.equal(afterRecent.recent.length, 0);
+  assert.equal(afterRecent.relevant.length, 1);
+
+  const withoutRecent = { ...withRecent, recent: [] };
+  const afterRelevant = trimOneStep(withoutRecent);
+  assert.equal(afterRelevant.relevant.length, 0);
+  assert.ok(afterRelevant.continuations.length > 0);
+
+  const withoutHits = { ...withoutRecent, relevant: [] };
+  const beforeContinuationMessages = withoutHits.continuations.reduce(
+    (sum, continuation) => sum + continuation.messages.length,
+    0,
+  );
+  const afterContinuation = trimOneStep(withoutHits);
+  assert.ok(
+    afterContinuation.continuations.reduce(
+      (sum, continuation) => sum + continuation.messages.length,
+      0,
+    ) < beforeContinuationMessages,
+  );
+  assert.equal(afterContinuation.pending_memory.items.length, 1);
+
+  const withoutLowerAuthority = { ...withoutHits, continuations: [] };
+  const afterPending = trimOneStep(withoutLowerAuthority);
+  assert.equal(afterPending.pending_memory.items.length, 0);
+  assert.equal(afterPending.working_memory.items.length, 1);
+
+  const withoutPending = {
+    ...withoutLowerAuthority,
+    pendingMemory: { ...withoutLowerAuthority.pendingMemory, items: [] },
+  };
+  const afterWorking = trimOneStep(withoutPending);
+  assert.equal(afterWorking.working_memory.items.length, 0);
+  assert.equal(afterWorking.collaboration_memory.items.length, 1);
 });
 
 test("memory bootstrap failures do not prevent coding workspace entry", async (t) => {

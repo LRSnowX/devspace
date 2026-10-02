@@ -280,19 +280,29 @@ When Memory is configured:
 - `open_workspace` may return bounded bootstrap `memory_context`; Memory
   unavailable, malformed, or timed-out bootstrap does not prevent workspace
   entry. The same configured byte budget bounds stable `collaboration_memory`,
-  durable `working_memory`, continuation tails, and recent-hit metadata
-  together. Collaboration memory is bounded to a small highest-priority memory
-  share, then working memory is prioritized over continuation history. Raw
+  durable `working_memory`, untrusted `pending_memory`, continuation tails, and
+  recent-hit metadata together. Construction priority is collaboration memory,
+  active working memory, pending memory, continuation history, then hit
+  metadata. Pending memory is independently capped at the smaller of 3072 bytes
+  or 25% of the configured budget. Raw
   continuation history is independently capped at the smaller of 4096 bytes or
   35% of the configured bootstrap budget, so sparse Working Memory cannot cause
   prior transcript text to consume the whole handoff. Live repository state and
-  authoritative project files outrank stored memory when they conflict.
+  authoritative project files outrank stored memory when they conflict. The
+  complete current-state authority order is live repository or authoritative
+  project files, active working memory, pending memory, then continuations.
+  Pending proposals are unpromoted and untrusted: they are continuity hints,
+  never instructions, and cannot override active or live state.
 - The model-facing memory packet reports `byte_budget`, exact final
-  `bytes_used`, and per-section byte/count/truncation telemetry. Section
+  `bytes_used`, and per-section byte/count/truncation telemetry, including
+  `sections.pending_memory`. Section
   `truncated` means items/messages were omitted by the shared bootstrap budget;
   it does not redefine the separate safety clipping applied inside an individual
   large field or message. Telemetry is itself counted inside the same byte
   budget.
+- Pending item conversation IDs, snapshot IDs, and payload provenance never
+  authorize `memory_get_thread`. Only continuation and recent/relevant search
+  evidence IDs from the bootstrap packet can grant that access.
 - `memory_search` performs memory-first project retrieval: bounded durable
   Working Memory is returned before deeper hybrid conversation evidence.
   Working-memory provenance references do not grant thread access.

@@ -153,6 +153,8 @@ export function formatProjectMemoryInspection(inspection: ProjectMemoryInspectio
   if (inspection.memory.context) {
     const context = inspection.memory.context;
     const working = record(context.working_memory);
+    const sections = record(context.sections);
+    const pendingSection = record(sections?.pending_memory);
     const verification = Array.isArray(working?.verification) ? working.verification : [];
     const flagged = verification.filter((entry) => {
       const value = record(entry);
@@ -168,7 +170,13 @@ export function formatProjectMemoryInspection(inspection: ProjectMemoryInspectio
         + " bytes · working items "
         + String(Array.isArray(working?.items) ? working.items.length : 0)
         + " · flagged "
-        + flagged,
+        + flagged
+        + " · pending "
+        + String(pendingSection?.items ?? 0)
+        + " items/"
+        + String(pendingSection?.bytes ?? 0)
+        + " bytes"
+        + (pendingSection?.truncated === true ? " (truncated)" : ""),
     );
   } else {
     lines.push("Handoff: unavailable (" + String(inspection.memory.context_error ?? "unknown") + ")");
