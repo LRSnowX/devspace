@@ -1572,6 +1572,23 @@ test("project entry resolves paths, names and aliases with workspace reuse", asy
       path: "missing-project",
     },
   });
+  const missingAbsolutePath = join(context.root, "missing-absolute-project");
+  const missingAbsolute = await callOpen(context.client, missingAbsolutePath);
+  assert.notEqual(missingAbsolute.isError, true);
+  assert.deepEqual(structuredContent(missingAbsolute), {
+    result:
+      `Project path does not exist: ${missingAbsolutePath}. Open an existing directory inside an allowed root or register the project.`,
+    status: "error",
+    error: {
+      code: "PROJECT_NOT_FOUND",
+      category: "not_found",
+      message:
+        `Project path does not exist: ${missingAbsolutePath}. Open an existing directory inside an allowed root or register the project.`,
+      retryable: false,
+      path: missingAbsolutePath,
+    },
+  });
+  await assert.rejects(() => access(missingAbsolutePath), /ENOENT/);
   const outsidePath = join(context.root, "..");
   const outside = await callOpen(context.client, outsidePath);
   assert.notEqual(outside.isError, true);
@@ -1599,10 +1616,22 @@ test("project entry resolves paths, names and aliases with workspace reuse", asy
     },
   });
   const missing = join(context.root, "new-project");
-  const created = structuredContent(await callOpen(context.client, missing, "same-session"));
-  assert.equal(created.status, "opened");
-  assert.equal(created.project_name, "new-project");
-  assert.equal(created.root, missing);
+  const missingProject = await callOpen(context.client, missing, "same-session");
+  assert.notEqual(missingProject.isError, true);
+  assert.deepEqual(structuredContent(missingProject), {
+    result:
+      `Project path does not exist: ${missing}. Open an existing directory inside an allowed root or register the project.`,
+    status: "error",
+    error: {
+      code: "PROJECT_NOT_FOUND",
+      category: "not_found",
+      message:
+        `Project path does not exist: ${missing}. Open an existing directory inside an allowed root or register the project.`,
+      retryable: false,
+      path: missing,
+    },
+  });
+  await assert.rejects(() => access(missing), /ENOENT/);
 });
 
 test("ambiguous project entry is rejected", async (t) => {

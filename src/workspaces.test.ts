@@ -99,13 +99,21 @@ test("workspace instruction symlinks cannot escape the workspace", {
   );
 });
 
-test("opening a missing checkout creates its workspace root", async (t) => {
+test("opening a missing checkout fails closed without creating its workspace root", async (t) => {
   const context = await fixture(t);
   const missingRoot = join(context.root, "missing", "workspace");
 
-  const opened = await context.registry.openWorkspace(missingRoot);
-  assert.equal(opened.workspace.root, missingRoot);
-  assert.equal((await stat(missingRoot)).isDirectory(), true);
+  await assert.rejects(
+    () => context.registry.openWorkspace(missingRoot),
+    (error: unknown) =>
+      error instanceof Error
+      && "payload" in error
+      && (error as { payload?: { code?: string; path?: string } }).payload?.code
+        === "PROJECT_NOT_FOUND"
+      && (error as { payload?: { code?: string; path?: string } }).payload?.path
+        === missingRoot,
+  );
+  await assert.rejects(() => stat(missingRoot), /ENOENT/);
 });
 
 test("worktree opens require Git and create an isolated managed workspace", async (t) => {

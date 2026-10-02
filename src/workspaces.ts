@@ -7,7 +7,7 @@ import type {
   WorkspaceSession,
   WorkspaceStore,
 } from "./workspace-store.js";
-import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
+import { opendir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
@@ -97,7 +97,6 @@ export interface OpenWorkspaceOptions {
 type PathStats = Stats;
 type DirectoryOps = {
   stat: (path: string) => Promise<PathStats>;
-  mkdir: (path: string, options: { recursive: true }) => Promise<unknown>;
 };
 
 const MAX_CACHED_WORKSPACES = 32;
@@ -680,18 +679,27 @@ function unavailableWorkspaceError(workspaceId: string): Error {
 
 export async function ensureCheckoutWorkspaceRoot(
   path: string,
-  ops: DirectoryOps = { stat, mkdir },
+  ops: DirectoryOps = { stat },
 ): Promise<PathStats> {
   try {
     return await ops.stat(path);
   } catch (error) {
-    if (!isErrnoException(error) || error.code !== "ENOENT") {
+    if (
+      !isErrnoException(error)
+      || (error.code !== "ENOENT" && error.code !== "ENOTDIR")
+    ) {
       throw error;
     }
   }
 
-  await ops.mkdir(path, { recursive: true });
-  return await ops.stat(path);
+  throw new ToolOperationError({
+    code: "PROJECT_NOT_FOUND",
+    category: "not_found",
+    message:
+      `Project path does not exist: ${path}. Open an existing directory inside an allowed root or register the project.`,
+    retryable: false,
+    path,
+  });
 }
 
 const CONTEXT_FILE_NAMES = new Set(["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
