@@ -28,10 +28,11 @@ Treat these as stronger current evidence than stored memory. Repository state is
 refreshed even if `open_workspace` reuses an existing checkout workspace.
 
 If the optional read-only CHIM Memory Adapter is configured, `open_workspace`
-also returns a bounded `memory_context`. Treat `working_memory`, when present,
-as durable current project state and `continuations` as recent prior-conversation
-context; continue from both without waiting for the user to request a memory
-lookup. Current repository state and authoritative project files take
+also returns a bounded `memory_context`. Treat `collaboration_memory`, when
+present, as stable cross-project collaboration rules; `working_memory` as
+durable current project state; and `continuations` as recent prior-conversation
+context. Continue from those layers without waiting for the user to request a
+memory lookup. Current repository state and authoritative project files take
 precedence over stale stored memory. The memory context may be absent without
 affecting coding access. For a specific deeper-history question, use
 `memory_search`; expand only a returned conversation or evidence ID with

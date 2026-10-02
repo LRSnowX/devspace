@@ -103,13 +103,14 @@ Memory is opt-in through the `memory` section of the versioned config. Set
 `memory_context` after a `bootstrapTimeoutMs` (default 5000 ms) attempt;
 unavailable, timed-out, or malformed Memory responses do not block workspace
 entry. The default budget is 12288 bytes. The bootstrap may include bounded
-`working_memory` plus bounded `continuations` from recent project conversations
-so a new host conversation receives durable current project state and recent
+`collaboration_memory`, bounded `working_memory`, and bounded `continuations`
+from recent project conversations so a new host conversation receives stable
+cross-project collaboration rules, durable current project state, and recent
 episodic context without an explicit history lookup; full threads are never
-injected automatically. Working memory is compacted first under a bounded share
-of the same bootstrap budget, then remaining space is used for continuation
-history. Live repository state and authoritative project files remain stronger
-evidence than stored memory when they conflict.
+injected automatically. Collaboration memory receives a small bounded share of
+the same bootstrap budget, then working memory, then remaining space is used for
+continuation history. Live repository state and authoritative project files
+remain stronger evidence than stored memory when they conflict.
 `open_workspace` exposes that stronger evidence explicitly as a bounded
 `repository_state` snapshot plus `authoritative_references`. The repository
 snapshot includes branch/HEAD/upstream divergence, dirty-state counts, and at

@@ -63,9 +63,15 @@ export interface MemoryBootstrapWorkingMemory {
   items: MemoryBootstrapWorkingItem[];
 }
 
+export interface MemoryBootstrapCollaborationMemory {
+  generatedAt?: number;
+  items: MemoryBootstrapWorkingItem[];
+}
+
 export interface MemoryBootstrapContext {
   project: string;
   sourcePolicy: string;
+  collaborationMemory: MemoryBootstrapCollaborationMemory;
   workingMemory: MemoryBootstrapWorkingMemory;
   continuations: MemoryBootstrapContinuation[];
   relevant: MemoryBootstrapHit[];
@@ -241,6 +247,9 @@ export function compactMemoryBootstrapContext(
     relevant: structured.relevant.map(compactHit),
     recent: structured.recent.map(compactHit),
   };
+  const collaborationMemoryCandidate = compactCollaborationMemory(
+    structured.collaboration_memory,
+  );
   const workingMemoryCandidate = compactWorkingMemory(structured.working_memory, expectedProject);
   const continuationCandidates = Array.isArray(structured.continuations)
     ? structured.continuations.map(compactContinuation)
@@ -250,6 +259,12 @@ export function compactMemoryBootstrapContext(
   const context: MemoryBootstrapContext = {
     project: expectedProject,
     sourcePolicy: clip(structured.source_policy, 80),
+    collaborationMemory: {
+      ...(collaborationMemoryCandidate.generatedAt === undefined
+        ? {}
+        : { generatedAt: collaborationMemoryCandidate.generatedAt }),
+      items: [],
+    },
     workingMemory: {
       project: expectedProject,
       ...(workingMemoryCandidate.generatedAt === undefined
@@ -263,6 +278,21 @@ export function compactMemoryBootstrapContext(
     truncated: false,
     byteBudget,
   };
+  const collaborationMemoryBudget = Math.min(2_048, Math.floor(byteBudget * 0.2));
+  for (const item of collaborationMemoryCandidate.items) {
+    context.collaborationMemory.items.push(item);
+    if (
+      byteLength(context.collaborationMemory) > collaborationMemoryBudget
+      || byteLength(context) > byteBudget
+    ) {
+      context.collaborationMemory.items.pop();
+      context.truncated = true;
+      break;
+    }
+  }
+  context.truncated ||=
+    context.collaborationMemory.items.length < collaborationMemoryCandidate.items.length;
+
   const workingMemoryBudget = Math.min(6_144, Math.floor(byteBudget * 0.55));
   for (const item of workingMemoryCandidate.items) {
     context.workingMemory.items.push(item);
@@ -376,6 +406,18 @@ function compactWorkingMemory(
     project: expectedProject,
     ...(typeof working.generated_at === "number" ? { generatedAt: working.generated_at } : {}),
     items: working.items.map(compactWorkingMemoryItem),
+  };
+}
+
+function compactCollaborationMemory(value: unknown): MemoryBootstrapCollaborationMemory {
+  if (value === undefined || value === null) return { items: [] };
+  const memory = record(value);
+  if (!memory || !Array.isArray(memory.items)) {
+    throw new Error("Malformed collaboration memory");
+  }
+  return {
+    ...(typeof memory.generated_at === "number" ? { generatedAt: memory.generated_at } : {}),
+    items: memory.items.map(compactWorkingMemoryItem),
   };
 }
 

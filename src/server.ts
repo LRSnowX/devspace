@@ -206,9 +206,14 @@ const memoryBootstrapWorkingMemoryOutputSchema = z.object({
   generated_at: z.number().optional(),
   items: z.array(memoryBootstrapWorkingItemOutputSchema),
 });
+const memoryBootstrapCollaborationMemoryOutputSchema = z.object({
+  generated_at: z.number().optional(),
+  items: z.array(memoryBootstrapWorkingItemOutputSchema),
+});
 const memoryBootstrapContextOutputSchema = z.object({
   project: z.string(),
   source_policy: z.string(),
+  collaboration_memory: memoryBootstrapCollaborationMemoryOutputSchema,
   working_memory: memoryBootstrapWorkingMemoryOutputSchema,
   continuations: z.array(memoryBootstrapContinuationOutputSchema),
   relevant: z.array(memoryBootstrapHitOutputSchema),
@@ -227,27 +232,32 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
     snippet: hit.snippet,
     topic_tags: hit.topicTags,
   });
+  const mapMemoryItem = (item: MemoryBootstrapContext["workingMemory"]["items"][number]) => ({
+    memory_id: item.memoryId,
+    kind: item.kind,
+    key: item.key,
+    value: item.value,
+    importance: item.importance,
+    confidence: item.confidence,
+    valid_from: item.validFrom,
+    valid_until: item.validUntil,
+    last_verified_at: item.lastVerifiedAt,
+    evidence: item.evidence.map((evidence) => ({
+      kind: evidence.kind,
+      reference: evidence.reference,
+    })),
+  });
   const output = {
     project: context.project,
     source_policy: context.sourcePolicy,
+    collaboration_memory: {
+      generated_at: context.collaborationMemory.generatedAt,
+      items: context.collaborationMemory.items.map(mapMemoryItem),
+    },
     working_memory: {
       project: context.workingMemory.project,
       generated_at: context.workingMemory.generatedAt,
-      items: context.workingMemory.items.map((item) => ({
-        memory_id: item.memoryId,
-        kind: item.kind,
-        key: item.key,
-        value: item.value,
-        importance: item.importance,
-        confidence: item.confidence,
-        valid_from: item.validFrom,
-        valid_until: item.validUntil,
-        last_verified_at: item.lastVerifiedAt,
-        evidence: item.evidence.map((evidence) => ({
-          kind: evidence.kind,
-          reference: evidence.reference,
-        })),
-      })),
+      items: context.workingMemory.items.map(mapMemoryItem),
     },
     continuations: context.continuations.map((continuation) => ({
           conversation_id: continuation.conversationId,
@@ -284,6 +294,8 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
         output.continuations.pop();
       } else if (output.working_memory.items.length > 0) {
         output.working_memory.items.pop();
+      } else if (output.collaboration_memory.items.length > 0) {
+        output.collaboration_memory.items.pop();
       } else {
         throw new Error("Memory bootstrap byte budget is too small for its envelope");
       }
@@ -868,15 +880,24 @@ function registerMcpSurface(
           });
         }
       }
-      const memoryInstruction = memoryContext?.working_memory.items.length
-        ? memoryContext.continuations.length
-          ? "Treat structuredContent.memory_context.working_memory as the current durable project state and structuredContent.memory_context.continuations as recent prior-conversation context. Continue from both without waiting for the user to ask you to search memory. Live repository state and authoritative project files outrank stored memory when they conflict; use memory_search only when additional history is needed."
-          : "Treat structuredContent.memory_context.working_memory as the current durable project state. Continue from it without waiting for the user to ask you to search memory. Live repository state and authoritative project files outrank stored memory when they conflict; use memory_search only when additional history is needed."
-        : memoryContext?.continuations.length
-          ? "Treat structuredContent.memory_context.continuations as recent prior-conversation context for this project. Continue from them without waiting for the user to ask you to search memory; use memory_search only when additional history is needed."
-          : memoryContext
-            ? "Use structuredContent.memory_context as bounded prior project context; use memory_search when additional history is needed."
-            : undefined;
+      const memoryLayers = memoryContext
+        ? [
+            memoryContext.collaboration_memory.items.length
+              ? "structuredContent.memory_context.collaboration_memory as stable cross-project collaboration rules"
+              : undefined,
+            memoryContext.working_memory.items.length
+              ? "structuredContent.memory_context.working_memory as the current durable project state"
+              : undefined,
+            memoryContext.continuations.length
+              ? "structuredContent.memory_context.continuations as recent prior-conversation context"
+              : undefined,
+          ].filter((value): value is string => Boolean(value))
+        : [];
+      const memoryInstruction = memoryContext
+        ? memoryLayers.length > 0
+          ? `Treat ${memoryLayers.join(", ")}. Continue from these memory layers without waiting for the user to request a memory lookup. Live repository state and authoritative project files outrank stored memory when they conflict; use memory_search only when additional history is needed.`
+          : "Use structuredContent.memory_context as bounded prior project context; use memory_search when additional history is needed."
+        : undefined;
       const cardInstruction = [
         config.skillsEnabled
           ? "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
@@ -938,6 +959,9 @@ function registerMcpSurface(
               : `Repository state unavailable: ${repositoryState.reason ?? "unknown"}.`,
             authoritativeReferences.length > 0
               ? `Authoritative project references: ${authoritativeReferences.map((reference) => reference.path).join(", ")}`
+              : undefined,
+            memoryContext?.collaboration_memory.items.length
+              ? "Stable Collaboration Memory is available in structuredContent.memory_context.collaboration_memory."
               : undefined,
             memoryContext?.working_memory.items.length
               ? "Durable Project Working Memory is available in structuredContent.memory_context.working_memory."

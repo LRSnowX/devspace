@@ -278,10 +278,12 @@ When Memory is configured:
   represented explicitly instead of relying only on prose priority guidance.
 - `open_workspace` may return bounded bootstrap `memory_context`; Memory
   unavailable, malformed, or timed-out bootstrap does not prevent workspace
-  entry. The same configured byte budget bounds durable `working_memory`,
-  continuation tails, and recent-hit metadata together. Working memory is
-  prioritized over continuation history, while live repository state and
-  authoritative project files outrank stored memory when they conflict.
+  entry. The same configured byte budget bounds stable `collaboration_memory`,
+  durable `working_memory`, continuation tails, and recent-hit metadata
+  together. Collaboration memory is bounded to a small highest-priority memory
+  share, then working memory is prioritized over continuation history, while
+  live repository state and authoritative project files outrank stored memory
+  when they conflict.
 - `memory_search` performs memory-first project retrieval: bounded durable
   Working Memory is returned before deeper hybrid conversation evidence.
   Working-memory provenance references do not grant thread access.
@@ -295,6 +297,8 @@ When Memory is configured:
 - Provenance references attached to working-memory items do not automatically
   authorize thread expansion; conversation expansion still requires normal
   bootstrap/search discovery.
+- Collaboration-memory provenance follows the same rule: global collaboration
+  items do not implicitly authorize their source conversation IDs.
 
 ### Current limitation
 

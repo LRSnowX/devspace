@@ -1418,6 +1418,22 @@ function fakeMemory(bootstrapFailure?: Error): MemoryClient {
       return {
         project,
         sourcePolicy: "relevance-filter",
+        collaborationMemory: {
+          generatedAt: 45,
+          items: [{
+            memoryId: "global-upstream-compatibility",
+            kind: "preference",
+            key: "upstream_compatibility",
+            value: { text: "Preserve upstream compatibility where practical." },
+            importance: 100,
+            confidence: 1,
+            lastVerifiedAt: 45,
+            evidence: [{
+              kind: "conversation_turn",
+              reference: "global-collaboration-private-evidence",
+            }],
+          }],
+        },
         workingMemory: {
           project,
           generatedAt: 44,
@@ -1623,6 +1639,17 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.ok(Buffer.byteLength(JSON.stringify(bootstrap), "utf8") <= 12_288);
   assert.equal(bootstrap.byte_budget, 12_288);
   assert.equal("messages" in bootstrap, false);
+  const collaborationMemory = bootstrap.collaboration_memory as Record<string, unknown>;
+  const collaborationItems = collaborationMemory.items as Array<Record<string, unknown>>;
+  assert.equal(collaborationItems.length, 1);
+  assert.equal(collaborationItems[0]?.memory_id, "global-upstream-compatibility");
+  assert.deepEqual(collaborationItems[0]?.value, {
+    text: "Preserve upstream compatibility where practical.",
+  });
+  assert.match(
+    opened.instruction as string,
+    /collaboration_memory as stable cross-project collaboration rules/,
+  );
   const workingMemory = bootstrap.working_memory as Record<string, unknown>;
   assert.equal(workingMemory.project, "LEMonX");
   const workingItems = workingMemory.items as Array<Record<string, unknown>>;
@@ -1672,6 +1699,19 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.equal(structuredContent(workingMemoryEvidenceDenied).status, "error");
   assert.equal(
     (structuredContent(workingMemoryEvidenceDenied).error as { code?: string }).code,
+    "MEMORY_THREAD_NOT_AUTHORIZED",
+  );
+  const collaborationEvidenceDenied = await context.client.callTool({
+    name: "memory_get_thread",
+    arguments: {
+      workspace_id: workspaceId,
+      conversation_id: "global-collaboration-private-evidence",
+    },
+  });
+  assert.notEqual(collaborationEvidenceDenied.isError, true);
+  assert.equal(structuredContent(collaborationEvidenceDenied).status, "error");
+  assert.equal(
+    (structuredContent(collaborationEvidenceDenied).error as { code?: string }).code,
     "MEMORY_THREAD_NOT_AUTHORIZED",
   );
   const bootstrapThread = await context.client.callTool({

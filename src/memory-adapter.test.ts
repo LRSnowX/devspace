@@ -156,6 +156,64 @@ test("memory bootstrap prioritizes bounded working memory before continuation hi
   );
 });
 
+test("memory bootstrap bounds collaboration memory ahead of project memory without authorizing provenance", () => {
+  const raw = projectContext() as {
+    structuredContent: Record<string, unknown>;
+  };
+  raw.structuredContent.collaboration_memory = {
+    generated_at: 222,
+    items: Array.from({ length: 6 }, (_, index) => ({
+      memory_id: "collaboration-" + index,
+      kind: index === 0 ? "invariant" : "preference",
+      key: "collaboration-key-" + index,
+      value: { text: "rule-" + index + "-" + "c".repeat(700) },
+      importance: 100 - index,
+      confidence: 1,
+      evidence: [{
+        kind: "conversation_turn",
+        reference: "conversation:collaboration-private-" + index + ":turn:1",
+      }],
+    })),
+  };
+  raw.structuredContent.working_memory = {
+    project: "Jack",
+    items: [{
+      memory_id: "project-goal",
+      kind: "state",
+      key: "current_goal",
+      value: { text: "finish the current project" },
+      importance: 100,
+      confidence: 1,
+      evidence: [],
+    }],
+  };
+  raw.structuredContent.continuations = [{
+    conversation_id: "continuation-1",
+    source: "chatgpt",
+    title: "Previous chat",
+    message_offset: 0,
+    total_messages: 2,
+    messages: [
+      { role: "user", turn_index: 0, text: "continue" },
+      { role: "assistant", turn_index: 1, text: "next action" },
+    ],
+  }];
+
+  const context = compactMemoryBootstrapContext(raw, "Jack", 8_192);
+  assert.ok(Buffer.byteLength(JSON.stringify(context), "utf8") <= 8_192);
+  assert.ok(context.collaborationMemory.items.length > 0);
+  assert.ok(context.collaborationMemory.items.length < 6);
+  assert.equal(context.collaborationMemory.items[0]?.memoryId, "collaboration-0");
+  assert.equal(context.workingMemory.items[0]?.memoryId, "project-goal");
+  assert.equal(context.continuations[0]?.conversationId, "continuation-1");
+  assert.equal(
+    memoryEvidenceIdsFromBootstrapContext(context).some((id) =>
+      id.startsWith("collaboration-private-")
+    ),
+    false,
+  );
+});
+
 test("memory bootstrap compacts a single oversized working-memory value", () => {
   const raw = projectContext() as {
     structuredContent: Record<string, unknown>;
