@@ -22,6 +22,11 @@ tools. A missing or ambiguous name requires an absolute path or registration.
 The result includes a `workspace_id`. All later file, search, edit, show-changes,
 and shell calls should reuse that same `workspace_id`.
 
+The result also includes a live `repository_state` when Git can be inspected and
+an `authoritative_references` list for DevSpace-recognized instruction files.
+Treat these as stronger current evidence than stored memory. Repository state is
+refreshed even if `open_workspace` reuses an existing checkout workspace.
+
 If the optional read-only CHIM Memory Adapter is configured, `open_workspace`
 also returns a bounded `memory_context`. Treat `working_memory`, when present,
 as durable current project state and `continuations` as recent prior-conversation

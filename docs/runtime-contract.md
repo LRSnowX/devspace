@@ -269,6 +269,13 @@ When Memory is configured:
 ### Guarantees
 
 - Memory remains a read-only optional extension to the coding surface.
+- `open_workspace` returns a bounded `repository_state` when Git state can be
+  inspected. It is refreshed on every call and reports branch/HEAD, optional
+  upstream ahead/behind counts, dirty-state counters, and a capped changed-path
+  sample. Git inspection failure does not prevent workspace entry.
+- `authoritative_references` identifies DevSpace-recognized project instruction
+  files. Loaded project instructions and discoverable nested instructions are
+  represented explicitly instead of relying only on prose priority guidance.
 - `open_workspace` may return bounded bootstrap `memory_context`; Memory
   unavailable, malformed, or timed-out bootstrap does not prevent workspace
   entry. The same configured byte budget bounds durable `working_memory`,

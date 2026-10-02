@@ -60,6 +60,7 @@ import { ProjectRegistry } from "./project-registry.js";
 import { PatchRecoveryManager, runPatchStartupRecovery } from "./patch-recovery.js";
 import { expandHomePath } from "./roots.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
+import { readRepositoryState } from "./repository-state.js";
 import { conversationScopeIdFromRequestMeta } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
@@ -341,6 +342,60 @@ const workspaceAgentsFileOutputSchema = z.object({
   truncated: z.boolean().optional(),
   original_bytes: z.number().int().positive().optional(),
 });
+
+const repositoryChangeOutputSchema = z.object({
+  status: z.string(),
+  path: z.string(),
+});
+
+const repositoryStateOutputSchema = z.object({
+  available: z.boolean(),
+  reason: z.enum(["not_git", "unborn_head", "git_error"]).optional(),
+  git_root: z.string().optional(),
+  branch: z.string().optional(),
+  head: z.string().optional(),
+  detached: z.boolean().optional(),
+  upstream: z.string().optional(),
+  ahead: z.number().int().nonnegative().optional(),
+  behind: z.number().int().nonnegative().optional(),
+  dirty: z.boolean().optional(),
+  modified: z.number().int().nonnegative().optional(),
+  deleted: z.number().int().nonnegative().optional(),
+  renamed: z.number().int().nonnegative().optional(),
+  untracked: z.number().int().nonnegative().optional(),
+  conflicted: z.number().int().nonnegative().optional(),
+  changes: z.array(repositoryChangeOutputSchema).optional(),
+  changes_truncated: z.boolean().optional(),
+});
+
+const authoritativeReferenceOutputSchema = z.object({
+  path: z.string(),
+  kind: z.enum(["project_instructions", "nested_instructions"]),
+  loaded: z.boolean(),
+  truncated: z.boolean().optional(),
+});
+
+function modelRepositoryState(state: Awaited<ReturnType<typeof readRepositoryState>>) {
+  return {
+    available: state.available,
+    reason: state.reason,
+    git_root: state.gitRoot,
+    branch: state.branch,
+    head: state.head,
+    detached: state.detached,
+    upstream: state.upstream,
+    ahead: state.ahead,
+    behind: state.behind,
+    dirty: state.dirty,
+    modified: state.modified,
+    deleted: state.deleted,
+    renamed: state.renamed,
+    untracked: state.untracked,
+    conflicted: state.conflicted,
+    changes: state.changes,
+    changes_truncated: state.changesTruncated,
+  };
+}
 
 const workspaceLocalAgentOutputSchema = z.object({
   name: z.string(),
@@ -660,6 +715,8 @@ function registerMcpSurface(
         agents: z.array(workspaceLocalAgentOutputSchema).optional(),
         skill_diagnostics: z.array(z.unknown()).optional(),
         project_name: z.string().optional(),
+        repository_state: repositoryStateOutputSchema.optional(),
+        authoritative_references: z.array(authoritativeReferenceOutputSchema).optional(),
         memory_context: memoryBootstrapContextOutputSchema.optional(),
         review: z.discriminatedUnion("available", [
           z.object({ available: z.literal(true) }),
@@ -730,10 +787,13 @@ function registerMcpSurface(
         workspaceReused,
         includeBootstrapContext,
       } = workspaceContext;
-      const review = await reviewCheckpoints.initializeWorkspace({
-        workspaceId: workspace.id,
-        root: workspace.root,
-      });
+      const [review, repositoryState] = await Promise.all([
+        reviewCheckpoints.initializeWorkspace({
+          workspaceId: workspace.id,
+          root: workspace.root,
+        }),
+        readRepositoryState(workspace.root),
+      ]);
       const preloadSubagents = config.subagents.enabled
         && config.subagents.instructions === "preload";
       const subagentsSkill = workspace.skills.find((skill) => skill.name === "subagents");
@@ -769,6 +829,22 @@ function registerMcpSurface(
       const cardAvailableAgentsFiles = availableAgentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
       }));
+      const loadedReferencePaths = new Set(cardAgentsFiles.map((file) => file.path));
+      const authoritativeReferences = [
+        ...cardAgentsFiles.map((file) => ({
+          path: file.path,
+          kind: "project_instructions" as const,
+          loaded: true,
+          ...(file.truncated ? { truncated: true } : {}),
+        })),
+        ...cardAvailableAgentsFiles
+          .filter((file) => !loadedReferencePaths.has(file.path))
+          .map((file) => ({
+            path: file.path,
+            kind: "nested_instructions" as const,
+            loaded: false,
+          })),
+      ];
       const visibleSkills = includeBootstrapContext ? cardSkills : [];
       const visibleAgentProviders = includeBootstrapContext ? cardAgentProviders : [];
       const visibleAgents = includeBootstrapContext ? cardAgents : [];
@@ -805,6 +881,7 @@ function registerMcpSurface(
         config.skillsEnabled
           ? "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
           : "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file.",
+        "Treat structuredContent.repository_state as the live repository snapshot for this workspace. Treat structuredContent.authoritative_references as the explicit project-instruction sources. These live/authoritative sources outrank stored memory when they conflict.",
         memoryInstruction,
         truncatedAgentsFiles.length > 0
           ? "Some oversized instruction files were context-bounded to their beginning and latest tail. Treat the visible content as authoritative for those portions and use read on the returned path when an omitted middle section is relevant."
@@ -814,6 +891,7 @@ function registerMcpSurface(
         ? [
             `Workspace already open as ${workspace.id}.`,
             "Continue with this workspace_id.",
+            "structuredContent.repository_state is refreshed for this call; treat it as the current repository reality.",
             "Keep following the project instructions, nested instruction files, skills, agent profiles, and diagnostics already provided for this workspace.",
           ].join("\n\n")
         : workspace.mode === "worktree"
@@ -854,6 +932,12 @@ function registerMcpSurface(
               : undefined,
             visibleAgents.length > 0
               ? `Available subagent profiles: ${visibleAgents.map(formatVisibleAgent).join(", ")}`
+              : undefined,
+            repositoryState.available
+              ? `Repository state: ${repositoryState.branch ?? "(detached)"} @ ${repositoryState.head?.slice(0, 12) ?? "unknown"}; dirty=${repositoryState.dirty ?? false}.`
+              : `Repository state unavailable: ${repositoryState.reason ?? "unknown"}.`,
+            authoritativeReferences.length > 0
+              ? `Authoritative project references: ${authoritativeReferences.map((reference) => reference.path).join(", ")}`
               : undefined,
             memoryContext?.working_memory.items.length
               ? "Durable Project Working Memory is available in structuredContent.memory_context.working_memory."
@@ -910,6 +994,8 @@ function registerMcpSurface(
           root: workspace.root,
           mode: workspace.mode,
           project_name: projectName,
+          repository_state: modelRepositoryState(repositoryState),
+          authoritative_references: authoritativeReferences,
           memory_context: memoryContext,
           source_root: workspace.sourceRoot,
           worktree: workspace.worktree

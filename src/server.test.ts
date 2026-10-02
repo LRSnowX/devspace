@@ -1014,6 +1014,51 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
   assert.ok(Array.isArray(card.agents));
 });
 
+test("open_workspace returns refreshed live repository state and explicit authoritative references", async (t) => {
+  const context = await fixture(t, { git: true });
+  await writeFile(join(context.project, "README.md"), "changed\n");
+  await writeFile(join(context.project, "untracked.txt"), "new\n");
+
+  const first = structuredContent(
+    await callOpen(context.client, context.project, "repository-state"),
+  );
+  const firstState = first.repository_state as Record<string, unknown>;
+  assert.equal(firstState.available, true);
+  assert.equal(firstState.dirty, true);
+  assert.equal(firstState.modified, 1);
+  assert.equal(firstState.untracked, 1);
+  assert.equal(typeof firstState.branch, "string");
+  assert.match(firstState.head as string, /^[0-9a-f]{40}$/);
+  assert.ok(Array.isArray(firstState.changes));
+  assert.match(first.instruction as string, /repository_state as the live repository snapshot/);
+
+  const references = first.authoritative_references as Array<Record<string, unknown>>;
+  assert.ok(Array.isArray(references));
+  assert.ok(references.some((reference) =>
+    reference.path === "AGENTS.md"
+    && reference.kind === "project_instructions"
+    && reference.loaded === true
+  ));
+
+  await git(context.project, ["add", "."]);
+  await git(context.project, ["commit", "-m", "Clean working tree"]);
+  const repeated = structuredContent(
+    await callOpen(context.client, context.project, "repository-state"),
+  );
+  const repeatedState = repeated.repository_state as Record<string, unknown>;
+  assert.equal(repeated.workspace_id, first.workspace_id);
+  assert.equal(repeatedState.available, true);
+  assert.equal(repeatedState.dirty, false);
+  assert.equal(repeatedState.modified, 0);
+  assert.equal(repeatedState.untracked, 0);
+  assert.equal(repeated.agents_files, undefined);
+  assert.ok(Array.isArray(repeated.authoritative_references));
+  assert.match(
+    repeated.instruction as string,
+    /repository_state is refreshed for this call/,
+  );
+});
+
 test("open_workspace bounds oversized instruction files while preserving their head and latest tail", async (t) => {
   const projectAgentsContent = [
     "HEAD-INSTRUCTIONS\n",

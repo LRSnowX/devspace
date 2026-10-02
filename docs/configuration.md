@@ -110,6 +110,11 @@ injected automatically. Working memory is compacted first under a bounded share
 of the same bootstrap budget, then remaining space is used for continuation
 history. Live repository state and authoritative project files remain stronger
 evidence than stored memory when they conflict.
+`open_workspace` exposes that stronger evidence explicitly as a bounded
+`repository_state` snapshot plus `authoritative_references`. The repository
+snapshot includes branch/HEAD/upstream divergence, dirty-state counts, and at
+most twenty changed-path samples. It is refreshed on every open, including a
+reused checkout workspace; Memory bootstrap remains lifecycle-bounded.
 When enabled, the only model-facing Memory tools are `memory_search` and
 `memory_get_thread`. The latter accepts only conversation/evidence IDs previously
 discovered for the current workspace project in this server process, returns a
