@@ -944,7 +944,7 @@ function registerMcpSurface(
       "memory_search",
       {
         title: "Search project memory",
-        description: "Search long-term AI conversation memory relevant to the current project. Results are a relevance filter, not a project security boundary. Use memory_get_thread to expand discovered evidence.",
+        description: "Search long-term project memory. Returns bounded durable Working Memory first and deeper conversation evidence second. Results are a relevance filter, not a project security boundary. Use memory_get_thread only to expand returned conversation/evidence hits.",
         inputSchema: {
           workspace_id: z.string().describe(workspaceIdDescription),
           query: z.string().trim().min(1),

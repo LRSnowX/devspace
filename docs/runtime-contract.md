@@ -275,7 +275,9 @@ When Memory is configured:
   continuation tails, and recent-hit metadata together. Working memory is
   prioritized over continuation history, while live repository state and
   authoritative project files outrank stored memory when they conflict.
-- `memory_search` performs project-relevant retrieval.
+- `memory_search` performs memory-first project retrieval: bounded durable
+  Working Memory is returned before deeper hybrid conversation evidence.
+  Working-memory provenance references do not grant thread access.
 - `memory_get_thread` expands only evidence IDs authorized by the current
   project's bootstrap/search discovery. Authorization is bounded,
   process-local, and reset by server restart. The model-facing surface returns
