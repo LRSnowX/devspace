@@ -68,6 +68,15 @@ export interface MemoryBootstrapCollaborationMemory {
   items: MemoryBootstrapWorkingItem[];
 }
 
+export interface MemoryBootstrapSourceCounts {
+  collaborationItems: number;
+  workingItems: number;
+  continuationConversations: number;
+  continuationMessages: number;
+  relevantHits: number;
+  recentHits: number;
+}
+
 export interface MemoryBootstrapContext {
   project: string;
   sourcePolicy: string;
@@ -78,6 +87,27 @@ export interface MemoryBootstrapContext {
   recent: MemoryBootstrapHit[];
   truncated: boolean;
   byteBudget: number;
+}
+
+const memoryBootstrapSourceCountsByContext = new WeakMap<
+  MemoryBootstrapContext,
+  MemoryBootstrapSourceCounts
+>();
+
+export function memoryBootstrapSourceCounts(
+  context: MemoryBootstrapContext,
+): MemoryBootstrapSourceCounts {
+  return memoryBootstrapSourceCountsByContext.get(context) ?? {
+    collaborationItems: context.collaborationMemory.items.length,
+    workingItems: context.workingMemory.items.length,
+    continuationConversations: context.continuations.length,
+    continuationMessages: context.continuations.reduce(
+      (sum, continuation) => sum + continuation.messages.length,
+      0,
+    ),
+    relevantHits: context.relevant.length,
+    recentHits: context.recent.length,
+  };
 }
 
 export interface MemoryClient {
@@ -278,6 +308,17 @@ export function compactMemoryBootstrapContext(
     truncated: false,
     byteBudget,
   };
+  memoryBootstrapSourceCountsByContext.set(context, {
+    collaborationItems: collaborationMemoryCandidate.items.length,
+    workingItems: workingMemoryCandidate.items.length,
+    continuationConversations: continuationCandidates.length,
+    continuationMessages: continuationCandidates.reduce(
+      (sum, continuation) => sum + continuation.messages.length,
+      0,
+    ),
+    relevantHits: candidates.relevant.length,
+    recentHits: candidates.recent.length,
+  });
   const collaborationMemoryBudget = Math.min(2_048, Math.floor(byteBudget * 0.2));
   for (const item of collaborationMemoryCandidate.items) {
     context.collaborationMemory.items.push(item);

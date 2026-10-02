@@ -111,6 +111,12 @@ injected automatically. Collaboration memory receives a small bounded share of
 the same bootstrap budget, then working memory, then remaining space is used for
 continuation history. Live repository state and authoritative project files
 remain stronger evidence than stored memory when they conflict.
+`memory_context` also reports read-only budget telemetry. `bytes_used` is the
+exact UTF-8 JSON size of the final model-facing memory packet, including the
+telemetry itself. `sections` reports the retained byte/count footprint and
+budget-level truncation state for collaboration memory, project working memory,
+continuations, and recent/relevant hits. These metrics do not add memory
+authority and do not include DevSpace-internal pre-budget bookkeeping.
 `open_workspace` exposes that stronger evidence explicitly as a bounded
 `repository_state` snapshot plus `authoritative_references`. The repository
 snapshot includes branch/HEAD/upstream divergence, dirty-state counts, and at

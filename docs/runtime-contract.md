@@ -284,6 +284,12 @@ When Memory is configured:
   share, then working memory is prioritized over continuation history, while
   live repository state and authoritative project files outrank stored memory
   when they conflict.
+- The model-facing memory packet reports `byte_budget`, exact final
+  `bytes_used`, and per-section byte/count/truncation telemetry. Section
+  `truncated` means items/messages were omitted by the shared bootstrap budget;
+  it does not redefine the separate safety clipping applied inside an individual
+  large field or message. Telemetry is itself counted inside the same byte
+  budget.
 - `memory_search` performs memory-first project retrieval: bounded durable
   Working Memory is returned before deeper hybrid conversation evidence.
   Working-memory provenance references do not grant thread access.

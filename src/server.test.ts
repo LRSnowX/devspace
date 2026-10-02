@@ -1638,6 +1638,18 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.equal(opened.project_name, "LEMonX");
   assert.ok(Buffer.byteLength(JSON.stringify(bootstrap), "utf8") <= 12_288);
   assert.equal(bootstrap.byte_budget, 12_288);
+  assert.equal(
+    bootstrap.bytes_used,
+    Buffer.byteLength(JSON.stringify(bootstrap), "utf8"),
+  );
+  const budgetSections = bootstrap.sections as Record<string, Record<string, unknown>>;
+  assert.equal(budgetSections.collaboration_memory?.items, 1);
+  assert.equal(budgetSections.collaboration_memory?.truncated, false);
+  assert.equal(budgetSections.working_memory?.items, 1);
+  assert.equal(budgetSections.working_memory?.truncated, false);
+  assert.equal(budgetSections.continuations?.items, 2);
+  assert.equal(budgetSections.continuations?.messages, 3);
+  assert.equal(budgetSections.continuations?.truncated, false);
   assert.equal("messages" in bootstrap, false);
   const collaborationMemory = bootstrap.collaboration_memory as Record<string, unknown>;
   const collaborationItems = collaborationMemory.items as Array<Record<string, unknown>>;
@@ -1790,7 +1802,16 @@ test("model-facing memory bootstrap stays within byte budget after snake_case ma
   const opened = structuredContent(await callOpen(context.client, context.project));
   const bootstrap = opened.memory_context as Record<string, unknown>;
   assert.ok(Buffer.byteLength(JSON.stringify(bootstrap), "utf8") <= 12_288);
+  assert.equal(
+    bootstrap.bytes_used,
+    Buffer.byteLength(JSON.stringify(bootstrap), "utf8"),
+  );
   assert.equal(bootstrap.truncated, true);
+  const budgetSections = bootstrap.sections as Record<string, Record<string, unknown>>;
+  assert.equal(
+    Object.values(budgetSections).some((section) => section.truncated === true),
+    true,
+  );
 });
 
 test("memory bootstrap failures do not prevent coding workspace entry", async (t) => {

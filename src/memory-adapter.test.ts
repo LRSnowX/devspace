@@ -6,6 +6,7 @@ import {
   MemoryThreadAuthorizationStore,
   compactMemoryBootstrapContext,
   compactMirroredMemoryResult,
+  memoryBootstrapSourceCounts,
   memoryEvidenceIdsFromBootstrapContext,
   memoryEvidenceIdsFromSearchResult,
 } from "./memory-adapter.js";
@@ -88,6 +89,15 @@ test("memory bootstrap preserves recent continuation tails within its byte budge
 
   const context = compactMemoryBootstrapContext(raw, "Jack", 4_096);
   assert.ok(Buffer.byteLength(JSON.stringify(context), "utf8") <= 4_096);
+  assert.equal(JSON.stringify(context).includes("sourceCounts"), false);
+  assert.deepEqual(memoryBootstrapSourceCounts(context), {
+    collaborationItems: 0,
+    workingItems: 0,
+    continuationConversations: 2,
+    continuationMessages: 11,
+    relevantHits: 4,
+    recentHits: 3,
+  });
   assert.equal(context.continuations.length, 2);
   assert.equal(context.continuations[0]?.conversationId, "continuation-1");
   assert.equal(context.continuations[0]?.messages.length, 3);

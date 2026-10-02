@@ -37,6 +37,10 @@ precedence over stale stored memory. The memory context may be absent without
 affecting coding access. For a specific deeper-history question, use
 `memory_search`; expand only a returned conversation or evidence ID with
 paginated `memory_get_thread`.
+When diagnosing incomplete handoff context, inspect `memory_context.bytes_used`
+against `byte_budget` and the per-section `sections.*.truncated` flags before
+requesting deeper history. These are read-only budget diagnostics, not another
+source of project facts.
 Project relevance filtering is not strict project isolation, and arbitrary
 conversation IDs cannot be opened through this surface.
 

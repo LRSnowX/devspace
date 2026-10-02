@@ -51,6 +51,7 @@ import { ProcessSessionManager } from "./process-sessions.js";
 import {
   MemoryAdapter,
   MemoryThreadAuthorizationStore,
+  memoryBootstrapSourceCounts,
   memoryEvidenceIdsFromBootstrapContext,
   memoryEvidenceIdsFromSearchResult,
   type MemoryBootstrapContext,
@@ -210,6 +211,12 @@ const memoryBootstrapCollaborationMemoryOutputSchema = z.object({
   generated_at: z.number().optional(),
   items: z.array(memoryBootstrapWorkingItemOutputSchema),
 });
+const memoryBootstrapBudgetSectionOutputSchema = z.object({
+  bytes: z.number().int().nonnegative(),
+  items: z.number().int().nonnegative(),
+  messages: z.number().int().nonnegative().optional(),
+  truncated: z.boolean(),
+});
 const memoryBootstrapContextOutputSchema = z.object({
   project: z.string(),
   source_policy: z.string(),
@@ -220,6 +227,13 @@ const memoryBootstrapContextOutputSchema = z.object({
   recent: z.array(memoryBootstrapHitOutputSchema),
   truncated: z.boolean(),
   byte_budget: z.number().int().positive(),
+  bytes_used: z.number().int().nonnegative(),
+  sections: z.object({
+    collaboration_memory: memoryBootstrapBudgetSectionOutputSchema,
+    working_memory: memoryBootstrapBudgetSectionOutputSchema,
+    continuations: memoryBootstrapBudgetSectionOutputSchema,
+    recent_hits: memoryBootstrapBudgetSectionOutputSchema,
+  }),
 });
 
 function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number) {
@@ -278,8 +292,60 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
     recent: context.recent.map(mapHit),
     truncated: context.truncated,
     byte_budget: byteBudget,
+    bytes_used: 0,
+    sections: {
+      collaboration_memory: { bytes: 0, items: 0, truncated: false },
+      working_memory: { bytes: 0, items: 0, truncated: false },
+      continuations: { bytes: 0, items: 0, messages: 0, truncated: false },
+      recent_hits: { bytes: 0, items: 0, truncated: false },
+    },
   };
-  while (Buffer.byteLength(JSON.stringify(output), "utf8") > byteBudget) {
+  const sourceCounts = memoryBootstrapSourceCounts(context);
+  const refreshBudgetTelemetry = () => {
+    const continuationMessages = output.continuations.reduce(
+      (sum, continuation) => sum + continuation.messages.length,
+      0,
+    );
+    output.sections = {
+      collaboration_memory: {
+        bytes: Buffer.byteLength(JSON.stringify(output.collaboration_memory), "utf8"),
+        items: output.collaboration_memory.items.length,
+        truncated: output.collaboration_memory.items.length < sourceCounts.collaborationItems,
+      },
+      working_memory: {
+        bytes: Buffer.byteLength(JSON.stringify(output.working_memory), "utf8"),
+        items: output.working_memory.items.length,
+        truncated: output.working_memory.items.length < sourceCounts.workingItems,
+      },
+      continuations: {
+        bytes: Buffer.byteLength(JSON.stringify(output.continuations), "utf8"),
+        items: output.continuations.length,
+        messages: continuationMessages,
+        truncated:
+          output.continuations.length < sourceCounts.continuationConversations
+          || continuationMessages < sourceCounts.continuationMessages,
+      },
+      recent_hits: {
+        bytes: Buffer.byteLength(
+          JSON.stringify({ relevant: output.relevant, recent: output.recent }),
+          "utf8",
+        ),
+        items: output.relevant.length + output.recent.length,
+        truncated:
+          output.relevant.length + output.recent.length
+          < sourceCounts.relevantHits + sourceCounts.recentHits,
+      },
+    };
+    let previous = -1;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const bytes = Buffer.byteLength(JSON.stringify(output), "utf8");
+      output.bytes_used = bytes;
+      if (bytes === previous) break;
+      previous = bytes;
+    }
+  };
+  refreshBudgetTelemetry();
+  while (output.bytes_used > byteBudget) {
     if (output.recent.length > 0) output.recent.pop();
     else if (output.relevant.length > 0) output.relevant.pop();
     else {
@@ -301,7 +367,9 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
       }
     }
     output.truncated = true;
+    refreshBudgetTelemetry();
   }
+  refreshBudgetTelemetry();
   return output;
 }
 
