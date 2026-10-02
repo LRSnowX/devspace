@@ -266,7 +266,7 @@ const memoryBootstrapContextOutputSchema = z.object({
   }),
 });
 
-function modelMemoryContext(
+export function modelMemoryContext(
   context: MemoryBootstrapContext,
   byteBudget: number,
   repositoryState?: Awaited<ReturnType<typeof readRepositoryState>>,
@@ -557,7 +557,7 @@ const authoritativeReferenceOutputSchema = z.object({
   truncated: z.boolean().optional(),
 });
 
-function modelRepositoryState(state: Awaited<ReturnType<typeof readRepositoryState>>) {
+export function modelRepositoryState(state: Awaited<ReturnType<typeof readRepositoryState>>) {
   return {
     available: state.available,
     reason: state.reason,

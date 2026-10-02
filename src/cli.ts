@@ -63,6 +63,12 @@ import {
   inspectWorkspaceMetadataRetention,
   pruneWorkspaceMetadataRetention,
 } from "./retention.js";
+import { MemoryAdapter } from "./memory-adapter.js";
+import {
+  formatProjectMemoryInspection,
+  inspectProjectMemory,
+  resolveMemoryInspectionProject,
+} from "./memory-inspect.js";
 
 type Command =
   | "serve"
@@ -72,6 +78,7 @@ type Command =
   | "projects"
   | "recovery"
   | "retention"
+  | "memory"
   | "worktrees"
   | "agents"
   | "show-changes"
@@ -109,6 +116,9 @@ async function main(argv: string[]): Promise<void> {
     case "retention":
       await runRetentionCommand(args);
       return;
+    case "memory":
+      await runMemoryCommand(args);
+      return;
     case "worktrees":
       await runWorktreesCommand(args);
       return;
@@ -136,6 +146,7 @@ function normalizeCommand(command: string | undefined): Command {
     || command === "projects"
     || command === "recovery"
     || command === "retention"
+    || command === "memory"
     || command === "worktrees"
     || command === "agents"
     || command === "show-changes"
@@ -143,6 +154,33 @@ function normalizeCommand(command: string | undefined): Command {
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
+}
+
+async function runMemoryCommand(args: string[]): Promise<void> {
+  const [subcommand, project, ...rest] = args;
+  if (subcommand !== "inspect" || !project) {
+    throw new Error("Usage: devspace memory inspect <project-or-path> [--json]");
+  }
+  const json = rest.length === 1 && rest[0] === "--json";
+  if (rest.length > 0 && !json) {
+    throw new Error("Usage: devspace memory inspect <project-or-path> [--json]");
+  }
+
+  const config = loadConfig();
+  const registry = new ProjectRegistry(config.projectRegistryPath, config.allowedRoots);
+  const resolved = resolveMemoryInspectionProject(project, registry, config.allowedRoots);
+
+  const inspection = await inspectProjectMemory({
+    projectName: resolved.name,
+    projectPath: resolved.path,
+    memory: new MemoryAdapter(config.memory),
+    byteBudget: config.memory.bootstrapByteBudget,
+  });
+  console.log(
+    json
+      ? JSON.stringify(inspection, null, 2)
+      : formatProjectMemoryInspection(inspection),
+  );
 }
 
 async function ensureConfigured(): Promise<void> {
@@ -723,6 +761,7 @@ function printHelp(): void {
       "  devspace projects register <name> <path> [--alias <alias>]...",
       "  devspace recovery list|show <id>|resolve <id> --accept-current",
       "  devspace retention inspect|prune [--json]  Inspect or prune safe workspace metadata idle for 90 days",
+      "  devspace memory inspect <project-or-path> [--json]  Inspect live handoff and CHIM memory health",
       "  devspace worktrees prune Prune managed worktrees unused for 3 days",
       "  devspace show-changes <review-ref> [--json]",
       "  devspace agents targets [--json]  List usable subagent providers and profiles",

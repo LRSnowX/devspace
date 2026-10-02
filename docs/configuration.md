@@ -141,6 +141,16 @@ bounded authorization expires on restart; attempts to expand another ID return
 discovery returns that ID. CHIM project search is a relevance filter, not a
 strict project-membership security boundary.
 
+For local operator diagnostics, `devspace memory inspect <project-or-path>`
+combines the same model-facing handoff mapping with a freshly read repository
+snapshot and CHIM's read-only `memory_health` report. `--json` returns the
+full structured diagnostic; the default output is a compact summary. This
+operator command does not add `memory_health` to the model-facing tool
+allow-list and does not invoke the memory compiler or another model. Unique
+project names may be discovered recursively within a bounded depth under
+allowed roots; ambiguous names must be disambiguated with an absolute path or a
+canonical project registration.
+
 `oauth.allowedResourceUrls` accepts exact alternate MCP resource URLs for
 clients that connect through a resource alias, such as a secure MCP tunnel.
 The normal `server.publicBaseUrl` `/mcp` resource remains allowed automatically.

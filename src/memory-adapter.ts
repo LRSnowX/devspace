@@ -11,6 +11,7 @@ const MEMORY_TOOL_NAMES = [
 ] as const;
 
 export type MemoryToolName = (typeof MEMORY_TOOL_NAMES)[number];
+export type MemoryAdapterToolName = MemoryToolName | "memory_health";
 
 export interface MemoryBootstrapHit {
   conversationId: string;
@@ -133,7 +134,7 @@ export function memoryBootstrapSourceCounts(
 export interface MemoryClient {
   readonly enabled: boolean;
   call(
-    toolName: MemoryToolName,
+    toolName: MemoryAdapterToolName,
     args: Record<string, unknown>,
     options?: { timeoutMs?: number },
   ): Promise<CallToolResult>;
@@ -219,7 +220,7 @@ export class MemoryAdapter {
   }
 
   async call(
-    toolName: MemoryToolName,
+    toolName: MemoryAdapterToolName,
     args: Record<string, unknown>,
     options: { timeoutMs?: number } = {},
   ) {

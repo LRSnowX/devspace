@@ -313,6 +313,12 @@ When Memory is configured:
   bootstrap/search discovery.
 - Collaboration-memory provenance follows the same rule: global collaboration
   items do not implicitly authorize their source conversation IDs.
+- `devspace memory inspect <project-or-path>` is an operator-only read path.
+  It recomputes live repository state, the bounded host handoff packet, and
+  CHIM memory health in one diagnostic result. The command may call CHIM's
+  internal read-only `memory_health` tool, but that tool is not forwarded to
+  the model-facing MCP surface. Inspection does not invoke compilation,
+  promotion, or any model.
 
 ### Current limitation
 
