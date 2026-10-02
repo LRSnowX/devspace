@@ -25,7 +25,8 @@ and shell calls should reuse that same `workspace_id`.
 The result also includes a live `repository_state` when Git can be inspected and
 an `authoritative_references` list for DevSpace-recognized instruction files.
 Treat these as stronger current evidence than stored memory. Repository state is
-refreshed even if `open_workspace` reuses an existing checkout workspace.
+refreshed even if `open_workspace` reuses an existing checkout workspace and
+includes the HEAD commit timestamp when available.
 
 If the optional read-only CHIM Memory Adapter is configured, `open_workspace`
 also returns a bounded `memory_context`. Treat `collaboration_memory`, when
@@ -37,6 +38,11 @@ precedence over stale stored memory. The memory context may be absent without
 affecting coding access. For a specific deeper-history question, use
 `memory_search`; expand only a returned conversation or evidence ID with
 paginated `memory_get_thread`.
+When `working_memory.verification` is present, treat `source_state` as CHIM's
+evidence-side assessment and `host_state` as the final handoff freshness state
+after DevSpace combines it with live Git. A `needs_revalidation` host state
+means the memory is still retained but should be checked against current files
+before it drives an action.
 When diagnosing incomplete handoff context, inspect `memory_context.bytes_used`
 against `byte_budget` and the per-section `sections.*.truncated` flags before
 requesting deeper history. These are read-only budget diagnostics, not another

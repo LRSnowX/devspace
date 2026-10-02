@@ -57,10 +57,30 @@ export interface MemoryBootstrapWorkingItem {
   evidence: MemoryBootstrapEvidence[];
 }
 
+export interface MemoryBootstrapWorkingVerification {
+  memoryId: string;
+  class: "stable" | "operational" | "tentative";
+  evidenceStrength:
+    | "strong_independent"
+    | "user_asserted"
+    | "conversation_only"
+    | "none";
+  sourceState:
+    | "strongly_verified"
+    | "current_by_evidence"
+    | "needs_revalidation"
+    | "tentative"
+    | "expired"
+    | "unavailable";
+  sourceReason?: string;
+  latestProjectEvidenceAt?: number;
+}
+
 export interface MemoryBootstrapWorkingMemory {
   project: string;
   generatedAt?: number;
   items: MemoryBootstrapWorkingItem[];
+  verification: MemoryBootstrapWorkingVerification[];
 }
 
 export interface MemoryBootstrapCollaborationMemory {
@@ -301,6 +321,7 @@ export function compactMemoryBootstrapContext(
         ? {}
         : { generatedAt: workingMemoryCandidate.generatedAt }),
       items: [],
+      verification: [],
     },
     continuations: [],
     relevant: [],
@@ -337,11 +358,16 @@ export function compactMemoryBootstrapContext(
   const workingMemoryBudget = Math.min(6_144, Math.floor(byteBudget * 0.55));
   for (const item of workingMemoryCandidate.items) {
     context.workingMemory.items.push(item);
+    const verification = workingMemoryCandidate.verification.find(
+      (candidate) => candidate.memoryId === item.memoryId,
+    ) ?? fallbackWorkingMemoryVerification(item);
+    context.workingMemory.verification.push(verification);
     if (
       byteLength(context.workingMemory) > workingMemoryBudget
       || byteLength(context) > byteBudget
     ) {
       context.workingMemory.items.pop();
+      context.workingMemory.verification.pop();
       context.truncated = true;
       break;
     }
@@ -438,7 +464,7 @@ function compactWorkingMemory(
 ): MemoryBootstrapWorkingMemory {
   const working = record(value);
   if (!working) {
-    return { project: expectedProject, items: [] };
+    return { project: expectedProject, items: [], verification: [] };
   }
   if (working.project !== expectedProject || !Array.isArray(working.items)) {
     throw new Error("Malformed project working memory");
@@ -447,6 +473,9 @@ function compactWorkingMemory(
     project: expectedProject,
     ...(typeof working.generated_at === "number" ? { generatedAt: working.generated_at } : {}),
     items: working.items.map(compactWorkingMemoryItem),
+    verification: Array.isArray(working.verification)
+      ? working.verification.map(compactWorkingMemoryVerification)
+      : [],
   };
 }
 
@@ -513,6 +542,89 @@ function compactWorkingMemoryEvidence(value: unknown): MemoryBootstrapEvidence {
     kind: clip(evidence.kind, 40),
     reference: clip(evidence.reference, 320),
   };
+}
+
+function compactWorkingMemoryVerification(
+  value: unknown,
+): MemoryBootstrapWorkingVerification {
+  const verification = record(value);
+  if (
+    !verification
+    || typeof verification.memory_id !== "string"
+    || !isWorkingMemoryClass(verification.class)
+    || !isWorkingMemoryEvidenceStrength(verification.evidence_strength)
+    || !isWorkingMemorySourceState(verification.state)
+  ) {
+    throw new Error("Malformed project working memory verification");
+  }
+  return {
+    memoryId: clip(verification.memory_id, 200),
+    class: verification.class,
+    evidenceStrength: verification.evidence_strength,
+    sourceState: verification.state,
+    ...(typeof verification.reason === "string"
+      ? { sourceReason: clip(verification.reason, 600) }
+      : {}),
+    ...(typeof verification.latest_project_evidence_at === "number"
+      ? { latestProjectEvidenceAt: verification.latest_project_evidence_at }
+      : {}),
+  };
+}
+
+function fallbackWorkingMemoryVerification(
+  item: MemoryBootstrapWorkingItem,
+): MemoryBootstrapWorkingVerification {
+  const memoryClass = item.kind === "hypothesis"
+    ? "tentative"
+    : ["state", "blocker", "task"].includes(item.kind)
+      ? "operational"
+      : "stable";
+  const evidenceKinds = new Set(item.evidence.map((evidence) => evidence.kind));
+  const evidenceStrength = [
+    "document",
+    "git_commit",
+    "repository_state",
+    "devspace_result",
+  ].some((kind) => evidenceKinds.has(kind))
+    ? "strong_independent"
+    : evidenceKinds.has("user_statement")
+      ? "user_asserted"
+      : evidenceKinds.has("conversation_turn")
+        ? "conversation_only"
+        : "none";
+  return {
+    memoryId: item.memoryId,
+    class: memoryClass,
+    evidenceStrength,
+    sourceState: memoryClass === "tentative" ? "tentative" : "unavailable",
+    sourceReason: "CHIM working-memory verification metadata was unavailable",
+  };
+}
+
+function isWorkingMemoryClass(
+  value: unknown,
+): value is MemoryBootstrapWorkingVerification["class"] {
+  return value === "stable" || value === "operational" || value === "tentative";
+}
+
+function isWorkingMemoryEvidenceStrength(
+  value: unknown,
+): value is MemoryBootstrapWorkingVerification["evidenceStrength"] {
+  return value === "strong_independent"
+    || value === "user_asserted"
+    || value === "conversation_only"
+    || value === "none";
+}
+
+function isWorkingMemorySourceState(
+  value: unknown,
+): value is MemoryBootstrapWorkingVerification["sourceState"] {
+  return value === "strongly_verified"
+    || value === "current_by_evidence"
+    || value === "needs_revalidation"
+    || value === "tentative"
+    || value === "expired"
+    || value === "unavailable";
 }
 
 function compactJsonValue(value: unknown, depth: number): unknown {

@@ -272,7 +272,8 @@ When Memory is configured:
 - `open_workspace` returns a bounded `repository_state` when Git state can be
   inspected. It is refreshed on every call and reports branch/HEAD, optional
   upstream ahead/behind counts, dirty-state counters, and a capped changed-path
-  sample. Git inspection failure does not prevent workspace entry.
+  sample. The HEAD commit timestamp is included when available. Git inspection
+  failure does not prevent workspace entry.
 - `authoritative_references` identifies DevSpace-recognized project instruction
   files. Loaded project instructions and discoverable nested instructions are
   represented explicitly instead of relying only on prose priority guidance.
@@ -293,6 +294,13 @@ When Memory is configured:
 - `memory_search` performs memory-first project retrieval: bounded durable
   Working Memory is returned before deeper hybrid conversation evidence.
   Working-memory provenance references do not grant thread access.
+- Working Memory verification keeps CHIM's `source_state` separate from the
+  DevSpace-derived `host_state`. DevSpace may conservatively downgrade only
+  operational state/task/blocker memories to `needs_revalidation` when source
+  verification metadata is unavailable, the live working tree is dirty, or the
+  repository HEAD commit timestamp is newer than the memory's
+  `last_verified_at`. Stable, tentative, and expired classifications are not
+  promoted or overwritten by this host freshness rule.
 - `memory_get_thread` expands only evidence IDs authorized by the current
   project's bootstrap/search discovery. Authorization is bounded,
   process-local, and reset by server restart. The model-facing surface returns

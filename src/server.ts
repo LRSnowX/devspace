@@ -202,10 +202,40 @@ const memoryBootstrapWorkingItemOutputSchema = z.object({
   last_verified_at: z.number().optional(),
   evidence: z.array(memoryBootstrapEvidenceOutputSchema),
 });
+const memoryBootstrapWorkingVerificationOutputSchema = z.object({
+  memory_id: z.string(),
+  class: z.enum(["stable", "operational", "tentative"]),
+  evidence_strength: z.enum([
+    "strong_independent",
+    "user_asserted",
+    "conversation_only",
+    "none",
+  ]),
+  source_state: z.enum([
+    "strongly_verified",
+    "current_by_evidence",
+    "needs_revalidation",
+    "tentative",
+    "expired",
+    "unavailable",
+  ]),
+  host_state: z.enum([
+    "strongly_verified",
+    "current_by_evidence",
+    "needs_revalidation",
+    "tentative",
+    "expired",
+  ]),
+  source_reason: z.string().optional(),
+  host_reason: z.string().optional(),
+  latest_project_evidence_at: z.number().optional(),
+  repository_head_committed_at: z.number().optional(),
+});
 const memoryBootstrapWorkingMemoryOutputSchema = z.object({
   project: z.string(),
   generated_at: z.number().optional(),
   items: z.array(memoryBootstrapWorkingItemOutputSchema),
+  verification: z.array(memoryBootstrapWorkingVerificationOutputSchema),
 });
 const memoryBootstrapCollaborationMemoryOutputSchema = z.object({
   generated_at: z.number().optional(),
@@ -236,7 +266,11 @@ const memoryBootstrapContextOutputSchema = z.object({
   }),
 });
 
-function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number) {
+function modelMemoryContext(
+  context: MemoryBootstrapContext,
+  byteBudget: number,
+  repositoryState?: Awaited<ReturnType<typeof readRepositoryState>>,
+) {
   const mapHit = (hit: MemoryBootstrapContext["relevant"][number]) => ({
     conversation_id: hit.conversationId,
     evidence_conversation_id: hit.evidenceConversationId,
@@ -261,6 +295,66 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
       reference: evidence.reference,
     })),
   });
+  const mapWorkingVerification = (
+    verification: MemoryBootstrapContext["workingMemory"]["verification"][number],
+  ) => {
+    const item = context.workingMemory.items.find(
+      (candidate) => candidate.memoryId === verification.memoryId,
+    );
+    const repositoryHeadCommittedAt = repositoryState?.available
+      ? repositoryState.headCommittedAt
+      : undefined;
+    const repositoryDirty = repositoryState?.available && repositoryState.dirty === true;
+    let hostState = verification.sourceState === "unavailable"
+      ? verification.class === "tentative"
+        ? "tentative"
+        : verification.class === "operational"
+          ? "needs_revalidation"
+          : verification.evidenceStrength === "strong_independent"
+            ? "strongly_verified"
+            : "current_by_evidence"
+      : verification.sourceState;
+    let hostReason = verification.sourceReason
+      ?? (verification.sourceState === "unavailable" && verification.class === "operational"
+        ? "CHIM working-memory verification metadata is unavailable for this operational memory; verify it against live project state before acting."
+        : undefined);
+
+    if (
+      verification.class === "operational"
+      && hostState !== "expired"
+      && hostState !== "tentative"
+      && hostState !== "needs_revalidation"
+    ) {
+      if (repositoryDirty) {
+        hostState = "needs_revalidation";
+        hostReason =
+          "Live repository working tree has uncommitted changes, so this operational memory cannot be safely treated as current without checking the changed files.";
+      } else if (item?.lastVerifiedAt === undefined) {
+        hostState = "needs_revalidation";
+        hostReason =
+          "Operational memory has no last_verified_at timestamp; verify it against live repository state before treating it as current.";
+      } else if (
+        repositoryHeadCommittedAt !== undefined
+        && repositoryHeadCommittedAt > item.lastVerifiedAt
+      ) {
+        hostState = "needs_revalidation";
+        hostReason =
+          "Live repository HEAD is newer than this operational memory's last verification; verify it against current repository state before acting.";
+      }
+    }
+
+    return {
+      memory_id: verification.memoryId,
+      class: verification.class,
+      evidence_strength: verification.evidenceStrength,
+      source_state: verification.sourceState,
+      host_state: hostState,
+      source_reason: verification.sourceReason,
+      host_reason: hostReason,
+      latest_project_evidence_at: verification.latestProjectEvidenceAt,
+      repository_head_committed_at: repositoryHeadCommittedAt,
+    };
+  };
   const output = {
     project: context.project,
     source_policy: context.sourcePolicy,
@@ -272,6 +366,7 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
       project: context.workingMemory.project,
       generated_at: context.workingMemory.generatedAt,
       items: context.workingMemory.items.map(mapMemoryItem),
+      verification: context.workingMemory.verification.map(mapWorkingVerification),
     },
     continuations: context.continuations.map((continuation) => ({
           conversation_id: continuation.conversationId,
@@ -359,7 +454,13 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
       } else if (output.continuations.length > 0) {
         output.continuations.pop();
       } else if (output.working_memory.items.length > 0) {
-        output.working_memory.items.pop();
+        const removed = output.working_memory.items.pop();
+        if (removed) {
+          const index = output.working_memory.verification.findIndex(
+            (verification) => verification.memory_id === removed.memory_id,
+          );
+          if (index >= 0) output.working_memory.verification.splice(index, 1);
+        }
       } else if (output.collaboration_memory.items.length > 0) {
         output.collaboration_memory.items.pop();
       } else {
@@ -434,6 +535,7 @@ const repositoryStateOutputSchema = z.object({
   git_root: z.string().optional(),
   branch: z.string().optional(),
   head: z.string().optional(),
+  head_committed_at: z.number().int().nonnegative().optional(),
   detached: z.boolean().optional(),
   upstream: z.string().optional(),
   ahead: z.number().int().nonnegative().optional(),
@@ -462,6 +564,7 @@ function modelRepositoryState(state: Awaited<ReturnType<typeof readRepositorySta
     git_root: state.gitRoot,
     branch: state.branch,
     head: state.head,
+    head_committed_at: state.headCommittedAt,
     detached: state.detached,
     upstream: state.upstream,
     ahead: state.ahead,
@@ -935,7 +1038,11 @@ function registerMcpSurface(
       if (memory.enabled && includeBootstrapContext) {
         try {
           const compact = await memory.bootstrapProjectContext(projectName);
-          const candidate = modelMemoryContext(compact, config.memory.bootstrapByteBudget);
+          const candidate = modelMemoryContext(
+            compact,
+            config.memory.bootstrapByteBudget,
+            repositoryState,
+          );
           memoryContext = candidate;
           memoryThreadAuthorizations.authorize(
             workspace.sourceRoot ?? workspace.root,

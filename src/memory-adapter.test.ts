@@ -139,6 +139,14 @@ test("memory bootstrap prioritizes bounded working memory before continuation hi
         created_at: 100 + index,
       }],
     })),
+    verification: Array.from({ length: 8 }, (_, index) => ({
+      memory_id: "memory-" + index,
+      class: index === 0 ? "stable" : "operational",
+      evidence_strength: "conversation_only",
+      state: index === 0 ? "current_by_evidence" : "needs_revalidation",
+      reason: index === 0 ? null : "newer project evidence exists",
+      latest_project_evidence_at: 999,
+    })),
   };
   raw.structuredContent.continuations = [{
     conversation_id: "continuation-1",
@@ -156,6 +164,14 @@ test("memory bootstrap prioritizes bounded working memory before continuation hi
   assert.ok(Buffer.byteLength(JSON.stringify(context), "utf8") <= 8_192);
   assert.ok(context.workingMemory.items.length > 0);
   assert.equal(context.workingMemory.items[0]?.memoryId, "memory-0");
+  assert.equal(context.workingMemory.verification.length, context.workingMemory.items.length);
+  assert.equal(context.workingMemory.verification[0]?.sourceState, "current_by_evidence");
+  if (context.workingMemory.verification.length > 1) {
+    assert.equal(
+      context.workingMemory.verification[1]?.sourceState,
+      "needs_revalidation",
+    );
+  }
   assert.ok(context.workingMemory.items.length < 8);
   assert.equal(context.continuations.length, 1);
   assert.ok(context.continuations[0]!.messages.length > 0);
@@ -164,6 +180,38 @@ test("memory bootstrap prioritizes bounded working memory before continuation hi
     memoryEvidenceIdsFromBootstrapContext(context).includes("private-0"),
     false,
   );
+});
+
+test("memory bootstrap synthesizes conservative verification for older CHIM responses", () => {
+  const raw = projectContext() as {
+    structuredContent: Record<string, unknown>;
+  };
+  raw.structuredContent.working_memory = {
+    project: "Jack",
+    items: [{
+      memory_id: "legacy-operational",
+      kind: "task",
+      key: "next_action",
+      value: { text: "finish acceptance" },
+      importance: 90,
+      confidence: 1,
+      last_verified_at: 100,
+      evidence: [{
+        kind: "conversation_turn",
+        reference: "conversation:legacy:message:a1",
+      }],
+    }],
+  };
+
+  const context = compactMemoryBootstrapContext(raw, "Jack", 4_096);
+  assert.equal(context.workingMemory.verification.length, 1);
+  assert.deepEqual(context.workingMemory.verification[0], {
+    memoryId: "legacy-operational",
+    class: "operational",
+    evidenceStrength: "conversation_only",
+    sourceState: "unavailable",
+    sourceReason: "CHIM working-memory verification metadata was unavailable",
+  });
 });
 
 test("memory bootstrap bounds collaboration memory ahead of project memory without authorizing provenance", () => {

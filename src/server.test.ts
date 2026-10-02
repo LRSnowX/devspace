@@ -1410,7 +1410,10 @@ test("server shutdown waits for an active MCP tool call", async (t) => {
   assert.equal(shutdownFinished, true);
 });
 
-function fakeMemory(bootstrapFailure?: Error): MemoryClient {
+function fakeMemory(
+  bootstrapFailure?: Error,
+  workingMemory?: MemoryBootstrapContext["workingMemory"],
+): MemoryClient {
   return {
     enabled: true,
     async bootstrapProjectContext(project): Promise<MemoryBootstrapContext> {
@@ -1434,7 +1437,7 @@ function fakeMemory(bootstrapFailure?: Error): MemoryClient {
             }],
           }],
         },
-        workingMemory: {
+        workingMemory: workingMemory ?? {
           project,
           generatedAt: 44,
           items: [{
@@ -1449,6 +1452,14 @@ function fakeMemory(bootstrapFailure?: Error): MemoryClient {
               kind: "conversation_turn",
               reference: `${project}-working-memory-private-evidence`,
             }],
+          }],
+          verification: [{
+            memoryId: `${project}-current-goal`,
+            class: "operational",
+            evidenceStrength: "conversation_only",
+            sourceState: "current_by_evidence",
+            sourceReason: "No newer project conversation evidence was found.",
+            latestProjectEvidenceAt: 43,
           }],
         },
         continuations: [
@@ -1773,6 +1784,169 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
     retryable: true,
     conversation_id: "LEMonX-search-evidence",
   });
+});
+
+test("memory handoff revalidates only operational memory against live repository freshness", async (t) => {
+  const workingMemory: MemoryBootstrapContext["workingMemory"] = {
+    project: "LEMonX",
+    generatedAt: 100,
+    items: [
+      {
+        memoryId: "head-old",
+        kind: "state",
+        key: "current_state",
+        value: { text: "Old operational state." },
+        importance: 95,
+        confidence: 1,
+        lastVerifiedAt: 0,
+        evidence: [{ kind: "conversation_turn", reference: "conversation:old:message:a1" }],
+      },
+      {
+        memoryId: "dirty-sensitive",
+        kind: "task",
+        key: "next_action",
+        value: { text: "Fresh operational task." },
+        importance: 90,
+        confidence: 1,
+        lastVerifiedAt: 4_000_000_000,
+        evidence: [{ kind: "conversation_turn", reference: "conversation:fresh:message:a1" }],
+      },
+      {
+        memoryId: "stable-decision",
+        kind: "decision",
+        key: "branch_policy",
+        value: { text: "Keep the established branch policy." },
+        importance: 100,
+        confidence: 1,
+        lastVerifiedAt: 0,
+        evidence: [{ kind: "user_statement", reference: "conversation:policy:message:u1" }],
+      },
+      {
+        memoryId: "expired-blocker",
+        kind: "blocker",
+        key: "old_blocker",
+        value: { text: "Expired blocker." },
+        importance: 80,
+        confidence: 1,
+        lastVerifiedAt: 0,
+        evidence: [{ kind: "conversation_turn", reference: "conversation:expired:message:a1" }],
+      },
+      {
+        memoryId: "tentative-hypothesis",
+        kind: "hypothesis",
+        key: "guess",
+        value: { text: "Tentative hypothesis." },
+        importance: 20,
+        confidence: 0.4,
+        lastVerifiedAt: 0,
+        evidence: [{ kind: "conversation_turn", reference: "conversation:guess:message:a1" }],
+      },
+      {
+        memoryId: "legacy-unavailable",
+        kind: "state",
+        key: "legacy_state",
+        value: { text: "Legacy operational memory without CHIM verification metadata." },
+        importance: 70,
+        confidence: 1,
+        lastVerifiedAt: 4_000_000_000,
+        evidence: [{ kind: "conversation_turn", reference: "conversation:legacy:message:a1" }],
+      },
+    ],
+    verification: [
+      {
+        memoryId: "head-old",
+        class: "operational",
+        evidenceStrength: "conversation_only",
+        sourceState: "current_by_evidence",
+      },
+      {
+        memoryId: "dirty-sensitive",
+        class: "operational",
+        evidenceStrength: "conversation_only",
+        sourceState: "current_by_evidence",
+      },
+      {
+        memoryId: "stable-decision",
+        class: "stable",
+        evidenceStrength: "user_asserted",
+        sourceState: "current_by_evidence",
+      },
+      {
+        memoryId: "expired-blocker",
+        class: "operational",
+        evidenceStrength: "conversation_only",
+        sourceState: "expired",
+        sourceReason: "Memory validity window has expired.",
+      },
+      {
+        memoryId: "tentative-hypothesis",
+        class: "tentative",
+        evidenceStrength: "conversation_only",
+        sourceState: "tentative",
+        sourceReason: "Hypotheses remain tentative until stronger evidence exists.",
+      },
+      {
+        memoryId: "legacy-unavailable",
+        class: "operational",
+        evidenceStrength: "conversation_only",
+        sourceState: "unavailable",
+        sourceReason: "CHIM working-memory verification metadata was unavailable",
+      },
+    ],
+  };
+  const context = await fixture(t, {
+    git: true,
+    projectRegistration: { name: "LEMonX" },
+    memoryClient: fakeMemory(undefined, workingMemory),
+  });
+
+  const clean = structuredContent(await callOpen(context.client, "LEMonX", "freshness-clean"));
+  const cleanRepository = clean.repository_state as Record<string, unknown>;
+  assert.equal(cleanRepository.available, true);
+  assert.equal(cleanRepository.dirty, false);
+  assert.equal(typeof cleanRepository.head_committed_at, "number");
+  const cleanWorking = (clean.memory_context as Record<string, unknown>)
+    .working_memory as Record<string, unknown>;
+  const cleanVerification = cleanWorking.verification as Array<Record<string, unknown>>;
+  const cleanState = (memoryId: string) =>
+    cleanVerification.find((item) => item.memory_id === memoryId)
+    ?? assert.fail("missing verification for " + memoryId);
+
+  assert.equal(cleanState("head-old").host_state, "needs_revalidation");
+  assert.match(
+    cleanState("head-old").host_reason as string,
+    /HEAD is newer than this operational memory/,
+  );
+  assert.equal(cleanState("dirty-sensitive").host_state, "current_by_evidence");
+  assert.equal(cleanState("stable-decision").host_state, "current_by_evidence");
+  assert.equal(cleanState("expired-blocker").host_state, "expired");
+  assert.equal(cleanState("tentative-hypothesis").host_state, "tentative");
+  assert.equal(cleanState("legacy-unavailable").host_state, "needs_revalidation");
+  assert.match(
+    cleanState("legacy-unavailable").host_reason as string,
+    /verification metadata was unavailable/,
+  );
+
+  await writeFile(join(context.project, "dirty.txt"), "uncommitted\n");
+  const dirty = structuredContent(await callOpen(context.client, "LEMonX", "freshness-dirty"));
+  const dirtyRepository = dirty.repository_state as Record<string, unknown>;
+  assert.equal(dirtyRepository.dirty, true);
+  const dirtyWorking = (dirty.memory_context as Record<string, unknown>)
+    .working_memory as Record<string, unknown>;
+  const dirtyVerification = dirtyWorking.verification as Array<Record<string, unknown>>;
+  const dirtyState = (memoryId: string) =>
+    dirtyVerification.find((item) => item.memory_id === memoryId)
+    ?? assert.fail("missing dirty verification for " + memoryId);
+
+  assert.equal(dirtyState("dirty-sensitive").host_state, "needs_revalidation");
+  assert.match(
+    dirtyState("dirty-sensitive").host_reason as string,
+    /working tree has uncommitted changes/,
+  );
+  assert.equal(dirtyState("stable-decision").host_state, "current_by_evidence");
+  assert.equal(dirtyState("expired-blocker").host_state, "expired");
+  assert.equal(dirtyState("tentative-hypothesis").host_state, "tentative");
+  assert.equal(dirtyState("legacy-unavailable").host_state, "needs_revalidation");
 });
 
 test("memory tools remain common to both upstream tool surfaces", async (t) => {

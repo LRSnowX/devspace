@@ -120,8 +120,17 @@ authority and do not include DevSpace-internal pre-budget bookkeeping.
 `open_workspace` exposes that stronger evidence explicitly as a bounded
 `repository_state` snapshot plus `authoritative_references`. The repository
 snapshot includes branch/HEAD/upstream divergence, dirty-state counts, and at
-most twenty changed-path samples. It is refreshed on every open, including a
-reused checkout workspace; Memory bootstrap remains lifecycle-bounded.
+most twenty changed-path samples. It also includes the HEAD commit timestamp
+when available. It is refreshed on every open, including a reused checkout
+workspace; Memory bootstrap remains lifecycle-bounded.
+Project Working Memory carries a verification sidecar. CHIM's `source_state`
+is preserved, while DevSpace derives a separate `host_state` from that source
+state plus live repository freshness. Operational state/task/blocker memories
+are downgraded to `needs_revalidation` when CHIM verification metadata is
+unavailable, when the working tree is dirty, or when repository HEAD is newer
+than the memory's `last_verified_at`. Stable decisions/preferences/invariants,
+tentative memories, and expired memories are not overwritten by this host-side
+operational freshness rule.
 When enabled, the only model-facing Memory tools are `memory_search` and
 `memory_get_thread`. The latter accepts only conversation/evidence IDs previously
 discovered for the current workspace project in this server process, returns a
