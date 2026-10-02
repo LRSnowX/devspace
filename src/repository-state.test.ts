@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
-import { parsePorcelainV1Z } from "./repository-state.js";
+import { git } from "./git.js";
+import { parsePorcelainV1Z, readRepositoryState } from "./repository-state.js";
 
 test("parsePorcelainV1Z summarizes bounded repository changes", () => {
   const parsed = parsePorcelainV1Z([
@@ -39,4 +43,25 @@ test("parsePorcelainV1Z caps the change sample", () => {
   assert.equal(parsed.total, 25);
   assert.equal(parsed.untracked, 25);
   assert.equal(parsed.changes.length, 20);
+});
+
+test("readRepositoryState reports the HEAD commit timestamp", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-repository-state-"));
+  await git(root, ["init"]);
+  await git(root, ["config", "user.email", "devspace@example.test"]);
+  await git(root, ["config", "user.name", "DevSpace Test"]);
+  await writeFile(join(root, "README.md"), "fixture\n");
+  await git(root, ["add", "README.md"]);
+  await git(root, ["commit", "-m", "fixture"]);
+
+  const expectedHead = (await git(root, ["rev-parse", "HEAD"])).stdout.trim();
+  const expectedCommittedAt = Number.parseInt(
+    (await git(root, ["show", "-s", "--format=%ct", "HEAD"])).stdout.trim(),
+    10,
+  );
+  const state = await readRepositoryState(root);
+
+  assert.equal(state.available, true);
+  assert.equal(state.head, expectedHead);
+  assert.equal(state.headCommittedAt, expectedCommittedAt);
 });

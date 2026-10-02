@@ -14,6 +14,7 @@ export interface RepositoryState {
   gitRoot?: string;
   branch?: string;
   head?: string;
+  headCommittedAt?: number;
   detached?: boolean;
   upstream?: string;
   ahead?: number;
@@ -49,6 +50,13 @@ export async function readRepositoryState(cwd: string): Promise<RepositoryState>
   try {
     const gitRoot = eligibility.gitRoot;
     const head = (await git(gitRoot, ["rev-parse", "HEAD"])).stdout.trim();
+    const headCommittedAtRaw = (await git(gitRoot, [
+      "show",
+      "-s",
+      "--format=%ct",
+      "HEAD",
+    ])).stdout.trim();
+    const headCommittedAt = Number.parseInt(headCommittedAtRaw, 10);
     let branch: string | undefined;
     try {
       branch = (await git(gitRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"])).stdout.trim()
@@ -98,6 +106,7 @@ export async function readRepositoryState(cwd: string): Promise<RepositoryState>
       gitRoot,
       branch,
       head,
+      headCommittedAt: Number.isFinite(headCommittedAt) ? headCommittedAt : undefined,
       detached,
       upstream,
       ahead,
