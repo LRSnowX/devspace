@@ -22,7 +22,11 @@ import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 import { ProjectRegistry } from "./project-registry.js";
 import { PatchRecoveryManager } from "./patch-recovery.js";
 import { randomUUID } from "node:crypto";
-import type { MemoryClient, MemoryBootstrapContext } from "./memory-adapter.js";
+import {
+  memoryContinuationByteBudget,
+  type MemoryClient,
+  type MemoryBootstrapContext,
+} from "./memory-adapter.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1997,6 +2001,16 @@ test("model-facing memory bootstrap stays within byte budget after snake_case ma
       const context = await original(project);
       return {
         ...context,
+        continuations: [{
+          ...context.continuations[0]!,
+          messageOffset: 0,
+          totalMessages: 8,
+          messages: Array.from({ length: 8 }, (_, index) => ({
+            role: index % 2 === 0 ? "user" : "assistant",
+            turnIndex: index,
+            text: `continuation-${index}-${"x".repeat(2_400)}`,
+          })),
+        }],
         relevant: [{ ...context.relevant[0]!, snippet: "x".repeat(20_000) }],
       };
     },
@@ -2011,6 +2025,16 @@ test("model-facing memory bootstrap stays within byte budget after snake_case ma
   );
   assert.equal(bootstrap.truncated, true);
   const budgetSections = bootstrap.sections as Record<string, Record<string, unknown>>;
+  assert.ok(
+    Number(budgetSections.continuations?.bytes)
+      <= memoryContinuationByteBudget(12_288),
+  );
+  const continuations = bootstrap.continuations as Array<{
+    message_offset: number;
+    messages: Array<{ turn_index: number }>;
+  }>;
+  assert.equal(continuations[0]?.messages.at(-1)?.turn_index, 7);
+  assert.ok((continuations[0]?.message_offset ?? 0) > 0);
   assert.equal(
     Object.values(budgetSections).some((section) => section.truncated === true),
     true,

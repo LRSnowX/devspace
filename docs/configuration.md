@@ -108,8 +108,10 @@ from recent project conversations so a new host conversation receives stable
 cross-project collaboration rules, durable current project state, and recent
 episodic context without an explicit history lookup; full threads are never
 injected automatically. Collaboration memory receives a small bounded share of
-the same bootstrap budget, then working memory, then remaining space is used for
-continuation history. Live repository state and authoritative project files
+the same bootstrap budget, then working memory. Raw continuation history has an
+additional cap of the smaller of 4096 bytes or 35% of the configured bootstrap
+budget; unused Working Memory space is therefore not automatically filled with
+old transcript text. Live repository state and authoritative project files
 remain stronger evidence than stored memory when they conflict.
 `memory_context` also reports read-only budget telemetry. `bytes_used` is the
 exact UTF-8 JSON size of the final model-facing memory packet, including the

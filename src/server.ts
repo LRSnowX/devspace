@@ -52,6 +52,7 @@ import {
   MemoryAdapter,
   MemoryThreadAuthorizationStore,
   memoryBootstrapSourceCounts,
+  memoryContinuationByteBudget,
   memoryEvidenceIdsFromBootstrapContext,
   memoryEvidenceIdsFromSearchResult,
   type MemoryBootstrapContext,
@@ -396,6 +397,25 @@ export function modelMemoryContext(
     },
   };
   const sourceCounts = memoryBootstrapSourceCounts(context);
+  const continuationBudget = memoryContinuationByteBudget(byteBudget);
+  while (
+    Buffer.byteLength(JSON.stringify(output.continuations), "utf8")
+      > continuationBudget
+  ) {
+    const continuation = [...output.continuations]
+      .reverse()
+      .find((candidate) => candidate.messages.length > 0);
+    if (continuation) {
+      continuation.messages.shift();
+      continuation.message_offset += 1;
+      continuation.returned_messages = continuation.messages.length;
+    } else if (output.continuations.length > 0) {
+      output.continuations.pop();
+    } else {
+      break;
+    }
+    output.truncated = true;
+  }
   const refreshBudgetTelemetry = () => {
     const continuationMessages = output.continuations.reduce(
       (sum, continuation) => sum + continuation.messages.length,

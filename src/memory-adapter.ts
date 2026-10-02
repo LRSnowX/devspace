@@ -10,6 +10,8 @@ const MEMORY_TOOL_NAMES = [
   "memory_project_context",
 ] as const;
 
+const MAX_CONTINUATION_BOOTSTRAP_BYTES = 4_096;
+
 export type MemoryToolName = (typeof MEMORY_TOOL_NAMES)[number];
 export type MemoryAdapterToolName = MemoryToolName | "memory_health";
 
@@ -129,6 +131,13 @@ export function memoryBootstrapSourceCounts(
     relevantHits: context.relevant.length,
     recentHits: context.recent.length,
   };
+}
+
+export function memoryContinuationByteBudget(byteBudget: number): number {
+  return Math.min(
+    MAX_CONTINUATION_BOOTSTRAP_BYTES,
+    Math.floor(byteBudget * 0.35),
+  );
 }
 
 export interface MemoryClient {
@@ -375,20 +384,27 @@ export function compactMemoryBootstrapContext(
   }
   context.truncated ||= context.workingMemory.items.length < workingMemoryCandidate.items.length;
 
+  const continuationBudget = memoryContinuationByteBudget(byteBudget);
   for (const candidate of continuationCandidates) {
     const continuation: MemoryBootstrapContinuation = {
       ...candidate,
       messages: [],
     };
     context.continuations.push(continuation);
-    if (byteLength(context) > byteBudget) {
+    if (
+      byteLength(context.continuations) > continuationBudget
+      || byteLength(context) > byteBudget
+    ) {
       context.continuations.pop();
       context.truncated = true;
       break;
     }
     for (const message of [...candidate.messages].reverse()) {
       continuation.messages.unshift(message);
-      if (byteLength(context) > byteBudget) {
+      if (
+        byteLength(context.continuations) > continuationBudget
+        || byteLength(context) > byteBudget
+      ) {
         continuation.messages.shift();
         context.truncated = true;
         break;

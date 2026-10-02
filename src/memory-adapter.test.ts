@@ -7,6 +7,7 @@ import {
   compactMemoryBootstrapContext,
   compactMirroredMemoryResult,
   memoryBootstrapSourceCounts,
+  memoryContinuationByteBudget,
   memoryEvidenceIdsFromBootstrapContext,
   memoryEvidenceIdsFromSearchResult,
 } from "./memory-adapter.js";
@@ -50,7 +51,7 @@ test("memory bootstrap rejects malformed responses", () => {
   );
 });
 
-test("memory bootstrap preserves recent continuation tails within its byte budget", () => {
+test("memory bootstrap preserves recent continuation tails within a dedicated section budget", () => {
   const raw = projectContext() as {
     structuredContent: Record<string, unknown>;
   };
@@ -89,6 +90,10 @@ test("memory bootstrap preserves recent continuation tails within its byte budge
 
   const context = compactMemoryBootstrapContext(raw, "Jack", 4_096);
   assert.ok(Buffer.byteLength(JSON.stringify(context), "utf8") <= 4_096);
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(context.continuations), "utf8")
+      <= memoryContinuationByteBudget(4_096),
+  );
   assert.equal(JSON.stringify(context).includes("sourceCounts"), false);
   assert.deepEqual(memoryBootstrapSourceCounts(context), {
     collaborationItems: 0,
@@ -98,16 +103,51 @@ test("memory bootstrap preserves recent continuation tails within its byte budge
     relevantHits: 4,
     recentHits: 3,
   });
-  assert.equal(context.continuations.length, 2);
+  assert.ok(context.continuations.length >= 1);
   assert.equal(context.continuations[0]?.conversationId, "continuation-1");
   assert.equal(context.continuations[0]?.messages.length, 3);
-  assert.equal(context.continuations[1]?.conversationId, "continuation-2");
-  assert.equal(context.continuations[1]?.messages.at(-1)?.turnIndex, 17);
-  assert.ok((context.continuations[1]?.messages.length ?? 0) > 0);
-  assert.ok((context.continuations[1]?.messageOffset ?? 0) >= 10);
+  if (context.continuations[1]) {
+    assert.equal(context.continuations[1].conversationId, "continuation-2");
+    assert.ok(context.continuations[1].messageOffset >= 10);
+    if (context.continuations[1].messages.length > 0) {
+      assert.equal(context.continuations[1].messages.at(-1)?.turnIndex, 17);
+    }
+  }
   assert.equal(context.truncated, true);
   assert.ok(memoryEvidenceIdsFromBootstrapContext(context).includes("continuation-1"));
-  assert.ok(memoryEvidenceIdsFromBootstrapContext(context).includes("continuation-2"));
+});
+
+test("memory bootstrap does not let raw continuation history consume an otherwise empty packet", () => {
+  const raw = projectContext() as {
+    structuredContent: Record<string, unknown>;
+  };
+  raw.structuredContent.continuations = [{
+    conversation_id: "continuation-heavy",
+    source: "chatgpt",
+    title: "Long prior project conversation",
+    update_time: 100,
+    message_offset: 0,
+    returned_messages: 8,
+    total_messages: 8,
+    messages: Array.from({ length: 8 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      create_time: 100 + index,
+      turn_index: index,
+      text: `message-${index}-${"x".repeat(2_400)}`,
+    })),
+  }];
+
+  const context = compactMemoryBootstrapContext(raw, "Jack", 12_288);
+  const continuationBytes = Buffer.byteLength(
+    JSON.stringify(context.continuations),
+    "utf8",
+  );
+  assert.ok(continuationBytes <= 4_096);
+  assert.ok(continuationBytes <= memoryContinuationByteBudget(12_288));
+  assert.equal(context.continuations.length, 1);
+  assert.equal(context.continuations[0]?.messages.at(-1)?.turnIndex, 7);
+  assert.ok((context.continuations[0]?.messageOffset ?? 0) > 0);
+  assert.equal(context.truncated, true);
 });
 
 test("memory bootstrap prioritizes bounded working memory before continuation history", () => {

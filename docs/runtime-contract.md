@@ -282,9 +282,11 @@ When Memory is configured:
   entry. The same configured byte budget bounds stable `collaboration_memory`,
   durable `working_memory`, continuation tails, and recent-hit metadata
   together. Collaboration memory is bounded to a small highest-priority memory
-  share, then working memory is prioritized over continuation history, while
-  live repository state and authoritative project files outrank stored memory
-  when they conflict.
+  share, then working memory is prioritized over continuation history. Raw
+  continuation history is independently capped at the smaller of 4096 bytes or
+  35% of the configured bootstrap budget, so sparse Working Memory cannot cause
+  prior transcript text to consume the whole handoff. Live repository state and
+  authoritative project files outrank stored memory when they conflict.
 - The model-facing memory packet reports `byte_budget`, exact final
   `bytes_used`, and per-section byte/count/truncation telemetry. Section
   `truncated` means items/messages were omitted by the shared bootstrap budget;
