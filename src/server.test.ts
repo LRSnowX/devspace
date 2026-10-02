@@ -1373,6 +1373,23 @@ function fakeMemory(bootstrapFailure?: Error): MemoryClient {
       return {
         project,
         sourcePolicy: "relevance-filter",
+        workingMemory: {
+          project,
+          generatedAt: 44,
+          items: [{
+            memoryId: `${project}-current-goal`,
+            kind: "state",
+            key: "current_goal",
+            value: { text: "Complete repository acceptance." },
+            importance: 95,
+            confidence: 1,
+            lastVerifiedAt: 44,
+            evidence: [{
+              kind: "conversation_turn",
+              reference: `${project}-working-memory-private-evidence`,
+            }],
+          }],
+        },
         continuations: [
           {
             conversationId: `${project}-continuation`,
@@ -1561,6 +1578,20 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.ok(Buffer.byteLength(JSON.stringify(bootstrap), "utf8") <= 12_288);
   assert.equal(bootstrap.byte_budget, 12_288);
   assert.equal("messages" in bootstrap, false);
+  const workingMemory = bootstrap.working_memory as Record<string, unknown>;
+  assert.equal(workingMemory.project, "LEMonX");
+  const workingItems = workingMemory.items as Array<Record<string, unknown>>;
+  assert.equal(workingItems.length, 1);
+  assert.equal(workingItems[0]?.memory_id, "LEMonX-current-goal");
+  assert.deepEqual(workingItems[0]?.value, { text: "Complete repository acceptance." });
+  assert.match(
+    opened.instruction as string,
+    /working_memory as the current durable project state/,
+  );
+  assert.match(
+    opened.instruction as string,
+    /Live repository state and authoritative project files outrank stored memory/,
+  );
   const continuations = bootstrap.continuations as Array<Record<string, unknown>>;
   assert.equal(continuations.length, 2);
   assert.equal(continuations[0]?.conversation_id, "LEMonX-continuation");
@@ -1585,6 +1616,19 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
       conversation_id: "foreign-id",
     },
   });
+  const workingMemoryEvidenceDenied = await context.client.callTool({
+    name: "memory_get_thread",
+    arguments: {
+      workspace_id: workspaceId,
+      conversation_id: "LEMonX-working-memory-private-evidence",
+    },
+  });
+  assert.notEqual(workingMemoryEvidenceDenied.isError, true);
+  assert.equal(structuredContent(workingMemoryEvidenceDenied).status, "error");
+  assert.equal(
+    (structuredContent(workingMemoryEvidenceDenied).error as { code?: string }).code,
+    "MEMORY_THREAD_NOT_AUTHORIZED",
+  );
   const bootstrapThread = await context.client.callTool({
     name: "memory_get_thread",
     arguments: { workspace_id: workspaceId, conversation_id: "LEMonX-evidence", message_offset: 0, message_limit: 1 },

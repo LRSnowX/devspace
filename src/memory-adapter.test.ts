@@ -100,6 +100,92 @@ test("memory bootstrap preserves recent continuation tails within its byte budge
   assert.ok(memoryEvidenceIdsFromBootstrapContext(context).includes("continuation-2"));
 });
 
+test("memory bootstrap prioritizes bounded working memory before continuation history", () => {
+  const raw = projectContext() as {
+    structuredContent: Record<string, unknown>;
+  };
+  raw.structuredContent.working_memory = {
+    project: "Jack",
+    generated_at: 123,
+    items: Array.from({ length: 8 }, (_, index) => ({
+      memory_id: "memory-" + index,
+      scope: { type: "project", project: "Jack" },
+      kind: index === 0 ? "decision" : "state",
+      key: "key-" + index,
+      value: { text: "memory-" + index + "-" + "m".repeat(900) },
+      status: "active",
+      importance: 100 - index,
+      confidence: 1,
+      valid_from: 100 + index,
+      valid_until: null,
+      supersedes_memory_id: null,
+      created_at: 100 + index,
+      updated_at: 100 + index,
+      last_verified_at: 100 + index,
+      evidence: [{
+        kind: "conversation_turn",
+        reference: "conversation:private-" + index + ":turn:1",
+        detail: {},
+        created_at: 100 + index,
+      }],
+    })),
+  };
+  raw.structuredContent.continuations = [{
+    conversation_id: "continuation-1",
+    source: "chatgpt",
+    title: "Previous chat",
+    message_offset: 0,
+    total_messages: 2,
+    messages: [
+      { role: "user", turn_index: 0, text: "continue" },
+      { role: "assistant", turn_index: 1, text: "next action" },
+    ],
+  }];
+
+  const context = compactMemoryBootstrapContext(raw, "Jack", 8_192);
+  assert.ok(Buffer.byteLength(JSON.stringify(context), "utf8") <= 8_192);
+  assert.ok(context.workingMemory.items.length > 0);
+  assert.equal(context.workingMemory.items[0]?.memoryId, "memory-0");
+  assert.ok(context.workingMemory.items.length < 8);
+  assert.equal(context.continuations.length, 1);
+  assert.ok(context.continuations[0]!.messages.length > 0);
+  assert.equal(context.truncated, true);
+  assert.equal(
+    memoryEvidenceIdsFromBootstrapContext(context).includes("private-0"),
+    false,
+  );
+});
+
+test("memory bootstrap compacts a single oversized working-memory value", () => {
+  const raw = projectContext() as {
+    structuredContent: Record<string, unknown>;
+  };
+  raw.structuredContent.working_memory = {
+    project: "Jack",
+    items: [{
+      memory_id: "large-memory",
+      kind: "state",
+      key: "current_state",
+      value: {
+        nested: Array.from({ length: 40 }, (_, index) => ({
+          index,
+          text: "x".repeat(2_000),
+        })),
+      },
+      importance: 100,
+      confidence: 1,
+      evidence: [],
+    }],
+  };
+
+  const context = compactMemoryBootstrapContext(raw, "Jack", 4_096);
+  assert.equal(context.workingMemory.items.length, 1);
+  assert.ok(Buffer.byteLength(JSON.stringify(context), "utf8") <= 4_096);
+  const value = context.workingMemory.items[0]?.value as Record<string, unknown>;
+  assert.equal(value.truncated, true);
+  assert.equal(typeof value.preview, "string");
+});
+
 test("memory adapter removes rmcp mirrored JSON text when structured content is identical", () => {
   const structuredContent = {
     hits: [{ result: { conversation_id: "conversation-1" } }],

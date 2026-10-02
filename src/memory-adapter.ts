@@ -39,9 +39,34 @@ export interface MemoryBootstrapContinuation {
   messages: MemoryBootstrapMessage[];
 }
 
+export interface MemoryBootstrapEvidence {
+  kind: string;
+  reference: string;
+}
+
+export interface MemoryBootstrapWorkingItem {
+  memoryId: string;
+  kind: string;
+  key: string;
+  value: unknown;
+  importance: number;
+  confidence: number;
+  validFrom?: number;
+  validUntil?: number;
+  lastVerifiedAt?: number;
+  evidence: MemoryBootstrapEvidence[];
+}
+
+export interface MemoryBootstrapWorkingMemory {
+  project: string;
+  generatedAt?: number;
+  items: MemoryBootstrapWorkingItem[];
+}
+
 export interface MemoryBootstrapContext {
   project: string;
   sourcePolicy: string;
+  workingMemory: MemoryBootstrapWorkingMemory;
   continuations: MemoryBootstrapContinuation[];
   relevant: MemoryBootstrapHit[];
   recent: MemoryBootstrapHit[];
@@ -216,6 +241,7 @@ export function compactMemoryBootstrapContext(
     relevant: structured.relevant.map(compactHit),
     recent: structured.recent.map(compactHit),
   };
+  const workingMemoryCandidate = compactWorkingMemory(structured.working_memory, expectedProject);
   const continuationCandidates = Array.isArray(structured.continuations)
     ? structured.continuations.map(compactContinuation)
     : structured.continuation === undefined || structured.continuation === null
@@ -224,18 +250,44 @@ export function compactMemoryBootstrapContext(
   const context: MemoryBootstrapContext = {
     project: expectedProject,
     sourcePolicy: clip(structured.source_policy, 80),
-    continuations: continuationCandidates.map((continuation) => ({
-      ...continuation,
-      messages: [],
-    })),
+    workingMemory: {
+      project: expectedProject,
+      ...(workingMemoryCandidate.generatedAt === undefined
+        ? {}
+        : { generatedAt: workingMemoryCandidate.generatedAt }),
+      items: [],
+    },
+    continuations: [],
     relevant: [],
     recent: [],
     truncated: false,
     byteBudget,
   };
-  for (let index = 0; index < continuationCandidates.length; index += 1) {
-    const candidate = continuationCandidates[index]!;
-    const continuation = context.continuations[index]!;
+  const workingMemoryBudget = Math.min(6_144, Math.floor(byteBudget * 0.55));
+  for (const item of workingMemoryCandidate.items) {
+    context.workingMemory.items.push(item);
+    if (
+      byteLength(context.workingMemory) > workingMemoryBudget
+      || byteLength(context) > byteBudget
+    ) {
+      context.workingMemory.items.pop();
+      context.truncated = true;
+      break;
+    }
+  }
+  context.truncated ||= context.workingMemory.items.length < workingMemoryCandidate.items.length;
+
+  for (const candidate of continuationCandidates) {
+    const continuation: MemoryBootstrapContinuation = {
+      ...candidate,
+      messages: [],
+    };
+    context.continuations.push(continuation);
+    if (byteLength(context) > byteBudget) {
+      context.continuations.pop();
+      context.truncated = true;
+      break;
+    }
     for (const message of [...candidate.messages].reverse()) {
       continuation.messages.unshift(message);
       if (byteLength(context) > byteBudget) {
@@ -307,6 +359,93 @@ function compactContinuation(value: unknown): MemoryBootstrapContinuation {
     totalMessages: continuation.total_messages,
     messages: continuation.messages.map(compactMessage),
   };
+}
+
+function compactWorkingMemory(
+  value: unknown,
+  expectedProject: string,
+): MemoryBootstrapWorkingMemory {
+  const working = record(value);
+  if (!working) {
+    return { project: expectedProject, items: [] };
+  }
+  if (working.project !== expectedProject || !Array.isArray(working.items)) {
+    throw new Error("Malformed project working memory");
+  }
+  return {
+    project: expectedProject,
+    ...(typeof working.generated_at === "number" ? { generatedAt: working.generated_at } : {}),
+    items: working.items.map(compactWorkingMemoryItem),
+  };
+}
+
+function compactWorkingMemoryItem(value: unknown): MemoryBootstrapWorkingItem {
+  const item = record(value);
+  if (
+    !item
+    || typeof item.memory_id !== "string"
+    || typeof item.kind !== "string"
+    || typeof item.key !== "string"
+    || typeof item.importance !== "number"
+    || typeof item.confidence !== "number"
+    || !Array.isArray(item.evidence)
+  ) {
+    throw new Error("Malformed project working memory item");
+  }
+  const compacted: MemoryBootstrapWorkingItem = {
+    memoryId: clip(item.memory_id, 200),
+    kind: clip(item.kind, 40),
+    key: clip(item.key, 160),
+    value: compactJsonValue(item.value, 0),
+    importance: item.importance,
+    confidence: item.confidence,
+    ...(typeof item.valid_from === "number" ? { validFrom: item.valid_from } : {}),
+    ...(typeof item.valid_until === "number" ? { validUntil: item.valid_until } : {}),
+    ...(typeof item.last_verified_at === "number"
+      ? { lastVerifiedAt: item.last_verified_at }
+      : {}),
+    evidence: item.evidence.slice(0, 6).map(compactWorkingMemoryEvidence),
+  };
+  if (byteLength(compacted) <= 2_600) return compacted;
+  return {
+    ...compacted,
+    value: {
+      truncated: true,
+      preview: clip(JSON.stringify(compacted.value), 1_400),
+    },
+    evidence: compacted.evidence.slice(0, 3),
+  };
+}
+
+function compactWorkingMemoryEvidence(value: unknown): MemoryBootstrapEvidence {
+  const evidence = record(value);
+  if (
+    !evidence
+    || typeof evidence.kind !== "string"
+    || typeof evidence.reference !== "string"
+  ) {
+    throw new Error("Malformed project working memory evidence");
+  }
+  return {
+    kind: clip(evidence.kind, 40),
+    reference: clip(evidence.reference, 320),
+  };
+}
+
+function compactJsonValue(value: unknown, depth: number): unknown {
+  if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "string") return clip(value, 1_200);
+  if (depth >= 4) return "[nested value omitted]";
+  if (Array.isArray(value)) {
+    return value.slice(0, 12).map((item) => compactJsonValue(item, depth + 1));
+  }
+  const object = record(value);
+  if (!object) return String(value);
+  return Object.fromEntries(
+    Object.entries(object)
+      .slice(0, 20)
+      .map(([key, item]) => [clip(key, 120), compactJsonValue(item, depth + 1)]),
+  );
 }
 
 function compactMessage(value: unknown): MemoryBootstrapMessage {

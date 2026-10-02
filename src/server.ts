@@ -154,7 +154,7 @@ function serverInstructions(
     : "";
   const agents = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in available_agents_files, use ${toolNames.read} to inspect that instruction file and follow it. `;
   const common = `Call ${toolNames.openWorkspace} when starting work in a project folder or isolated worktree without a usable workspace_id, then reuse the returned workspace_id for subsequent operations in that workspace.`;
-  const projectMemory = " open_workspace also accepts an unambiguous project name or registered alias. When memory is configured it may return bounded memory_context including an automatic continuation tail from the latest project conversation; treat that as prior-conversation context and verify repository facts against current files. Use memory_search for additional history questions and memory_get_thread only for discovered evidence.";
+  const projectMemory = " open_workspace also accepts an unambiguous project name or registered alias. When memory is configured it may return bounded memory_context containing durable project working memory plus recent conversation continuations. Treat live repository state and authoritative project files as stronger evidence than stored memory, then use working_memory as current durable project state and continuations as recent episodic context. Use memory_search for additional history questions and memory_get_thread only for discovered conversation evidence.";
 
   return `${common}${projectMemory} ${toolSurface.instructions({ agents, skills })}${artifactInstruction}${showChangesInstruction}`;
 }
@@ -184,9 +184,31 @@ const memoryBootstrapContinuationOutputSchema = z.object({
   total_messages: z.number().int().nonnegative(),
   messages: z.array(memoryBootstrapMessageOutputSchema),
 });
+const memoryBootstrapEvidenceOutputSchema = z.object({
+  kind: z.string(),
+  reference: z.string(),
+});
+const memoryBootstrapWorkingItemOutputSchema = z.object({
+  memory_id: z.string(),
+  kind: z.string(),
+  key: z.string(),
+  value: z.unknown(),
+  importance: z.number(),
+  confidence: z.number(),
+  valid_from: z.number().optional(),
+  valid_until: z.number().optional(),
+  last_verified_at: z.number().optional(),
+  evidence: z.array(memoryBootstrapEvidenceOutputSchema),
+});
+const memoryBootstrapWorkingMemoryOutputSchema = z.object({
+  project: z.string(),
+  generated_at: z.number().optional(),
+  items: z.array(memoryBootstrapWorkingItemOutputSchema),
+});
 const memoryBootstrapContextOutputSchema = z.object({
   project: z.string(),
   source_policy: z.string(),
+  working_memory: memoryBootstrapWorkingMemoryOutputSchema,
   continuations: z.array(memoryBootstrapContinuationOutputSchema),
   relevant: z.array(memoryBootstrapHitOutputSchema),
   recent: z.array(memoryBootstrapHitOutputSchema),
@@ -207,6 +229,25 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
   const output = {
     project: context.project,
     source_policy: context.sourcePolicy,
+    working_memory: {
+      project: context.workingMemory.project,
+      generated_at: context.workingMemory.generatedAt,
+      items: context.workingMemory.items.map((item) => ({
+        memory_id: item.memoryId,
+        kind: item.kind,
+        key: item.key,
+        value: item.value,
+        importance: item.importance,
+        confidence: item.confidence,
+        valid_from: item.validFrom,
+        valid_until: item.validUntil,
+        last_verified_at: item.lastVerifiedAt,
+        evidence: item.evidence.map((evidence) => ({
+          kind: evidence.kind,
+          reference: evidence.reference,
+        })),
+      })),
+    },
     continuations: context.continuations.map((continuation) => ({
           conversation_id: continuation.conversationId,
           source: continuation.source,
@@ -233,11 +274,18 @@ function modelMemoryContext(context: MemoryBootstrapContext, byteBudget: number)
     else {
       const continuation = [...output.continuations]
         .reverse()
-        .find((candidate) => candidate.messages.length > 1);
-      if (!continuation) throw new Error("Memory bootstrap byte budget is too small for its envelope");
-      continuation.messages.shift();
-      continuation.message_offset += 1;
-      continuation.returned_messages = continuation.messages.length;
+        .find((candidate) => candidate.messages.length > 0);
+      if (continuation) {
+        continuation.messages.shift();
+        continuation.message_offset += 1;
+        continuation.returned_messages = continuation.messages.length;
+      } else if (output.continuations.length > 0) {
+        output.continuations.pop();
+      } else if (output.working_memory.items.length > 0) {
+        output.working_memory.items.pop();
+      } else {
+        throw new Error("Memory bootstrap byte budget is too small for its envelope");
+      }
     }
     output.truncated = true;
   }
@@ -744,11 +792,15 @@ function registerMcpSurface(
           });
         }
       }
-      const memoryInstruction = memoryContext?.continuations.length
-        ? "Treat structuredContent.memory_context.continuations as prior-conversation context for this project. Continue from them without waiting for the user to ask you to search memory; use memory_search only when additional history is needed."
-        : memoryContext
-          ? "Use structuredContent.memory_context as bounded prior project context; use memory_search when additional history is needed."
-          : undefined;
+      const memoryInstruction = memoryContext?.working_memory.items.length
+        ? memoryContext.continuations.length
+          ? "Treat structuredContent.memory_context.working_memory as the current durable project state and structuredContent.memory_context.continuations as recent prior-conversation context. Continue from both without waiting for the user to ask you to search memory. Live repository state and authoritative project files outrank stored memory when they conflict; use memory_search only when additional history is needed."
+          : "Treat structuredContent.memory_context.working_memory as the current durable project state. Continue from it without waiting for the user to ask you to search memory. Live repository state and authoritative project files outrank stored memory when they conflict; use memory_search only when additional history is needed."
+        : memoryContext?.continuations.length
+          ? "Treat structuredContent.memory_context.continuations as recent prior-conversation context for this project. Continue from them without waiting for the user to ask you to search memory; use memory_search only when additional history is needed."
+          : memoryContext
+            ? "Use structuredContent.memory_context as bounded prior project context; use memory_search when additional history is needed."
+            : undefined;
       const cardInstruction = [
         config.skillsEnabled
           ? "Use this workspace_id for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agents_files instructions. Before working under a path listed in available_agents_files, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
@@ -803,8 +855,11 @@ function registerMcpSurface(
             visibleAgents.length > 0
               ? `Available subagent profiles: ${visibleAgents.map(formatVisibleAgent).join(", ")}`
               : undefined,
+            memoryContext?.working_memory.items.length
+              ? "Durable Project Working Memory is available in structuredContent.memory_context.working_memory."
+              : undefined,
             memoryContext?.continuations.length
-              ? "Automatic continuation memory from recent project conversations is available in structuredContent.memory_context.continuations."
+              ? "Recent project conversation continuity is available in structuredContent.memory_context.continuations."
               : memoryContext
                 ? "Bounded project memory context is available in structuredContent.memory_context."
                 : undefined,

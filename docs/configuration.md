@@ -103,9 +103,13 @@ Memory is opt-in through the `memory` section of the versioned config. Set
 `memory_context` after a `bootstrapTimeoutMs` (default 5000 ms) attempt;
 unavailable, timed-out, or malformed Memory responses do not block workspace
 entry. The default budget is 12288 bytes. The bootstrap may include bounded
-`continuations` from the most recent project conversations so a new host
-conversation can continue recent work without an explicit history lookup; full
-threads are never injected automatically.
+`working_memory` plus bounded `continuations` from recent project conversations
+so a new host conversation receives durable current project state and recent
+episodic context without an explicit history lookup; full threads are never
+injected automatically. Working memory is compacted first under a bounded share
+of the same bootstrap budget, then remaining space is used for continuation
+history. Live repository state and authoritative project files remain stronger
+evidence than stored memory when they conflict.
 When enabled, the only model-facing Memory tools are `memory_search` and
 `memory_get_thread`. The latter accepts only conversation/evidence IDs previously
 discovered for the current workspace project in this server process, returns a

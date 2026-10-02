@@ -271,9 +271,10 @@ When Memory is configured:
 - Memory remains a read-only optional extension to the coding surface.
 - `open_workspace` may return bounded bootstrap `memory_context`; Memory
   unavailable, malformed, or timed-out bootstrap does not prevent workspace
-  entry. Bootstrap continuity is limited by the configured byte budget and may
-  include tails from multiple recent project conversations rather than one full
-  transcript.
+  entry. The same configured byte budget bounds durable `working_memory`,
+  continuation tails, and recent-hit metadata together. Working memory is
+  prioritized over continuation history, while live repository state and
+  authoritative project files outrank stored memory when they conflict.
 - `memory_search` performs project-relevant retrieval.
 - `memory_get_thread` expands only evidence IDs authorized by the current
   project's bootstrap/search discovery. Authorization is bounded,
@@ -282,6 +283,9 @@ When Memory is configured:
   and uses explicit offsets for older pagination.
 - An expansion outside that authorization boundary returns the structured
   `MEMORY_THREAD_NOT_AUTHORIZED` scope error without exposing thread contents.
+- Provenance references attached to working-memory items do not automatically
+  authorize thread expansion; conversation expansion still requires normal
+  bootstrap/search discovery.
 
 ### Current limitation
 

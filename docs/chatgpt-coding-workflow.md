@@ -23,11 +23,12 @@ The result includes a `workspace_id`. All later file, search, edit, show-changes
 and shell calls should reuse that same `workspace_id`.
 
 If the optional read-only CHIM Memory Adapter is configured, `open_workspace`
-also returns a bounded `memory_context`. When recent continuation tails are
-present, treat them as the previous project conversation context and continue
-from them without waiting for the user to request a memory lookup. It may be
-absent without affecting coding access. Treat historical context as evidence to
-check against current files. For a specific deeper-history question, use
+also returns a bounded `memory_context`. Treat `working_memory`, when present,
+as durable current project state and `continuations` as recent prior-conversation
+context; continue from both without waiting for the user to request a memory
+lookup. Current repository state and authoritative project files take
+precedence over stale stored memory. The memory context may be absent without
+affecting coding access. For a specific deeper-history question, use
 `memory_search`; expand only a returned conversation or evidence ID with
 paginated `memory_get_thread`.
 Project relevance filtering is not strict project isolation, and arbitrary
