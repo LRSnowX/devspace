@@ -8,7 +8,7 @@ const DEFAULT_POLL_YIELD_MS = 5_000;
 export const MAX_PROCESS_YIELD_MS = 12_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_BUFFER_CHARACTERS = 1_000_000;
-const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
+const COMPLETED_SESSION_TTL_MS = 30 * 60 * 1_000;
 const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
 
@@ -61,6 +61,7 @@ interface ProcessSession {
   running: boolean;
   exitCode?: number;
   signal?: string;
+  completedSnapshot?: ProcessSnapshot;
   exitPromise: Promise<void>;
   resolveExit: () => void;
   cleanupTimer?: NodeJS.Timeout;
@@ -270,14 +271,17 @@ export class ProcessSessionManager {
     const writableChars = chars.replaceAll("\u0003", "");
     if (writableChars && session.running) session.process?.write(writableChars);
 
-    if ((interactionRequested || !session.buffer.hasOutput()) && session.running) {
+    const explicitPollWindow = input.yieldTimeMs !== undefined;
+    if (
+      (interactionRequested || explicitPollWindow || !session.buffer.hasOutput()) &&
+      session.running
+    ) {
       const fallback = interactionRequested ? DEFAULT_INTERACTIVE_YIELD_MS : DEFAULT_POLL_YIELD_MS;
       const yieldTimeMs = boundedInteger(input.yieldTimeMs, fallback, MAX_PROCESS_YIELD_MS);
       await this.waitForExit(session, yieldTimeMs);
     }
 
     const snapshot = this.consume(session, input.maxOutputTokens);
-    if (!session.running) this.removeSession(session.id);
     return snapshot;
   }
 
@@ -407,11 +411,15 @@ export class ProcessSessionManager {
   }
 
   private consume(session: ProcessSession, maxOutputTokens?: number): ProcessSnapshot {
+    if (!session.running && session.completedSnapshot) {
+      return session.completedSnapshot;
+    }
+
     const limit = boundedInteger(maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 100_000);
     const maxCharacters = Math.max(256, limit * 4);
     const buffered = session.buffer.drain(maxCharacters);
 
-    return {
+    const snapshot = {
       sessionId: session.running ? session.id : undefined,
       output: buffered.output,
       outputTruncated: buffered.truncated,
@@ -420,6 +428,9 @@ export class ProcessSessionManager {
       signal: session.signal,
       wallTimeMs: Date.now() - session.startedAt,
     };
+
+    if (!session.running) session.completedSnapshot = snapshot;
+    return snapshot;
   }
 
   private getOwnedSession(workspaceId: string, sessionId: number): ProcessSession {

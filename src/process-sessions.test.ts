@@ -97,6 +97,14 @@ assert.equal(completed.running, false);
 assert.equal(completed.exitCode, 0);
 assert.match(completed.output, /finished/);
 
+const replayedCompleted = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: background.sessionId,
+  yieldTimeMs: 1,
+});
+assert.deepEqual(replayedCompleted, completed);
+
+await new Promise((resolve) => setTimeout(resolve, 1_100));
 await assert.rejects(
   manager.write({
     workspaceId: "workspace-a",
@@ -205,6 +213,23 @@ const noisyInputResult = await manager.write({
 });
 assert.equal(noisyInputResult.running, false);
 assert.match(noisyInputResult.output, /input:hello/);
+
+const explicitlyPolled = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "console.log('early'); setTimeout(() => { console.log('done'); process.exit(0); }, 100)"`,
+  yieldTimeMs: 5,
+});
+assert.equal(explicitlyPolled.running, true);
+assert.ok(explicitlyPolled.sessionId);
+await new Promise((resolve) => setTimeout(resolve, 25));
+const explicitlyWaited = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: explicitlyPolled.sessionId,
+  yieldTimeMs: 500,
+});
+assert.equal(explicitlyWaited.running, false);
+assert.match(explicitlyWaited.output, /done/);
 
 const interruptible = await manager.start({
   workspaceId: "workspace-a",
