@@ -61,7 +61,7 @@ the corresponding regression coverage in the same change.
 - Shell commands run with the local user's authority. Workspace path checks do
   not turn shell execution into a filesystem or process sandbox.
 
-## Host checkout write ownership
+## Checkout write ownership
 
 - `open_workspace` reports a compact `write_ownership` snapshot: `state`,
   optional `owner_workspace_id`, and `active_mutation_count`. It does not acquire.
@@ -83,9 +83,33 @@ the corresponding regression coverage in the same change.
 - Restart preserves claims and interrupted activities; there is no automatic
   release, expiry, takeover, waiting, or scheduler. Arbitrary-shell executor
   evidence is non-exhaustive, so crash recovery cannot trust a shell PID alone.
-- This Host integration does not enforce ownership in local agents/agentd or
-  retention, and adds no operator recovery CLI. Shell execution remains local-user
-  authority, not a sandbox or proof that detached descendants have stopped.
+- Local-agent/agentd mutation-capable turns use the same stateDir-backed
+  ownership store as the Host. Explicit `read_only` turns do not acquire
+  ownership or create a mutation activity; `allowed`, `full_access`, and the
+  omitted/default mode require ownership by the originating workspace. One
+  mutation activity covers one turn. A normal response or acknowledged terminal
+  failure/cancellation clears that exact activity; transport errors, timeouts,
+  process death, or unacknowledged cancellation retain it because executor
+  termination is not proven.
+- Destructive workspace retention and pruned-worktree restoration use a
+  per-canonical-root retention guard that races atomically with ownership acquire
+  under the same short transition mutex. The guard remains published while the
+  destructive Git/persistence/compensation work runs outside the mutex. Safe
+  completion or known-safe compensation clears only the exact guard; stale,
+  corrupt, unverifiable, partial, or ambiguously failed lifecycles fail closed
+  instead of deleting or taking over state.
+- Operator diagnostics and bounded recovery are available through
+  `devspace write-ownership list`, `show <project-or-path>`, and
+  `recover <project-or-path>`. Recovery does not wait, transfer ownership,
+  expire claims, or provide a force takeover. Active state may be cleared only
+  when executor evidence is exhaustive and all executors are dead; destructive
+  retention guards additionally require a known-safe filesystem lifecycle.
+  Managed-worktree destructive guards remain manual-inspection cases when the
+  current Git evidence cannot prove that lifecycle safely.
+- Shell execution and local-agent providers still run with the local user's
+  authority. Ownership is coordination and crash-recovery state, not an OS
+  sandbox, power-loss durability guarantee, or proof that detached descendants
+  have stopped.
 
 ## `apply_patch`
 
