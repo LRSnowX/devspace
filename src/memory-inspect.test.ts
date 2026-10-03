@@ -26,6 +26,13 @@ test("memory inspection combines live repository freshness, handoff and CHIM hea
   await git(root, ["commit", "-m", "Initial commit"]);
 
   const memory = fakeMemory();
+  const bootstrap = memory.bootstrapProjectContext.bind(memory);
+  memory.bootstrapProjectContext = async (project, repositoryState) => {
+    assert.equal(repositoryState?.available, true);
+    assert.equal(repositoryState?.dirty, false);
+    assert.equal(typeof repositoryState?.headCommittedAt, "number");
+    return bootstrap(project, repositoryState);
+  };
   const inspection = await inspectProjectMemory({
     projectName: "LEMonX",
     projectPath: root,

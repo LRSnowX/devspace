@@ -56,6 +56,9 @@ import {
 import {
   MemoryAdapter,
   MemoryThreadAuthorizationStore,
+  deriveWorkingMemoryFreshness,
+  isNonCurrentWorkingMemory,
+  continuityWorkingMemoryItem,
   memoryBootstrapSourceCounts,
   memoryContinuationByteBudget,
   memoryEvidenceIdsFromBootstrapContext,
@@ -434,47 +437,8 @@ export function modelMemoryContext(
     const item = context.workingMemory.items.find(
       (candidate) => candidate.memoryId === verification.memoryId,
     );
-    const repositoryHeadCommittedAt = repositoryState?.available
-      ? repositoryState.headCommittedAt
-      : undefined;
-    const repositoryDirty = repositoryState?.available && repositoryState.dirty === true;
-    let hostState = verification.sourceState === "unavailable"
-      ? verification.class === "tentative"
-        ? "tentative"
-        : verification.class === "operational"
-          ? "needs_revalidation"
-          : verification.evidenceStrength === "strong_independent"
-            ? "strongly_verified"
-            : "current_by_evidence"
-      : verification.sourceState;
-    let hostReason = verification.sourceReason
-      ?? (verification.sourceState === "unavailable" && verification.class === "operational"
-        ? "CHIM working-memory verification metadata is unavailable for this operational memory; verify it against live project state before acting."
-        : undefined);
-
-    if (
-      verification.class === "operational"
-      && hostState !== "expired"
-      && hostState !== "tentative"
-      && hostState !== "needs_revalidation"
-    ) {
-      if (repositoryDirty) {
-        hostState = "needs_revalidation";
-        hostReason =
-          "Live repository working tree has uncommitted changes, so this operational memory cannot be safely treated as current without checking the changed files.";
-      } else if (item?.lastVerifiedAt === undefined) {
-        hostState = "needs_revalidation";
-        hostReason =
-          "Operational memory has no last_verified_at timestamp; verify it against live repository state before treating it as current.";
-      } else if (
-        repositoryHeadCommittedAt !== undefined
-        && repositoryHeadCommittedAt > item.lastVerifiedAt
-      ) {
-        hostState = "needs_revalidation";
-        hostReason =
-          "Live repository HEAD is newer than this operational memory's last verification; verify it against current repository state before acting.";
-      }
-    }
+    const { hostState, hostReason, repositoryHeadCommittedAt } =
+      deriveWorkingMemoryFreshness(item, verification, repositoryState);
 
     return {
       memory_id: verification.memoryId,
@@ -526,7 +490,15 @@ export function modelMemoryContext(
     working_memory: {
       project: context.workingMemory.project,
       generated_at: context.workingMemory.generatedAt,
-      items: context.workingMemory.items.map(mapMemoryItem),
+      items: context.workingMemory.items.map((item) => {
+        const verification = context.workingMemory.verification.find(
+          (entry) => entry.memoryId === item.memoryId,
+        );
+        return mapMemoryItem(!verification || isNonCurrentWorkingMemory(
+          deriveWorkingMemoryFreshness(item, verification, repositoryState).hostState,
+          verification.sourceState,
+        ) ? continuityWorkingMemoryItem(item) : item);
+      }),
       verification: context.workingMemory.verification.map(mapWorkingVerification),
       confirmation: context.workingMemory.confirmation.map((confirmation) => ({
         memory_id: confirmation.memoryId,
@@ -654,8 +626,30 @@ export function modelMemoryContext(
     }
   };
   refreshBudgetTelemetry();
+  const removeWorkingItem = (index: number) => {
+    const [removed] = output.working_memory.items.splice(index, 1);
+    if (!removed) return;
+    output.working_memory.verification = output.working_memory.verification.filter(
+      (entry) => entry.memory_id !== removed.memory_id,
+    );
+    output.working_memory.confirmation = output.working_memory.confirmation.filter(
+      (entry) => entry.memory_id !== removed.memory_id,
+    );
+  };
   while (output.bytes_used > byteBudget) {
-    if (output.recent.length > 0) output.recent.pop();
+    let deferredIndex = -1;
+    for (let index = output.working_memory.items.length - 1; index >= 0; index -= 1) {
+      const item = output.working_memory.items[index]!;
+      const verification = output.working_memory.verification.find(
+        (entry) => entry.memory_id === item.memory_id,
+      );
+      if (!verification || isNonCurrentWorkingMemory(verification.host_state, verification.source_state)) {
+        deferredIndex = index;
+        break;
+      }
+    }
+    if (deferredIndex >= 0) removeWorkingItem(deferredIndex);
+    else if (output.recent.length > 0) output.recent.pop();
     else if (output.relevant.length > 0) output.relevant.pop();
     else {
       const continuation = [...output.continuations]
@@ -670,13 +664,7 @@ export function modelMemoryContext(
       } else if (output.pending_memory.items.length > 0) {
         output.pending_memory.items.pop();
       } else if (output.working_memory.items.length > 0) {
-        const removed = output.working_memory.items.pop();
-        if (removed) {
-          const index = output.working_memory.verification.findIndex(
-            (verification) => verification.memory_id === removed.memory_id,
-          );
-          if (index >= 0) output.working_memory.verification.splice(index, 1);
-        }
+        removeWorkingItem(output.working_memory.items.length - 1);
       } else if (output.collaboration_memory.items.length > 0) {
         output.collaboration_memory.items.pop();
       } else {
@@ -1290,7 +1278,7 @@ function registerMcpSurface(
       let memoryContext: ReturnType<typeof modelMemoryContext> | undefined;
       if (memory.enabled && includeBootstrapContext) {
         try {
-          const compact = await memory.bootstrapProjectContext(projectName);
+          const compact = await memory.bootstrapProjectContext(projectName, repositoryState);
           const candidate = modelMemoryContext(
             compact,
             config.memory.bootstrapByteBudget,

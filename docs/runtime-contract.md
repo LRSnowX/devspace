@@ -342,8 +342,18 @@ When Memory is configured:
   entry. The same configured byte budget bounds stable `collaboration_memory`,
   durable `working_memory`, untrusted `pending_memory`, continuation tails, and
   recent-hit metadata together. Construction priority is collaboration memory,
-  active working memory, pending memory, continuation history, then hit
-  metadata. Pending memory is independently capped at the smaller of 3072 bytes
+  current Working Memory, pending memory, continuation history, hit metadata,
+  then non-current Working Memory. Effective Host freshness is assessed before
+  allocation, including live-repository downgrades of CHIM-current operational
+  items. `needs_revalidation`, `tentative`, `expired`, and unavailable verification
+  do not reserve protected current-state space. They remain eligible continuity
+  evidence in `working_memory`, with unchanged verification and confirmation
+  semantics; large values use a marked preview capped at 160 characters.
+  Final wire-size trimming evicts these deferred items before continuation
+  evidence and removes item sidecars together. Ordinary byte truncation can
+  still omit individual items; freshness alone does not exclude them. Budget
+  priority does not change the authority order or confirm a rule.
+  Pending memory is independently capped at the smaller of 3072 bytes
   or 25% of the configured budget. Raw
   continuation history is independently capped at the smaller of 4096 bytes or
   35% of the configured bootstrap budget, so sparse Working Memory cannot cause

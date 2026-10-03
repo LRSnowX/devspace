@@ -111,8 +111,15 @@ without an explicit history lookup; full threads are never injected
 automatically. DevSpace requests up to eight pending proposals. There is no
 DevSpace configuration knob for this limit. Pending memory has its own cap of
 the smaller of 3072 bytes or 25% of the bootstrap budget. Collaboration memory
-is constructed first, then active working memory, pending memory, continuations,
-and recent/relevant metadata. Raw continuation history has an
+is constructed first, then current working memory, pending memory, continuations,
+recent/relevant metadata, and non-current working memory. Source verification
+and live Host freshness both affect budgeting before allocation. Non-current
+items remain eligible continuity evidence, with truthful sidecars and marked
+160-character value previews for large values; they are evicted before fresher
+continuation evidence under final byte pressure. This changes budget priority,
+not rule confirmation or the authority policy. All Working Memory still shares
+its existing section cap and the unchanged total budget.
+Raw continuation history has an
 additional cap of the smaller of 4096 bytes or 35% of the configured bootstrap
 budget; unused Working Memory space is therefore not automatically filled with
 old transcript text. Live repository state and authoritative project files

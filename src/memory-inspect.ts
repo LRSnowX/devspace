@@ -95,7 +95,7 @@ export async function inspectProjectMemory(input: {
   if (!input.memory.enabled) return inspection;
 
   try {
-    const bootstrap = await input.memory.bootstrapProjectContext(input.projectName);
+    const bootstrap = await input.memory.bootstrapProjectContext(input.projectName, repositoryState);
     inspection.memory.context = modelMemoryContext(
       bootstrap,
       input.byteBudget,

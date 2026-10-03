@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { modelMemoryContext } from "./server.js";
 import {
   MemoryAdapter,
   MemoryThreadAuthorizationStore,
@@ -50,6 +51,180 @@ test("memory bootstrap rejects malformed responses", () => {
     () => compactMemoryBootstrapContext({ structuredContent: { project: "Jack" } }, "Jack", 12_288),
     /Malformed memory project context response/,
   );
+});
+
+function staleHandoffContext() {
+  const raw = projectContext() as { structuredContent: Record<string, unknown> };
+  raw.structuredContent.relevant = [];
+  raw.structuredContent.recent = [];
+  raw.structuredContent.working_memory = {
+    project: "Jack",
+    items: Array.from({ length: 8 }, (_, index) => ({
+      memory_id: `stale-${index}`,
+      kind: "state",
+      key: `state-${index}`,
+      value: { text: "stale operational state ".repeat(40) },
+      importance: 100,
+      confidence: 1,
+      last_verified_at: 1,
+      evidence: [],
+    })),
+    verification: Array.from({ length: 8 }, (_, index) => ({
+      memory_id: `stale-${index}`,
+      class: "operational",
+      evidence_strength: "conversation_only",
+      state: "needs_revalidation",
+    })),
+  };
+  raw.structuredContent.continuations = [
+    {
+      conversation_id: "fresh-continuation",
+      source: "chatgpt",
+      title: "Latest continuation",
+      message_offset: 0,
+      total_messages: 2,
+      messages: [
+        { role: "user", turn_index: 0, text: "Continue the current acceptance." },
+        { role: "assistant", turn_index: 1, text: "Fresh next step: " + "e".repeat(650) },
+      ],
+    },
+  ];
+  return raw;
+}
+
+test("stale-heavy Working Memory preserves a useful recent continuation tail", () => {
+  const raw = staleHandoffContext();
+  const context = compactMemoryBootstrapContext(raw, "Jack", 3_072);
+  assert.equal(context.continuations[0]?.messages.at(-1)?.turnIndex, 1);
+  assert.match(context.continuations[0]?.messages.at(-1)?.text ?? "", /Fresh next step/);
+  assert.ok(context.workingMemory.items.length > 0, "stale continuity remains visible");
+  assert.equal(context.workingMemory.verification[0]?.sourceState, "needs_revalidation");
+  assert.ok(Buffer.byteLength(JSON.stringify(context), "utf8") <= 3_072);
+  const packet = modelMemoryContext(context, 3_072);
+  assert.equal(packet.continuations[0]?.messages.at(-1)?.turn_index, 1);
+  assert.match(packet.continuations[0]?.messages.at(-1)?.text ?? "", /Fresh next step/);
+  assert.ok(packet.working_memory.items.length > 0, "stale continuity remains visible on the wire");
+  assert.equal(packet.bytes_used, Buffer.byteLength(JSON.stringify(packet), "utf8"));
+  assert.ok(packet.sections.working_memory.truncated);
+  assert.deepEqual(memoryEvidenceIdsFromBootstrapContext(context), ["fresh-continuation"]);
+});
+
+test("Host downgrades and every non-current source state lose protected budget before compaction", () => {
+  const cases = [
+    {
+      source: "needs_revalidation",
+      repository: { available: true, dirty: false },
+      host: "needs_revalidation",
+    },
+    {
+      source: "current_by_evidence",
+      repository: { available: true, dirty: true },
+      host: "needs_revalidation",
+    },
+    {
+      source: "strongly_verified",
+      repository: { available: true, dirty: false, headCommittedAt: 2 },
+      host: "needs_revalidation",
+    },
+    { source: "tentative", repository: { available: true }, host: "tentative" },
+    { source: "expired", repository: { available: true }, host: "expired" },
+    { source: "unavailable", repository: { available: false }, host: "needs_revalidation" },
+  ];
+  for (const { source, repository, host } of cases) {
+    const raw = staleHandoffContext();
+    const working = raw.structuredContent.working_memory as {
+      verification: Array<{ state: string }>;
+    };
+    for (const verification of working.verification) verification.state = source;
+    const context = compactMemoryBootstrapContext(raw, "Jack", 3_072, undefined, repository);
+    const packet = modelMemoryContext(context, 3_072, repository);
+    assert.equal(packet.continuations[0]?.messages.at(-1)?.turn_index, 1, source);
+    assert.ok(packet.working_memory.items.length > 0, source);
+    assert.equal(packet.working_memory.verification[0]?.source_state, source);
+    assert.equal(packet.working_memory.verification[0]?.host_state, host);
+    assert.equal(packet.bytes_used, Buffer.byteLength(JSON.stringify(packet), "utf8"));
+    assert.ok(packet.bytes_used <= 3_072);
+    assert.equal(packet.working_memory.verification.length, packet.working_memory.items.length);
+    assert.equal(packet.working_memory.confirmation.length, packet.working_memory.items.length);
+  }
+});
+
+test("current operational and confirmed stable memory retain priority ahead of stale source order", () => {
+  const raw = staleHandoffContext();
+  const working = raw.structuredContent.working_memory as {
+    items: Array<Record<string, unknown>>;
+    verification: Array<Record<string, unknown>>;
+    confirmation?: Array<Record<string, unknown>>;
+  };
+  working.items.push(
+    {
+      ...working.items[0],
+      memory_id: "current-task",
+      last_verified_at: 100,
+      value: { text: "Current task " + "c".repeat(400) },
+    },
+    {
+      ...working.items[0],
+      memory_id: "confirmed-rule",
+      kind: "decision",
+      value: { text: "Confirmed rule " + "r".repeat(200) },
+    },
+  );
+  working.verification.push(
+    {
+      memory_id: "current-task",
+      class: "operational",
+      evidence_strength: "strong_independent",
+      state: "strongly_verified",
+    },
+    {
+      memory_id: "confirmed-rule",
+      class: "stable",
+      evidence_strength: "user_asserted",
+      state: "current_by_evidence",
+    },
+  );
+  working.confirmation = [{ memory_id: "confirmed-rule", state: "confirmed" }];
+  const repository = { available: true, dirty: false, headCommittedAt: 100 };
+  const context = compactMemoryBootstrapContext(raw, "Jack", 4_096, undefined, repository);
+  const packet = modelMemoryContext(context, 4_096, repository);
+  for (const id of ["current-task", "confirmed-rule"]) {
+    const item = packet.working_memory.items.find((entry) => entry.memory_id === id);
+    assert.ok(item, id);
+    assert.deepEqual(item.value, working.items.find((entry) => entry.memory_id === id)?.value);
+  }
+  assert.equal(
+    packet.working_memory.confirmation.find((entry) => entry.memory_id === "confirmed-rule")?.state,
+    "confirmed",
+  );
+  assert.ok(packet.bytes_used <= 4_096);
+});
+
+test("non-current multilingual previews keep exact wire bytes and aligned sidecars", () => {
+  const raw = staleHandoffContext();
+  const working = raw.structuredContent.working_memory as {
+    items: Array<{ value: unknown; last_verified_at?: number }>;
+    verification: Array<{ state: string }>;
+  };
+  for (const item of working.items) {
+    item.value = { text: "旧的操作状态，需要重新验证。".repeat(100) };
+    delete item.last_verified_at;
+  }
+  for (const verification of working.verification) verification.state = "current_by_evidence";
+  const context = compactMemoryBootstrapContext(raw, "Jack", 4_096);
+  const packet = modelMemoryContext(context, 4_096);
+  assert.equal(packet.continuations[0]?.messages.at(-1)?.turn_index, 1);
+  assert.ok(packet.working_memory.items.length > 0);
+  assert.match(packet.working_memory.verification[0]?.host_reason ?? "", /no last_verified_at/);
+  assert.equal(packet.bytes_used, Buffer.byteLength(JSON.stringify(packet), "utf8"));
+  assert.ok(packet.bytes_used <= 4_096);
+  const ids = packet.working_memory.items.map((entry) => entry.memory_id);
+  assert.deepEqual(packet.working_memory.verification.map((entry) => entry.memory_id), ids);
+  assert.deepEqual(packet.working_memory.confirmation.map((entry) => entry.memory_id), ids);
+  const preview = packet.working_memory.items[0]?.value as { truncated: boolean; preview: string };
+  assert.equal(preview.truncated, true);
+  assert.ok(preview.preview.length <= 160);
+  assert.equal(preview.preview.startsWith('{"text"'), true, "mapping must not wrap an existing preview again");
 });
 
 test("memory bootstrap treats an older CHIM response without pending memory as empty", () => {

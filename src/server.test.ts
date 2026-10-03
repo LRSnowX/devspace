@@ -26,6 +26,7 @@ import { writeOwnershipPaths } from "./write-ownership-store.js";
 import type { ToolErrorPayload } from "./tool-errors.js";
 import { randomUUID } from "node:crypto";
 import {
+  MemoryAdapter,
   memoryContinuationByteBudget,
   memoryPendingByteBudget,
   type MemoryClient,
@@ -2733,6 +2734,123 @@ test("final memory budget evicts each lower-authority layer before the next", as
   const afterWorking = trimOneStep(withoutPending);
   assert.equal(afterWorking.working_memory.items.length, 0);
   assert.equal(afterWorking.collaboration_memory.items.length, 1);
+  assert.equal(afterWorking.working_memory.verification.length, 0);
+  assert.equal(afterWorking.working_memory.confirmation.length, 0);
+
+  const stale = {
+    ...withRecent,
+    workingMemory: {
+      ...withRecent.workingMemory,
+      verification: withRecent.workingMemory.verification.map((entry) => ({
+        ...entry, sourceState: "needs_revalidation" as const,
+      })),
+    },
+  };
+  const afterStale = trimOneStep(stale);
+  assert.equal(afterStale.working_memory.items.length, 0);
+  assert.equal(afterStale.working_memory.verification.length, 0);
+  assert.equal(afterStale.working_memory.confirmation.length, 0);
+  assert.equal(afterStale.recent.length, 1);
+  assert.equal(afterStale.relevant.length, 1);
+  assert.equal(afterStale.continuations[0]?.messages.length, stale.continuations[0]?.messages.length);
+  assert.equal(afterStale.collaboration_memory.items.length, 1);
+});
+
+test("MCP handoff passes live freshness into adapter allocation before stale-heavy budgeting", async (t) => {
+  const memory = new MemoryAdapter({
+    enabled: true,
+    command: "/bin/false",
+    bootstrapTimeoutMs: 5_000,
+    bootstrapByteBudget: 12_288,
+  });
+  const calls: string[] = [];
+  const bootstrap = memory.bootstrapProjectContext.bind(memory);
+  memory.bootstrapProjectContext = async (project, repositoryState) => {
+    assert.equal(repositoryState?.available, true);
+    assert.equal(typeof repositoryState?.headCommittedAt, "number");
+    const compact = await bootstrap(project, repositoryState);
+    assert.equal((compact.workingMemory.items[0]?.value as { truncated?: boolean }).truncated, true);
+    assert.equal(compact.continuations[0]?.messages.length, 2);
+    return compact;
+  };
+  memory.call = async (name, args) => {
+    calls.push(name);
+    assert.equal(name, "memory_project_context");
+    return {
+      content: [],
+      structuredContent: {
+        project: args.project,
+        source_policy: "chatgpt-first-fallback-all",
+        relevant: [],
+        recent: [],
+        working_memory: {
+          project: args.project,
+          items: Array.from({ length: 12 }, (_, index) => ({
+            memory_id: `old-${index}`,
+            kind: "state",
+            key: `old-${index}`,
+            value: { text: "Obsolete operational plan ".repeat(50) },
+            importance: 100,
+            confidence: 1,
+            last_verified_at: 0,
+            evidence: [{ kind: "conversation_turn", reference: "conversation:private:turn:1" }],
+          })),
+          verification: Array.from({ length: 12 }, (_, index) => ({
+            memory_id: `old-${index}`,
+            class: "operational",
+            evidence_strength: "conversation_only",
+            state: "current_by_evidence",
+          })),
+        },
+        continuations: [
+          {
+            conversation_id: "recent-current",
+            source: "chatgpt",
+            title: "Recent handoff",
+            message_offset: 0,
+            total_messages: 2,
+            messages: [
+              { role: "user", turn_index: 0, text: "Current acceptance: " + "u".repeat(1_300) },
+              {
+                role: "assistant",
+                turn_index: 1,
+                text: "Fresh continuation: " + "a".repeat(1_300),
+              },
+            ],
+          },
+        ],
+      },
+    };
+  };
+  const context = await fixture(t, {
+    git: true,
+    projectRegistration: { name: "LEMonX" },
+    memoryClient: memory,
+  });
+  const result = structuredContent(await callOpen(context.client, "LEMonX"));
+  const packet = result.memory_context as ReturnType<typeof modelMemoryContext>;
+  assert.deepEqual(calls, ["memory_project_context"]);
+  assert.equal(packet.continuations[0]?.messages.length, 2);
+  assert.match(packet.continuations[0]?.messages.at(-1)?.text ?? "", /Fresh continuation/);
+  assert.ok(packet.working_memory.items.length > 0);
+  assert.equal(packet.working_memory.verification[0]?.source_state, "current_by_evidence");
+  assert.equal(packet.working_memory.verification[0]?.host_state, "needs_revalidation");
+  assert.match(packet.working_memory.verification[0]?.host_reason ?? "", /HEAD is newer/);
+  assert.equal(
+    (packet.working_memory.items[0]?.value as { truncated?: boolean }).truncated,
+    true,
+    "live downgrade must affect the adapter allocation, not just final labels",
+  );
+  assert.equal(packet.bytes_used, Buffer.byteLength(JSON.stringify(packet), "utf8"));
+  assert.ok(packet.bytes_used <= 12_288);
+  const denied = structuredContent(
+    await context.client.callTool({
+      name: "memory_get_thread",
+      arguments: { workspace_id: result.workspace_id, conversation_id: "private" },
+    }),
+  );
+  assert.equal((denied.error as { code: string }).code, "MEMORY_THREAD_NOT_AUTHORIZED");
+  assert.deepEqual(calls, ["memory_project_context"]);
 });
 
 test("memory bootstrap failures do not prevent coding workspace entry", async (t) => {

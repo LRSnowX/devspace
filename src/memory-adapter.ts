@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CallToolResultSchema, type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { MemoryAdapterConfig } from "./config.js";
+import type { RepositoryState } from "./repository-state.js";
 
 const MEMORY_TOOL_NAMES = [
   "memory_search",
@@ -80,6 +81,83 @@ export interface MemoryBootstrapWorkingVerification {
     | "unavailable";
   sourceReason?: string;
   latestProjectEvidenceAt?: number;
+}
+
+export function isNonCurrentWorkingMemory(state: string, sourceState?: string): boolean {
+  return (
+    sourceState === "unavailable" ||
+    (state !== "strongly_verified" && state !== "current_by_evidence")
+  );
+}
+
+export function continuityWorkingMemoryItem(
+  item: MemoryBootstrapWorkingItem,
+): MemoryBootstrapWorkingItem {
+  const existing = record(item.value);
+  if (existing?.truncated === true && typeof existing.preview === "string") {
+    return { ...item, value: { truncated: true, preview: clip(existing.preview, 160) } };
+  }
+  const value = JSON.stringify(item.value);
+  return Buffer.byteLength(value, "utf8") <= 160
+    ? item
+    : {
+        ...item,
+        value: { truncated: true, preview: clip(value, 160) },
+      };
+}
+
+// One Host assessment drives both early allocation and final wire budgeting.
+// Confirmation remains independent: freshness never promotes a historical rule.
+export function deriveWorkingMemoryFreshness(
+  item: MemoryBootstrapWorkingItem | undefined,
+  verification: MemoryBootstrapWorkingVerification,
+  repositoryState?: RepositoryState,
+) {
+  const repositoryHeadCommittedAt = repositoryState?.available
+    ? repositoryState.headCommittedAt
+    : undefined;
+  const repositoryDirty = repositoryState?.available && repositoryState.dirty === true;
+  let hostState =
+    verification.sourceState === "unavailable"
+      ? verification.class === "tentative"
+        ? "tentative"
+        : verification.class === "operational"
+          ? "needs_revalidation"
+          : verification.evidenceStrength === "strong_independent"
+            ? "strongly_verified"
+            : "current_by_evidence"
+      : verification.sourceState;
+  let hostReason =
+    verification.sourceReason ??
+    (verification.sourceState === "unavailable" && verification.class === "operational"
+      ? "CHIM working-memory verification metadata is unavailable for this operational memory; verify it against live project state before acting."
+      : undefined);
+
+  if (
+    verification.class === "operational" &&
+    hostState !== "expired" &&
+    hostState !== "tentative" &&
+    hostState !== "needs_revalidation"
+  ) {
+    if (repositoryDirty) {
+      hostState = "needs_revalidation";
+      hostReason =
+        "Live repository working tree has uncommitted changes, so this operational memory cannot be safely treated as current without checking the changed files.";
+    } else if (item?.lastVerifiedAt === undefined) {
+      hostState = "needs_revalidation";
+      hostReason =
+        "Operational memory has no last_verified_at timestamp; verify it against live repository state before treating it as current.";
+    } else if (
+      repositoryHeadCommittedAt !== undefined &&
+      repositoryHeadCommittedAt > item.lastVerifiedAt
+    ) {
+      hostState = "needs_revalidation";
+      hostReason =
+        "Live repository HEAD is newer than this operational memory's last verification; verify it against current repository state before acting.";
+    }
+  }
+
+  return { hostState, hostReason, repositoryHeadCommittedAt };
 }
 
 export interface MemoryBootstrapWorkingConfirmation {
@@ -235,7 +313,10 @@ export interface MemoryClient {
     args: Record<string, unknown>,
     options?: { timeoutMs?: number },
   ): Promise<CallToolResult>;
-  bootstrapProjectContext(project: string): Promise<MemoryBootstrapContext>;
+  bootstrapProjectContext(
+    project: string,
+    repositoryState?: RepositoryState,
+  ): Promise<MemoryBootstrapContext>;
 }
 
 export class MemoryThreadAuthorizationStore {
@@ -352,7 +433,10 @@ export class MemoryAdapter {
     }
   }
 
-  async bootstrapProjectContext(project: string): Promise<MemoryBootstrapContext> {
+  async bootstrapProjectContext(
+    project: string,
+    repositoryState?: RepositoryState,
+  ): Promise<MemoryBootstrapContext> {
     const operation = this.call(
       "memory_project_context",
       {
@@ -374,6 +458,8 @@ export class MemoryAdapter {
       result,
       project,
       this.config.bootstrapByteBudget,
+      undefined,
+      repositoryState,
     );
   }
 }
@@ -387,6 +473,7 @@ export function compactMemoryBootstrapContext(
   expectedProject: string,
   byteBudget: number,
   bootstrapStatus?: MemoryBootstrapStatus,
+  repositoryState?: RepositoryState,
 ): MemoryBootstrapContext {
   const result = record(raw);
   const structured = record(result?.structuredContent);
@@ -478,28 +565,40 @@ export function compactMemoryBootstrapContext(
     context.collaborationMemory.items.length < collaborationMemoryCandidate.items.length;
 
   const workingMemoryBudget = Math.min(6_144, Math.floor(byteBudget * 0.55));
-  for (const item of workingMemoryCandidate.items) {
-    context.workingMemory.items.push(item);
+  const workingEntries = workingMemoryCandidate.items.map((item) => {
     const verification = workingMemoryCandidate.verification.find(
       (candidate) => candidate.memoryId === item.memoryId,
     ) ?? fallbackWorkingMemoryVerification(item);
-    context.workingMemory.verification.push(verification);
     const confirmation = workingMemoryCandidate.confirmation.find(
       (candidate) => candidate.memoryId === item.memoryId,
     ) ?? fallbackWorkingMemoryConfirmation(item);
-    context.workingMemory.confirmation.push(confirmation);
-    if (
-      byteLength(context.workingMemory) > workingMemoryBudget
-      || byteLength(context) > byteBudget
-    ) {
-      context.workingMemory.items.pop();
-      context.workingMemory.verification.pop();
-      context.workingMemory.confirmation.pop();
-      context.truncated = true;
-      break;
+    const deferred = isNonCurrentWorkingMemory(
+      deriveWorkingMemoryFreshness(item, verification, repositoryState).hostState,
+      verification.sourceState,
+    );
+    return { item, verification, confirmation, deferred };
+  });
+  const appendWorkingEntries = (deferred: boolean) => {
+    for (const entry of workingEntries) {
+      if (entry.deferred !== deferred) continue;
+      context.workingMemory.items.push(
+        deferred ? continuityWorkingMemoryItem(entry.item) : entry.item,
+      );
+      context.workingMemory.verification.push(entry.verification);
+      context.workingMemory.confirmation.push(entry.confirmation);
+      if (
+        byteLength(context.workingMemory) > workingMemoryBudget
+        || byteLength(context) > byteBudget
+      ) {
+        context.workingMemory.items.pop();
+        context.workingMemory.verification.pop();
+        context.workingMemory.confirmation.pop();
+        context.truncated = true;
+        continue;
+      }
     }
-  }
-  context.truncated ||= context.workingMemory.items.length < workingMemoryCandidate.items.length;
+  };
+  appendWorkingEntries(false);
 
   const pendingMemoryBudget = memoryPendingByteBudget(byteBudget);
   for (const item of pendingMemoryCandidate.items) {
@@ -577,6 +676,10 @@ export function compactMemoryBootstrapContext(
   context.truncated ||=
     context.relevant.length < dedupedHits.relevant.length ||
     context.recent.length < dedupedHits.recent.length;
+  // Non-current memory remains continuity evidence, but never reserves space
+  // ahead of current memory, recent tails, or discovery metadata.
+  appendWorkingEntries(true);
+  context.truncated ||= context.workingMemory.items.length < workingMemoryCandidate.items.length;
   if (byteLength(context) > byteBudget) {
     throw new Error("Memory bootstrap byte budget is too small for its envelope");
   }
