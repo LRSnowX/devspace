@@ -1066,11 +1066,12 @@ test("open_workspace returns refreshed live repository state and explicit author
 
 test("open_workspace bounds oversized instruction files while preserving their head and latest tail", async (t) => {
   const projectAgentsContent = [
-    "HEAD-INSTRUCTIONS\n",
+    "# HEAD-INSTRUCTIONS\n",
     "A".repeat(40_000),
-    "\nOMITTED-MIDDLE-SENTINEL\n",
+    "\n## OMITTED-MIDDLE-HEADING\n",
+    "OMITTED-MIDDLE-SENTINEL\n",
     "B".repeat(70_000),
-    "\nTAIL-INSTRUCTIONS\n",
+    "\n## TAIL-INSTRUCTIONS\n",
   ].join("");
   const context = await fixture(t, { projectAgentsContent });
   const opened = structuredContent(await callOpen(context.client, context.project, "large-agents"));
@@ -1080,10 +1081,12 @@ test("open_workspace bounds oversized instruction files while preserving their h
   assert.equal(projectFile.truncated, true);
   assert.equal(projectFile.original_bytes, Buffer.byteLength(projectAgentsContent, "utf8"));
   const content = projectFile.content as string;
-  assert.ok(Buffer.byteLength(content, "utf8") <= 48 * 1024);
+  assert.ok(Buffer.byteLength(content, "utf8") <= 16 * 1024);
   assert.match(content, /HEAD-INSTRUCTIONS/);
   assert.match(content, /TAIL-INSTRUCTIONS/);
   assert.match(content, /DevSpace omitted/);
+  assert.match(content, /DevSpace heading index for the full instruction file/);
+  assert.match(content, /L\d+ ## OMITTED-MIDDLE-HEADING/);
   assert.doesNotMatch(content, /OMITTED-MIDDLE-SENTINEL/);
   assert.match(opened.instruction as string, /context-bounded/);
 });

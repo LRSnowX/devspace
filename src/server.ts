@@ -745,9 +745,10 @@ const workspaceAvailableAgentsFileOutputSchema = z.object({
   path: z.string(),
 });
 
-const MODEL_INSTRUCTION_FILE_MAX_BYTES = 48 * 1024;
-const MODEL_INSTRUCTION_FILE_HEAD_BYTES = 34 * 1024;
-const MODEL_INSTRUCTION_FILE_TAIL_BYTES = 12 * 1024;
+const MODEL_INSTRUCTION_FILE_MAX_BYTES = 16 * 1024;
+const MODEL_INSTRUCTION_FILE_HEAD_BYTES = 7 * 1024;
+const MODEL_INSTRUCTION_FILE_TAIL_BYTES = 7 * 1024;
+const MODEL_INSTRUCTION_FILE_HEADING_INDEX_BYTES = 1_536;
 
 function compactInstructionFileForModel(content: string) {
   const originalBytes = Buffer.byteLength(content, "utf8");
@@ -756,6 +757,10 @@ function compactInstructionFileForModel(content: string) {
   }
   const head = utf8Prefix(content, MODEL_INSTRUCTION_FILE_HEAD_BYTES);
   const tail = utf8Suffix(content, MODEL_INSTRUCTION_FILE_TAIL_BYTES);
+  const headingIndex = markdownHeadingIndex(
+    content,
+    MODEL_INSTRUCTION_FILE_HEADING_INDEX_BYTES,
+  );
   const omittedBytes = Math.max(
     0,
     originalBytes
@@ -767,12 +772,42 @@ function compactInstructionFileForModel(content: string) {
       head,
       "",
       "[... DevSpace omitted " + omittedBytes + " bytes from the middle of this oversized instruction file. Read the file by range if an omitted section is relevant. ...]",
+      ...(headingIndex
+        ? [
+            "",
+            "[DevSpace heading index for the full instruction file]",
+            headingIndex,
+            "[End DevSpace heading index]",
+          ]
+        : []),
       "",
       tail,
     ].join("\n"),
     truncated: true as const,
     original_bytes: originalBytes,
   };
+}
+
+function markdownHeadingIndex(content: string, maxBytes: number): string {
+  const entries: string[] = [];
+  let usedBytes = 0;
+  const lines = content.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    if (!/^#{1,6}\s+\S/.test(line)) continue;
+    const entry = "L" + (index + 1) + " " + line.slice(0, 220);
+    const entryBytes = Buffer.byteLength(entry + "\n", "utf8");
+    if (usedBytes + entryBytes > maxBytes) {
+      const marker = "[... additional headings omitted ...]";
+      if (usedBytes + Buffer.byteLength(marker, "utf8") <= maxBytes) {
+        entries.push(marker);
+      }
+      break;
+    }
+    entries.push(entry);
+    usedBytes += entryBytes;
+  }
+  return entries.join("\n");
 }
 
 function utf8Prefix(value: string, maxBytes: number): string {
