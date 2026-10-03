@@ -126,7 +126,10 @@ await assert.rejects(
     assert.deepEqual((error as ToolOperationError).payload, {
       code: "PROCESS_SESSION_NOT_FOUND",
       category: "not_found",
-      message: "Unknown process session: " + background.sessionId + ". Start a new command with exec_command.",
+      message:
+        "Unknown process session: " +
+        background.sessionId +
+        ". The session may have expired or the DevSpace server may have restarted. Inspect existing process, logs, and result artifacts before starting a replacement command.",
       retryable: true,
       session_id: background.sessionId,
     });
@@ -313,5 +316,5 @@ try {
     assert.match(resizedPty.output, /columns:120/);
   }
 } finally {
-  manager.shutdown();
+  await manager.shutdown();
 }

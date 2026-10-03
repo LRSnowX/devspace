@@ -21,6 +21,9 @@ import { WorkspaceRegistry } from "./workspaces.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 import { ProjectRegistry } from "./project-registry.js";
 import { PatchRecoveryManager } from "./patch-recovery.js";
+import { WriteOwnership } from "./write-ownership.js";
+import { writeOwnershipPaths } from "./write-ownership-store.js";
+import type { ToolErrorPayload } from "./tool-errors.js";
 import { randomUUID } from "node:crypto";
 import {
   memoryContinuationByteBudget,
@@ -31,6 +34,436 @@ import {
 
 const execFileAsync = promisify(execFile);
 
+test("Host ownership coordinates same-checkout workspaces without restricting reads", async (t) => {
+  for (const toolMode of ["codex", "claude"] as const) {
+    await t.test(toolMode, async (nested) => {
+      const context = await fixture(nested, { toolMode, uiEnabled: false });
+      await writeFile(join(context.project, "note.txt"), "before\n");
+      const a = structuredContent(
+        await callOpen(context.client, context.project, "owner-a"),
+      );
+      const b = structuredContent(
+        await callOpen(context.client, context.project, "owner-b"),
+      );
+      assert.notEqual(a.workspace_id, b.workspace_id);
+      assert.deepEqual(a.write_ownership, {
+        state: "unowned",
+        active_mutation_count: 0,
+      });
+      const call = async (name: string, workspaceId: unknown, args = {}) => {
+        const response = await context.client.callTool({
+          name,
+          arguments: { workspace_id: workspaceId, ...args },
+        });
+        assert.notEqual(response.isError, true);
+        return structuredContent(response);
+      };
+      const mutationArgs =
+        toolMode === "codex"
+          ? {
+              patch:
+                "*** Begin Patch\n*** Add File: owned.txt\n+owned\n*** End Patch",
+            }
+          : { path: "owned.txt", content: "owned\n" };
+      const mutation = toolMode === "codex" ? "apply_patch" : "write";
+      // Acquisition, not a changed request, must unblock repeated authority failures.
+      for (let i = 0; i < 5; i++) {
+        assert.equal(
+          (await call(mutation, a.workspace_id, mutationArgs)).error?.code,
+          "WRITE_OWNERSHIP_REQUIRED",
+        );
+      }
+      const shellArgs =
+        toolMode === "codex"
+          ? { cmd: "echo denied" }
+          : { command: "echo denied" };
+      const shellTool = toolMode === "codex" ? "exec_command" : "bash";
+      assert.equal(
+        (await call(shellTool, a.workspace_id, shellArgs)).error?.code,
+        "WRITE_OWNERSHIP_REQUIRED",
+      );
+      if (toolMode === "claude") {
+        assert.equal(
+          (
+            await call("edit", a.workspace_id, {
+              path: "note.txt",
+              edits: [{ old_text: "before", new_text: "after" }],
+            })
+          ).error?.code,
+          "WRITE_OWNERSHIP_REQUIRED",
+        );
+      }
+      assert.equal(
+        (await call("release_write_ownership", a.workspace_id)).status,
+        "not_owned",
+      );
+      assert.equal(
+        (await call("acquire_write_ownership", a.workspace_id)).status,
+        "acquired",
+      );
+      assert.equal(
+        (await call("acquire_write_ownership", a.workspace_id)).status,
+        "already_owned",
+      );
+      for (const name of [
+        "acquire_write_ownership",
+        "release_write_ownership",
+        mutation,
+        shellTool,
+      ]) {
+        const result = await call(
+          name,
+          b.workspace_id,
+          name === mutation
+            ? mutationArgs
+            : name === shellTool
+              ? shellArgs
+              : {},
+        );
+        assert.equal(result.error?.code, "WRITE_OWNERSHIP_CONFLICT");
+        assert.equal(result.error?.owner_workspace_id, a.workspace_id);
+      }
+      assert.equal(
+        (await call("read", b.workspace_id, { path: "note.txt" })).status,
+        "read",
+      );
+      const reopened = structuredContent(
+        await callOpen(context.client, context.project, "owner-b"),
+      );
+      assert.deepEqual(reopened.write_ownership, {
+        state: "owned_by_other",
+        owner_workspace_id: a.workspace_id,
+        active_mutation_count: 0,
+      });
+      assert.equal(
+        (await call(mutation, a.workspace_id, mutationArgs)).status,
+        "applied",
+      );
+      const invalid = await call(
+        toolMode === "codex" ? "apply_patch" : "edit",
+        a.workspace_id,
+        toolMode === "codex"
+          ? { patch: "invalid" }
+          : { path: "missing.txt", edits: [{ old_text: "a", new_text: "b" }] },
+      );
+      assert.equal(invalid.status, "error");
+      const snapshot = structuredContent(
+        await callOpen(context.client, context.project, "owner-a"),
+      ).write_ownership;
+      assert.deepEqual(snapshot, {
+        state: "owned_by_workspace",
+        owner_workspace_id: a.workspace_id,
+        active_mutation_count: 0,
+      });
+      assert.equal(
+        (await call("release_write_ownership", a.workspace_id)).status,
+        "released",
+      );
+      assert.equal(
+        (await call("acquire_write_ownership", b.workspace_id)).status,
+        "acquired",
+      );
+    });
+  }
+});
+
+test("Host process activities span exit, concurrent commands, stdin, cancellation and replay", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
+  const a = structuredContent(
+    await callOpenOwned(context.client, context.project, "process-owner"),
+  ).workspace_id;
+  const b = structuredContent(
+    await callOpen(context.client, context.project, "process-nonowner"),
+  ).workspace_id;
+  const root = await realpath(context.project);
+  const call = async (name: string, args: Record<string, unknown> = {}) =>
+    structuredContent(
+      await context.client.callTool({
+        name,
+        arguments: { workspace_id: a, ...args },
+      }),
+    );
+  const cmd = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("process.stdin.resume();process.stdin.on('data',()=>process.exit(0));setInterval(()=>{},1000)")}`;
+  const first = await call("exec_command", { cmd, yield_time_ms: 5 });
+  const second = await call("exec_command", { cmd, yield_time_ms: 5 });
+  assert.equal(first.running, true);
+  assert.equal(second.running, true);
+  assert.equal(
+    context.ownership.inspect(root, a as string).activeMutations.length,
+    2,
+  );
+  for (const activity of context.ownership.inspect(root, a as string)
+    .activeMutations) {
+    assert.equal(activity.executor_processes.length, 1);
+    assert.equal(activity.executor_processes_complete, false);
+    assert.notEqual(activity.executor_processes[0], process.pid);
+  }
+  assert.equal(
+    (await call("release_write_ownership")).error?.code,
+    "WRITE_OWNERSHIP_BUSY",
+  );
+  await call("write_stdin", { session_id: first.session_id, yield_time_ms: 0 });
+  assert.equal(
+    context.ownership.inspect(root, a as string).activeMutations.length,
+    2,
+  );
+  const foreign = await call("write_stdin", {
+    workspace_id: b,
+    session_id: first.session_id,
+    chars: "exit\n",
+  });
+  assert.equal(foreign.error?.code, "PROCESS_SESSION_SCOPE_MISMATCH");
+  const patch = await call("apply_patch", {
+    patch: "*** Begin Patch\n*** Add File: concurrent.txt\n+ok\n*** End Patch",
+  });
+  assert.equal(patch.status, "applied");
+  assert.equal(
+    context.ownership.inspect(root, a as string).activeMutations.length,
+    2,
+  );
+  const done = await call("write_stdin", {
+    session_id: first.session_id,
+    chars: "exit\n",
+    yield_time_ms: 2000,
+  });
+  assert.equal(done.running, false);
+  assert.equal(
+    context.ownership.inspect(root, a as string).activeMutations.length,
+    1,
+  );
+  assert.deepEqual(
+    await call("write_stdin", { session_id: first.session_id }),
+    done,
+  );
+  const interrupted = await call("write_stdin", {
+    session_id: second.session_id,
+    chars: "\u0003",
+    yield_time_ms: 0,
+  });
+  if (interrupted.running)
+    assert.equal(
+      context.ownership.inspect(root, a as string).activeMutations.length,
+      1,
+    );
+  const cancelled = await call("write_stdin", {
+    session_id: second.session_id,
+    yield_time_ms: 2000,
+  });
+  assert.equal(cancelled.running, false);
+  assert.equal(
+    context.ownership.inspect(root, a as string).activeMutations.length,
+    0,
+  );
+  assert.deepEqual(
+    await call("write_stdin", { session_id: second.session_id }),
+    cancelled,
+  );
+  assert.equal((await call("release_write_ownership")).status, "released");
+});
+
+test("Claude bash retains activity until actual completion and timeout cleanup", async (t) => {
+  const context = await fixture(t, { toolMode: "claude", uiEnabled: false });
+  const workspaceId = structuredContent(
+    await callOpenOwned(context.client, context.project, "bash-owner"),
+  ).workspace_id;
+  const root = await realpath(context.project);
+  const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify("require('fs').writeFileSync('bash-started','');setInterval(()=>{if(require('fs').existsSync('bash-finish'))process.exit(0)},10)")}`;
+  const running = context.client.callTool({
+    name: "bash",
+    arguments: { workspace_id: workspaceId, command },
+  });
+  await waitForFile(join(context.project, "bash-started"));
+  assert.equal(
+    context.ownership.inspect(root, workspaceId as string).activeMutations
+      .length,
+    1,
+  );
+  const release = structuredContent(
+    await context.client.callTool({
+      name: "release_write_ownership",
+      arguments: { workspace_id: workspaceId },
+    }),
+  );
+  assert.equal(release.error?.code, "WRITE_OWNERSHIP_BUSY");
+  await writeFile(join(context.project, "bash-finish"), "");
+  assert.equal(structuredContent(await running).status, "completed");
+  const timeout = await context.client.callTool({
+    name: "bash",
+    arguments: {
+      workspace_id: workspaceId,
+      command: `${JSON.stringify(process.execPath)} -e "setInterval(()=>{},1000)"`,
+      timeout: 0.1,
+    },
+  });
+  assert.equal(timeout.isError, true);
+  assert.match(
+    (timeout.content as Array<{ text: string }>)[0]!.text,
+    /timed out/,
+  );
+  assert.equal(
+    context.ownership.inspect(root, workspaceId as string).activeMutations
+      .length,
+    0,
+  );
+  assert.equal(
+    context.ownership.inspect(root, workspaceId as string).state,
+    "owned_by_workspace",
+  );
+});
+
+test("Host ownership corruption fails closed for mutation but preserves read-only and other roots", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
+  const opened = structuredContent(
+    await callOpen(context.client, context.project, "corrupt-owner"),
+  );
+  const root = await realpath(context.project);
+  const state = writeOwnershipPaths(join(context.root, ".state"), root).state;
+  await writeFile(state, "{partial");
+  await writeFile(join(context.project, "note.txt"), "readable\n");
+  const again = structuredContent(
+    await callOpen(context.client, context.project, "corrupt-owner"),
+  );
+  assert.deepEqual(again.write_ownership, {
+    state: "recovery_required",
+    active_mutation_count: 0,
+  });
+  for (const name of [
+    "acquire_write_ownership",
+    "release_write_ownership",
+    "exec_command",
+    "apply_patch",
+  ]) {
+    const response = await context.client.callTool({
+      name,
+      arguments: {
+        workspace_id: opened.workspace_id,
+        ...(name === "exec_command" ? { cmd: "echo forbidden" } : {}),
+        ...(name === "apply_patch"
+          ? {
+              patch:
+                "*** Begin Patch\n*** Add File: forbidden.txt\n+no\n*** End Patch",
+            }
+          : {}),
+      },
+    });
+    assert.notEqual(response.isError, true);
+    assert.equal(
+      structuredContent(response).error?.code,
+      "WRITE_OWNERSHIP_RECOVERY_REQUIRED",
+    );
+    assert.equal(structuredContent(response).error?.retryable, false);
+  }
+  assert.equal(
+    structuredContent(
+      await context.client.callTool({
+        name: "read",
+        arguments: { workspace_id: opened.workspace_id, path: "note.txt" },
+      }),
+    ).status,
+    "read",
+  );
+  const other = join(context.root, "independent");
+  await mkdir(other);
+  const independent = structuredContent(
+    await callOpenOwned(context.client, other, "independent"),
+  ).workspace_id;
+  assert.equal(
+    structuredContent(
+      await context.client.callTool({
+        name: "exec_command",
+        arguments: {
+          workspace_id: independent,
+          cmd: "echo allowed",
+          yield_time_ms: 2000,
+        },
+      }),
+    ).status,
+    "completed",
+  );
+  assert.equal(await readFile(state, "utf8"), "{partial");
+  for (const name of ["acquire_write_ownership", "release_write_ownership"]) {
+    assert.equal(
+      structuredContent(
+        await context.client.callTool({
+          name,
+          arguments: { workspace_id: "ws_missing" },
+        }),
+      ).error?.code,
+      "WORKSPACE_NOT_FOUND",
+    );
+  }
+});
+
+test("modern stateless MCP requests share explicit Host ownership", async (t) => {
+  const { root, localBaseUrl, accessToken } = await httpServerFixture(
+    t,
+    "devspace-ownership-http-",
+  );
+  const call = async (
+    name: string,
+    args: Record<string, unknown>,
+    scope?: string,
+  ) => {
+    const response = await postModernMcp(
+      localBaseUrl,
+      accessToken,
+      "tools/call",
+      {
+        name,
+        arguments: args,
+        ...(scope ? { _meta: { "openai/session": scope } } : {}),
+      },
+    );
+    assert.equal(response.status, 200);
+    const body = (await response.json()) as {
+      result: {
+        isError?: boolean;
+        structuredContent: Record<string, unknown> & {
+          error?: ToolErrorPayload;
+        };
+      };
+    };
+    assert.notEqual(body.result.isError, true);
+    return body.result.structuredContent;
+  };
+  const a = await call("open_workspace", { path: root }, "http-owner");
+  const b = await call("open_workspace", { path: root }, "http-other");
+  assert.equal(
+    (await call("acquire_write_ownership", { workspace_id: a.workspace_id }))
+      .status,
+    "acquired",
+  );
+  assert.equal(
+    (
+      await call("exec_command", {
+        workspace_id: b.workspace_id,
+        cmd: "echo denied",
+      })
+    ).error?.code,
+    "WRITE_OWNERSHIP_CONFLICT",
+  );
+  assert.equal(
+    (
+      await call("exec_command", {
+        workspace_id: a.workspace_id,
+        cmd: "echo owned",
+        yield_time_ms: 2000,
+      })
+    ).status,
+    "completed",
+  );
+  assert.equal(
+    (await call("release_write_ownership", { workspace_id: a.workspace_id }))
+      .status,
+    "released",
+  );
+  assert.equal(
+    (await call("acquire_write_ownership", { workspace_id: b.workspace_id }))
+      .status,
+    "acquired",
+  );
+});
+
 test("tool modes expose the expected host-facing tool surface", async (t) => {
   const cases: Array<{
     mode: ToolMode;
@@ -38,11 +471,29 @@ test("tool modes expose the expected host-facing tool surface", async (t) => {
   }> = [
     {
       mode: "claude",
-      expected: ["open_workspace", "read", "write", "edit", "bash", "show_changes"],
+      expected: [
+        "open_workspace",
+        "read",
+        "write",
+        "edit",
+        "bash",
+        "show_changes",
+        "acquire_write_ownership",
+        "release_write_ownership",
+      ],
     },
     {
       mode: "codex",
-      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin", "show_changes"],
+      expected: [
+        "open_workspace",
+        "read",
+        "apply_patch",
+        "exec_command",
+        "write_stdin",
+        "show_changes",
+        "acquire_write_ownership",
+        "release_write_ownership",
+      ],
     },
   ];
 
@@ -97,7 +548,7 @@ test("Codex process tools bound model-facing yield windows to 12 seconds", async
 test("Codex process tools return structured session errors without connector failure", async (t) => {
   const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
   const workspaceId = structuredContent(
-    await callOpen(context.client, context.project, "process-session-errors"),
+    await callOpenOwned(context.client, context.project, "process-session-errors"),
   ).workspace_id;
   assert.equal(typeof workspaceId, "string");
 
@@ -110,7 +561,8 @@ test("Codex process tools return structured session errors without connector fai
   });
   assert.notEqual(missing.isError, true);
   assert.deepEqual(structuredContent(missing), {
-    result: "Unknown process session: 999999. Start a new command with exec_command.",
+    result:
+      "Unknown process session: 999999. The session may have expired or the DevSpace server may have restarted. Inspect existing process, logs, and result artifacts before starting a replacement command.",
     status: "error",
     session_id: 999_999,
     running: false,
@@ -119,7 +571,8 @@ test("Codex process tools return structured session errors without connector fai
     error: {
       code: "PROCESS_SESSION_NOT_FOUND",
       category: "not_found",
-      message: "Unknown process session: 999999. Start a new command with exec_command.",
+      message:
+        "Unknown process session: 999999. The session may have expired or the DevSpace server may have restarted. Inspect existing process, logs, and result artifacts before starting a replacement command.",
       retryable: true,
       session_id: 999_999,
     },
@@ -306,7 +759,7 @@ test("read returns structured workspace and missing-file errors on both tool sur
 test("Codex apply_patch absence preconditions protect intended-new paths", async (t) => {
   const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
   const workspaceId = structuredContent(
-    await callOpen(context.client, context.project, "absence-precondition"),
+    await callOpenOwned(context.client, context.project, "absence-precondition"),
   ).workspace_id;
   assert.equal(typeof workspaceId, "string");
 
@@ -356,7 +809,7 @@ test("Codex apply_patch absence preconditions protect intended-new paths", async
 test("read revisions reject stale Codex patches before publication", async (t) => {
   const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
   const workspaceId = structuredContent(
-    await callOpen(context.client, context.project, "revision-protection"),
+    await callOpenOwned(context.client, context.project, "revision-protection"),
   ).workspace_id;
   assert.equal(typeof workspaceId, "string");
 
@@ -495,7 +948,7 @@ test("Codex apply_patch exposes structured workspace and path errors", async (t)
   });
 
   const workspaceId = structuredContent(
-    await callOpen(context.client, context.project, "structured-path-error"),
+    await callOpenOwned(context.client, context.project, "structured-path-error"),
   ).workspace_id;
   assert.equal(typeof workspaceId, "string");
 
@@ -549,7 +1002,7 @@ test("Codex apply_patch reports a blocked canonical root without changing the mo
 test("Codex apply_patch blocks a fourth identical domain failure and resets on a changed request", async (t) => {
   const context = await fixture(t, { toolMode: "codex", uiEnabled: false });
   const workspaceId = structuredContent(
-    await callOpen(context.client, context.project, "repeat-failure-circuit"),
+    await callOpenOwned(context.client, context.project, "repeat-failure-circuit"),
   ).workspace_id;
   assert.equal(typeof workspaceId, "string");
 
@@ -625,7 +1078,7 @@ test("Codex apply_patch blocks a fourth identical domain failure and resets on a
 test("Claude edit and bash tools accept snake_case runtime inputs", async (t) => {
   const context = await fixture(t, { toolMode: "claude", uiEnabled: false });
   const workspaceId = structuredContent(
-    await callOpen(context.client, context.project, "snake-case-claude"),
+    await callOpenOwned(context.client, context.project, "snake-case-claude"),
   ).workspace_id;
   assert.equal(typeof workspaceId, "string");
 
@@ -682,7 +1135,7 @@ test("Claude mutation tools structure typed path failures without classifying up
   }
 
   const workspaceId = structuredContent(
-    await callOpen(context.client, context.project, "claude-mutation-errors"),
+    await callOpenOwned(context.client, context.project, "claude-mutation-errors"),
   ).workspace_id;
   assert.equal(typeof workspaceId, "string");
 
@@ -1387,6 +1840,16 @@ test("server shutdown waits for an active MCP tool call", async (t) => {
   };
   const workspaceId = openBody.result?.structuredContent?.workspace_id;
   assert.equal(typeof workspaceId, "string");
+  const acquired = await postModernMcp(
+    localBaseUrl,
+    accessToken,
+    "tools/call",
+    {
+      name: "acquire_write_ownership",
+      arguments: { workspace_id: workspaceId },
+    },
+  );
+  assert.equal(acquired.status, 200);
 
   const command = [
     "const fs=require('node:fs')",
@@ -2288,6 +2751,7 @@ interface ServerFixture {
   project: string;
   root: string;
   patchRecovery: PatchRecoveryManager;
+  ownership: WriteOwnership;
 }
 
 function schemaPropertyPaths(
@@ -2411,6 +2875,7 @@ async function fixture(
   const loadedConfig = loadConfig(writeTestDevspaceConfig(join(root, ".config"), {
     server: { port: 1 },
     workspaces: { allowedRoots: options.extraAllowedRoot ? [root, options.extraAllowedRoot] : [root], worktreeRoot: join(root, ".worktrees") },
+    storage: { stateDir },
     memory: options.memoryClient ? { enabled: true, command: "/bin/false" } : undefined,
     skills: { agentDir },
     subagents: {
@@ -2454,11 +2919,12 @@ async function fixture(
     });
   }
   const workspaces = new WorkspaceRegistry(config, store);
+  const processSessions = new ProcessSessionManager();
   const server = createMcpServer(
     config,
     workspaces,
     createReviewCheckpointManager(),
-    new ProcessSessionManager(),
+    processSessions,
     resolveLocalAgentProviders,
     [],
     undefined,
@@ -2479,6 +2945,7 @@ async function fixture(
     closed = true;
     await client.close();
     await server.close();
+    await processSessions.shutdown();
     store.close();
     patchRecovery.close();
   };
@@ -2488,7 +2955,13 @@ async function fixture(
     await rm(root, { recursive: true, force: true });
   });
 
-  return { client, project, root, patchRecovery };
+  return {
+    client,
+    project,
+    root,
+    patchRecovery,
+    ownership: new WriteOwnership(stateDir),
+  };
 }
 
 async function git(cwd: string, args: string[]): Promise<void> {
@@ -2632,7 +3105,23 @@ async function callOpen(
   return client.callTool(params);
 }
 
-function structuredContent(result: Awaited<ReturnType<Client["callTool"]>>): Record<string, unknown> {
+async function callOpenOwned(client: Client, path: string, scope?: string) {
+  const opened = await callOpen(client, path, scope);
+  const acquired = structuredContent(
+    await client.callTool({
+      name: "acquire_write_ownership",
+      arguments: { workspace_id: structuredContent(opened).workspace_id },
+    }),
+  );
+  assert.ok(
+    acquired.status === "acquired" || acquired.status === "already_owned",
+  );
+  return opened;
+}
+
+function structuredContent(
+  result: Awaited<ReturnType<Client["callTool"]>>,
+): Record<string, unknown> & { error?: ToolErrorPayload } {
   assert.ok(result.structuredContent);
   return result.structuredContent as Record<string, unknown>;
 }

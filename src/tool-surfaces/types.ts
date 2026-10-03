@@ -3,6 +3,7 @@ import type { ProcessSessionManager } from "../process-sessions.js";
 import type { ServerConfig } from "../config.js";
 import type { WorkspaceRegistry } from "../workspaces.js";
 import type { PatchRecoveryManager } from "../patch-recovery.js";
+import type { WriteOwnership } from "../write-ownership.js";
 
 export const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 
@@ -83,6 +84,7 @@ export interface ToolRegistrationContext {
   workspaces: WorkspaceRegistry;
   processSessions: ProcessSessionManager;
   patchRecovery?: PatchRecoveryManager;
+  writeOwnership: WriteOwnership;
 }
 
 export interface ToolInstructionContext {

@@ -1,5 +1,10 @@
 import * as z from "zod/v4";
 import {
+  withOwnedMutation,
+  withOwnedShellCall,
+} from "../write-ownership-host.js";
+import { ownedBashOperations } from "../owned-bash.js";
+import {
   editFileTool,
   runShellTool,
   writeFileTool,
@@ -56,7 +61,7 @@ function mutationErrorResponse(payload: ToolErrorPayload) {
 }
 
 function registerClaudeMutationTools(context: ToolRegistrationContext): void {
-  const { server, config, workspaces } = context;
+  const { server, config, workspaces, writeOwnership } = context;
 
   server.registerTool(
     toolNames.write,
@@ -83,9 +88,16 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
       try {
         const workspace = await workspaces.getWorkspace(workspaceId);
         const path = await workspaces.resolvePath(workspace, input.path);
-        response = await writeFileTool(
-          { ...input, path },
-          { cwd: workspace.root, displayPath: input.path },
+        response = await withOwnedMutation(
+          writeOwnership,
+          workspace.canonicalRoot,
+          workspace.id,
+          "write",
+          () =>
+            writeFileTool(
+              { ...input, path },
+              { cwd: workspace.root, displayPath: input.path },
+            ),
         );
       } catch (error) {
         const payload = toolErrorPayload(error);
@@ -188,14 +200,24 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
       try {
         const workspace = await workspaces.getWorkspace(workspaceId);
         const path = await workspaces.resolvePath(workspace, input.path);
-        response = await editFileTool({
-          ...input,
-          path,
-          edits: edits.map(({ old_text, new_text }) => ({
-            oldText: old_text,
-            newText: new_text,
-          })),
-        }, { cwd: workspace.root, displayPath: input.path });
+        response = await withOwnedMutation(
+          writeOwnership,
+          workspace.canonicalRoot,
+          workspace.id,
+          "edit",
+          () =>
+            editFileTool(
+              {
+                ...input,
+                path,
+                edits: edits.map(({ old_text, new_text }) => ({
+                  oldText: old_text,
+                  newText: new_text,
+                })),
+              },
+              { cwd: workspace.root, displayPath: input.path },
+            ),
+        );
       } catch (error) {
         const payload = toolErrorPayload(error);
         if (!payload) throw error;
@@ -267,7 +289,7 @@ function registerClaudeMutationTools(context: ToolRegistrationContext): void {
 }
 
 function registerShellTool(context: ToolRegistrationContext): void {
-  const { server, config, workspaces } = context;
+  const { server, config, workspaces, writeOwnership } = context;
 
   server.registerTool(
     toolNames.shell,
@@ -292,21 +314,55 @@ function registerShellTool(context: ToolRegistrationContext): void {
           .optional()
           .describe("Timeout in seconds. Defaults to 30, max 300."),
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: resultOutputSchema({
+        status: z.enum(["completed", "error"]),
+        error: toolErrorPayloadSchema.optional(),
+      }),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
     async ({ workspace_id, working_directory, ...input }) => {
       const startedAt = performance.now();
       const workspaceId = workspace_id;
       const workingDirectory = working_directory;
-      const workspace = await workspaces.getWorkspace(workspaceId);
-      const cwd = await workspaces.resolveWorkingDirectory(
-        workspace,
-        workingDirectory,
-      );
-      const response = await runShellTool(input, {
-        cwd,
-      });
+      let response;
+      try {
+        const workspace = await workspaces.getWorkspace(workspaceId);
+        const cwd = await workspaces.resolveWorkingDirectory(
+          workspace,
+          workingDirectory,
+        );
+        response = await withOwnedShellCall(
+          writeOwnership,
+          workspace.canonicalRoot,
+          workspace.id,
+          (executor) =>
+            runShellTool(input, {
+              cwd,
+              bashOperations: ownedBashOperations(() => executor),
+            }),
+        );
+      } catch (error) {
+        const payload = toolErrorPayload(error);
+        if (!payload) throw error;
+        const result = mutationErrorResponse(payload);
+        logFailedToolResponse(
+          config,
+          { tool: toolNames.shell, workspaceId },
+          result.content,
+          startedAt,
+        );
+        return result;
+      }
+      if (response.toolError) {
+        const result = mutationErrorResponse(response.toolError);
+        logFailedToolResponse(
+          config,
+          { tool: toolNames.shell, workspaceId },
+          result.content,
+          startedAt,
+        );
+        return result;
+      }
 
       if (response.isError) {
         logFailedToolResponse(
@@ -337,6 +393,7 @@ function registerShellTool(context: ToolRegistrationContext): void {
       return {
         ...response,
         structuredContent: {
+          status: "completed" as const,
           result: contentText(response.content),
         },
       };

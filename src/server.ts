@@ -48,6 +48,11 @@ import {
   type McpRegistrationTarget,
 } from "./mcp-modern-server.js";
 import { ProcessSessionManager } from "./process-sessions.js";
+import { WriteOwnership } from "./write-ownership.js";
+import {
+  ownershipSnapshot,
+  writeOwnershipSnapshotSchema,
+} from "./write-ownership-host.js";
 import {
   MemoryAdapter,
   MemoryThreadAuthorizationStore,
@@ -1057,6 +1062,7 @@ function registerMcpSurface(
   const toolSurface = getToolSurface(config.toolMode);
   const memory = memoryClient ?? new MemoryAdapter(config.memory);
   const projects = new ProjectRegistry(config.projectRegistryPath, config.allowedRoots);
+  const writeOwnership = new WriteOwnership(config.stateDir);
   const memoryProjectForWorkspace = async (workspaceId: string) => {
     const workspace = await workspaces.getWorkspace(workspaceId);
     const path = workspace.sourceRoot ?? workspace.root;
@@ -1147,6 +1153,7 @@ function registerMcpSurface(
         repository_state: repositoryStateOutputSchema.optional(),
         authoritative_references: z.array(authoritativeReferenceOutputSchema).optional(),
         memory_context: memoryBootstrapContextOutputSchema.optional(),
+        write_ownership: writeOwnershipSnapshotSchema.optional(),
         review: z.discriminatedUnion("available", [
           z.object({ available: z.literal(true) }),
           z.object({
@@ -1324,13 +1331,33 @@ function registerMcpSurface(
         : workspace.mode === "worktree"
           ? "Use this workspace_id for subsequent work in this isolated worktree. Keep reusing it while working in this worktree. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for it."
           : cardInstruction;
-      const instruction = preloadedSubagentInstructions && includeBootstrapContext
+      const contextInstruction = preloadedSubagentInstructions && includeBootstrapContext
         ? [
             workspaceInstruction,
             "Subagent workflow instructions:",
             preloadedSubagentInstructions,
           ].join("\n\n")
         : workspaceInstruction;
+      const instruction = `${contextInstruction}\nAcquire write ownership before mutation-capable work; release it when the mutation phase is complete. Conflicts are Host decisions; DevSpace does not wait or transfer ownership.`;
+      let writeOwnershipState;
+      try {
+        writeOwnershipState = ownershipSnapshot(
+          writeOwnership,
+          workspace.canonicalRoot,
+          workspace.id,
+        );
+      } catch (error) {
+        const payload = toolErrorPayload(error);
+        if (!payload) throw error;
+        const response = toolErrorResponse(payload);
+        logFailedToolResponse(
+          config,
+          { tool: "open_workspace", workspaceId: workspace.id },
+          response.content,
+          startedAt,
+        );
+        return response;
+      }
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -1424,6 +1451,7 @@ function registerMcpSurface(
         structuredContent: {
           status: "opened" as const,
           workspace_id: workspace.id,
+          write_ownership: writeOwnershipState,
           root: workspace.root,
           mode: workspace.mode,
           project_name: projectName,
@@ -1654,7 +1682,83 @@ function registerMcpSurface(
     workspaces,
     processSessions,
     patchRecovery,
+    writeOwnership,
   });
+
+  for (const action of ["acquire", "release"] as const) {
+    registrationTarget.registerTool(
+      `${action}_write_ownership`,
+      {
+        title: `${action === "acquire" ? "Acquire" : "Release"} write ownership`,
+        description:
+          action === "acquire"
+            ? "Explicitly reserve this workspace's canonical checkout for mutation. Does not wait, transfer ownership, or authorize subagent invocation."
+            : "Release this workspace's write ownership when its mutation phase is complete. Refuses while mutations remain active.",
+        inputSchema: {
+          workspace_id: z.string().describe(workspaceIdDescription),
+        },
+        outputSchema: resultOutputSchema({
+          status: z.enum([
+            "acquired",
+            "already_owned",
+            "released",
+            "not_owned",
+            "error",
+          ]),
+          write_ownership: writeOwnershipSnapshotSchema.optional(),
+          error: toolErrorPayloadSchema.optional(),
+        }),
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ workspace_id }) => {
+        const startedAt = performance.now();
+        const tool = `${action}_write_ownership`;
+        try {
+          const workspace = await workspaces.getWorkspace(workspace_id);
+          const { status } = writeOwnership[action](
+            workspace.canonicalRoot,
+            workspace.id,
+          );
+          const result = `Write ownership: ${status}.`;
+          const snapshot = ownershipSnapshot(
+            writeOwnership,
+            workspace.canonicalRoot,
+            workspace.id,
+          );
+          logToolCall(config, {
+            tool,
+            workspaceId: workspace.id,
+            success: true,
+            durationMs: Math.round(performance.now() - startedAt),
+          });
+          return {
+            content: [textBlock(result)],
+            structuredContent: {
+              result,
+              status,
+              write_ownership: snapshot,
+            },
+          };
+        } catch (error) {
+          const payload = toolErrorPayload(error);
+          if (!payload) throw error;
+          const response = toolErrorResponse(payload);
+          logFailedToolResponse(
+            config,
+            { tool, workspaceId: workspace_id },
+            response.content,
+            startedAt,
+          );
+          return response;
+        }
+      },
+    );
+  }
 
   registerAppTool(
     registrationTarget,
@@ -1725,6 +1829,7 @@ function registerMcpSurface(
     registerArtifactTools(registrationTarget, {
       config,
       workspaces,
+      writeOwnership,
       incomingArtifactAdapters,
     });
   }
@@ -1940,7 +2045,7 @@ export function createServer(
           });
         }
         await toolActivities.waitForIdle();
-        processSessions.shutdown();
+        await processSessions.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();
         patchRecovery.close();

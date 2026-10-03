@@ -24,6 +24,13 @@ import {
   type IncomingArtifactAdapter,
 } from "./incoming-artifacts.js";
 import { logEvent } from "./logger.js";
+import {
+  toolErrorPayload,
+  toolErrorPayloadSchema,
+  type ToolErrorPayload,
+} from "./tool-errors.js";
+import { withOwnedMutation } from "./write-ownership-host.js";
+import type { WriteOwnership } from "./write-ownership.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 
 const ARTIFACT_WRITE_ANNOTATIONS = {
@@ -52,6 +59,7 @@ const openAIFileReferenceInputSchema = z.strictObject({
 export interface ArtifactToolRegistrationOptions {
   config: ServerConfig;
   workspaces: WorkspaceRegistry;
+  writeOwnership: WriteOwnership;
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
 }
 
@@ -84,6 +92,7 @@ export function registerArtifactTools(
   {
     config,
     workspaces,
+    writeOwnership,
     incomingArtifactAdapters = [],
   }: ArtifactToolRegistrationOptions,
 ): void {
@@ -108,26 +117,43 @@ export function registerArtifactTools(
         ),
       },
       outputSchema: {
-        path: z.string(),
+        path: z.string().optional(),
+        error: toolErrorPayloadSchema.optional(),
       },
       _meta: { "openai/fileParams": ["file"] },
       annotations: ARTIFACT_WRITE_ANNOTATIONS,
     },
-    async (input) => executeArtifactTool(config, input, async () => {
-      const workspace = await workspaces.getWorkspace(input.workspace_id);
-      const downloaded = await downloadIncomingArtifact({
-        registry: incomingRegistry,
-        workspaceId: workspace.id,
-        workspaceRoot: workspace.root,
-        maxFileBytes: config.artifactMaxFileBytes,
-        file: input.file,
-        path: input.path,
-      });
-      return {
-        publicResult: { path: downloaded.path },
-        logResult: downloaded,
-      };
-    }),
+    async (input) => {
+      try {
+        return await executeArtifactTool(config, input, async () => {
+          const workspace = await workspaces.getWorkspace(input.workspace_id);
+          return withOwnedMutation(
+            writeOwnership,
+            workspace.canonicalRoot,
+            workspace.id,
+            "write",
+            async () => {
+              const downloaded = await downloadIncomingArtifact({
+                registry: incomingRegistry,
+                workspaceId: workspace.id,
+                workspaceRoot: workspace.root,
+                maxFileBytes: config.artifactMaxFileBytes,
+                file: input.file,
+                path: input.path,
+              });
+              return {
+                publicResult: { path: downloaded.path },
+                logResult: downloaded,
+              };
+            },
+          );
+        });
+      } catch (error) {
+        const payload = toolErrorPayload(error);
+        if (!payload) throw error;
+        return artifactToolErrorResponse(payload);
+      }
+    },
   );
 }
 
@@ -303,7 +329,10 @@ async function executeArtifactTool(
         tool: "download_artifact",
         ...artifactToolLogFields(input),
         success: false,
-        errorCode: error instanceof ArtifactError ? error.code : "internal_error",
+        errorCode:
+          error instanceof ArtifactError
+            ? error.code
+            : (toolErrorPayload(error)?.code ?? "internal_error"),
         durationMs: Math.round(performance.now() - startedAt),
       });
     }
@@ -315,6 +344,13 @@ function artifactToolResponse(result: { path: string }) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(result) }],
     structuredContent: result,
+  };
+}
+
+function artifactToolErrorResponse(payload: ToolErrorPayload) {
+  return {
+    content: [{ type: "text" as const, text: payload.message }],
+    structuredContent: { error: payload },
   };
 }
 

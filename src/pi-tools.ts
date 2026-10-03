@@ -12,6 +12,7 @@ import {
   type ReadToolInput,
   type WriteToolInput,
   type AgentToolResult,
+  type BashOperations,
 } from "@earendil-works/pi-coding-agent";
 import { fileRevision } from "./file-revision.js";
 import {
@@ -31,6 +32,7 @@ export type ToolResponse<TDetails = unknown> = {
 interface ToolContext {
   cwd: string;
   displayPath?: string;
+  bashOperations?: BashOperations;
 }
 
 interface DevspaceReadToolDetails extends ReadToolDetails {
@@ -188,7 +190,9 @@ export async function editFileTool(input: EditToolInput, context: ToolContext): 
 }
 
 export async function runShellTool(input: BashToolInput, context: ToolContext): Promise<ToolResponse> {
-  const tool = createBashTool(context.cwd);
+  const tool = createBashTool(context.cwd, {
+    operations: context.bashOperations,
+  });
   const timeout = input.timeout === undefined ? 30 : Math.min(input.timeout, 300);
 
   return runTool((params) => tool.execute("run_shell", params), {

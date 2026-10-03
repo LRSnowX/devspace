@@ -1,4 +1,5 @@
 import * as z from "zod/v4";
+import { WriteOwnershipError } from "./write-ownership.js";
 
 export const TOOL_ERROR_CODES = [
   "PATCH_INVALID",
@@ -19,6 +20,10 @@ export const TOOL_ERROR_CODES = [
   "PROCESS_SESSION_SCOPE_MISMATCH",
   "PROCESS_SESSION_NOT_INTERACTIVE",
   "REPEATED_FAILURE",
+  "WRITE_OWNERSHIP_REQUIRED",
+  "WRITE_OWNERSHIP_CONFLICT",
+  "WRITE_OWNERSHIP_BUSY",
+  "WRITE_OWNERSHIP_RECOVERY_REQUIRED",
 ] as const;
 
 export type ToolErrorCode = typeof TOOL_ERROR_CODES[number];
@@ -50,6 +55,8 @@ export interface ToolErrorPayload {
   session_id?: number;
   repeat_count?: number;
   previous_error_code?: ToolErrorCode;
+  owner_workspace_id?: string;
+  active_mutation_count?: number;
 }
 
 export const toolErrorPayloadSchema = z.object({
@@ -68,6 +75,8 @@ export const toolErrorPayloadSchema = z.object({
   session_id: z.number().int().positive().optional(),
   repeat_count: z.number().int().positive().optional(),
   previous_error_code: z.enum(TOOL_ERROR_CODES).optional(),
+  owner_workspace_id: z.string().optional(),
+  active_mutation_count: z.number().int().nonnegative().optional(),
 });
 
 export class ToolOperationError extends Error {
@@ -85,5 +94,24 @@ export function isToolOperationError(error: unknown): error is ToolOperationErro
 }
 
 export function toolErrorPayload(error: unknown): ToolErrorPayload | undefined {
+  if (error instanceof WriteOwnershipError) {
+    return {
+      code: error.code,
+      category:
+        error.code === "WRITE_OWNERSHIP_REQUIRED"
+          ? "state"
+          : error.code === "WRITE_OWNERSHIP_RECOVERY_REQUIRED"
+            ? "recovery"
+            : "conflict",
+      message: error.message,
+      retryable: error.code !== "WRITE_OWNERSHIP_RECOVERY_REQUIRED",
+      ...(error.record
+        ? {
+            owner_workspace_id: error.record.owner_workspace_id,
+            active_mutation_count: error.record.active_mutations.length,
+          }
+        : {}),
+    };
+  }
   return isToolOperationError(error) ? error.payload : undefined;
 }

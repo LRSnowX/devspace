@@ -4,12 +4,17 @@ import { FILE_REVISION_PATTERN } from "../file-revision.js";
 import {
   toolErrorPayload,
   toolErrorPayloadSchema,
+  ToolOperationError,
 } from "../tool-errors.js";
 import {
   MAX_PROCESS_YIELD_MS,
   type ProcessSnapshot,
 } from "../process-sessions.js";
 import { RepeatFailureCircuitBreaker } from "../repeat-failure-circuit.js";
+import {
+  withOwnedMutation,
+  beginOwnedProcess,
+} from "../write-ownership-host.js";
 import {
   EDIT_TOOL_ANNOTATIONS,
   SHELL_TOOL_ANNOTATIONS,
@@ -104,7 +109,7 @@ function processErrorResponse(payload: NonNullable<ReturnType<typeof toolErrorPa
 }
 
 function registerApplyPatchTool(context: ToolRegistrationContext): void {
-  const { server, config, workspaces, patchRecovery } = context;
+  const { server, config, workspaces, patchRecovery, writeOwnership } = context;
   const repeatFailures = new RepeatFailureCircuitBreaker();
 
   server.registerTool(
@@ -184,18 +189,6 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
           throw error;
         }
       }
-      const blocked = repeatFailures.beforeAttempt(workspaceId, request);
-      if (blocked) {
-        const response = patchErrorResponse(blocked);
-        logFailedToolResponse(
-          config,
-          { tool: "apply_patch", workspaceId },
-          response.content,
-          startedAt,
-        );
-        return response;
-      }
-
       let applied;
       try {
         applied = await runLoggedToolOperation(
@@ -204,11 +197,24 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
           startedAt,
           async () => {
             const workspace = await workspaces.getWorkspace(workspaceId);
-            return applyPatch(workspace.root, patch, {
-              journal: patchRecovery,
-              expectedRevisions: expected_revisions,
-              expectedAbsentPaths: expected_absent_paths,
-            });
+            return withOwnedMutation(
+              writeOwnership,
+              workspace.canonicalRoot,
+              workspace.id,
+              "apply_patch",
+              () => {
+                const blocked = repeatFailures.beforeAttempt(
+                  workspaceId,
+                  request,
+                );
+                if (blocked) throw new ToolOperationError(blocked);
+                return applyPatch(workspace.root, patch, {
+                  journal: patchRecovery,
+                  expectedRevisions: expected_revisions,
+                  expectedAbsentPaths: expected_absent_paths,
+                });
+              },
+            );
           },
         );
       } catch (error) {
@@ -217,7 +223,12 @@ function registerApplyPatchTool(context: ToolRegistrationContext): void {
           repeatFailures.reset(workspaceId);
           throw error;
         }
-        repeatFailures.recordFailure(workspaceId, request, payload.code);
+        if (
+          !payload.code.startsWith("WRITE_OWNERSHIP_") &&
+          payload.code !== "REPEATED_FAILURE"
+        ) {
+          repeatFailures.recordFailure(workspaceId, request, payload.code);
+        }
         return patchErrorResponse(payload);
       }
       repeatFailures.recordSuccess(workspaceId);
@@ -258,7 +269,7 @@ function patchErrorResponse(payload: NonNullable<ReturnType<typeof toolErrorPayl
 }
 
 function registerCodexProcessTools(context: ToolRegistrationContext): void {
-  const { server, config, workspaces, processSessions } = context;
+  const { server, config, workspaces, processSessions, writeOwnership } = context;
 
   server.registerTool(
     "exec_command",
@@ -349,6 +360,12 @@ function registerCodexProcessTools(context: ToolRegistrationContext): void {
               workingDirectory,
             );
             return processSessions.start({
+              mutation: () =>
+                beginOwnedProcess(
+                  writeOwnership,
+                  workspace.canonicalRoot,
+                  workspace.id,
+                ),
               workspaceId,
               command: cmd,
               cwd,

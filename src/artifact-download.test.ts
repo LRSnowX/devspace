@@ -4,6 +4,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   readdir,
   rm,
   stat,
@@ -27,6 +28,7 @@ import {
   IncomingArtifactAdapterRegistry,
   type IncomingArtifactAdapter,
 } from "./incoming-artifacts.js";
+import { WriteOwnership } from "./write-ownership.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-artifact-download-test-"));
 
@@ -35,6 +37,7 @@ try {
   testPlatformSupportContract();
   testWindowsPathValidationContract();
   if (isArtifactDownloadSupportedPlatform()) {
+    await testOwnershipEnforcement(join(root, "ownership"));
     await testSafeDownloadAndConflict(join(root, "downloads"));
     await testDestinationValidation(join(root, "destinations"));
     await testSizeLimitAndCleanup(join(root, "size-limit"));
@@ -69,6 +72,7 @@ function testOneToolContract(): void {
       logging: { toolCalls: false },
     } as never,
     workspaces: {} as never,
+    writeOwnership: new WriteOwnership(join(root, "tool-contract-state")),
   });
 
   assert.deepEqual([...registered.keys()], ["download_artifact"]);
@@ -76,7 +80,7 @@ function testOneToolContract(): void {
   assert.ok(descriptor);
   assert.deepEqual(descriptor._meta, { "openai/fileParams": ["file"] });
   assert.deepEqual(Object.keys(descriptor.inputSchema as object).sort(), ["file", "path", "workspace_id"]);
-  assert.deepEqual(Object.keys(descriptor.outputSchema as object), ["path"]);
+  assert.deepEqual(Object.keys(descriptor.outputSchema as object).sort(), ["error", "path"]);
   assert.equal((descriptor.annotations as { destructiveHint?: boolean }).destructiveHint, false);
 
   const fileSchema = (descriptor.inputSchema as z.ZodRawShape).file as z.ZodType;
@@ -96,6 +100,71 @@ function testOneToolContract(): void {
   });
   assert.equal(rejected.success, false);
   assert.equal(JSON.stringify(rejected).includes(sensitiveExtraValue), false);
+}
+
+async function testOwnershipEnforcement(testRoot: string): Promise<void> {
+  const workspacePath = join(testRoot, "workspace");
+  await mkdir(workspacePath, { recursive: true });
+  const workspaceRoot = await realpath(workspacePath);
+  const ownership = new WriteOwnership(join(testRoot, "state"));
+  let download:
+    | ((input: Record<string, unknown>) => Promise<{ structuredContent?: Record<string, unknown> }>)
+    | undefined;
+  const server = {
+    registerTool(
+      name: string,
+      _descriptor: Record<string, unknown>,
+      callback: (input: Record<string, unknown>) => Promise<{
+        structuredContent?: Record<string, unknown>;
+      }>,
+    ) {
+      if (name === "download_artifact") download = callback;
+      return {};
+    },
+  };
+  const workspaces = {
+    async getWorkspace(workspaceId: string) {
+      if (workspaceId !== "ws_A" && workspaceId !== "ws_B") throw new Error("unknown workspace");
+      return { id: workspaceId, root: workspaceRoot, canonicalRoot: workspaceRoot };
+    },
+  };
+  const adapter: IncomingArtifactAdapter = {
+    id: "test-native",
+    canHandle: () => true,
+    async open() {
+      return { name: "owned.txt", stream: Readable.from(["owned"]) };
+    },
+  };
+  registerArtifactTools(server as never, {
+    config: {
+      artifactMaxFileBytes: 1024,
+      logging: { toolCalls: false },
+    } as never,
+    workspaces: workspaces as never,
+    writeOwnership: ownership,
+    incomingArtifactAdapters: [adapter],
+  });
+  assert.ok(download);
+  const invoke = (workspaceId: string, path: string) =>
+    download!({ file: { native: true }, workspace_id: workspaceId, path });
+
+  const required = await invoke("ws_A", "blocked.txt");
+  assert.equal(
+    (required.structuredContent?.error as { code?: string } | undefined)?.code,
+    "WRITE_OWNERSHIP_REQUIRED",
+  );
+  await assert.rejects(readFile(join(workspaceRoot, "blocked.txt")));
+
+  ownership.acquire(workspaceRoot, "ws_A");
+  assert.deepEqual((await invoke("ws_A", "owned.txt")).structuredContent, { path: "owned.txt" });
+  assert.equal(await readFile(join(workspaceRoot, "owned.txt"), "utf8"), "owned");
+
+  const conflict = await invoke("ws_B", "foreign.txt");
+  assert.equal(
+    (conflict.structuredContent?.error as { code?: string } | undefined)?.code,
+    "WRITE_OWNERSHIP_CONFLICT",
+  );
+  await assert.rejects(readFile(join(workspaceRoot, "foreign.txt")));
 }
 
 function testPlatformSupportContract(): void {

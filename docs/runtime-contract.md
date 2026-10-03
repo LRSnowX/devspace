@@ -12,6 +12,8 @@ the corresponding regression coverage in the same change.
 ### Guarantees
 
 - Model-facing tool schemas use `snake_case`.
+- Both Host coding surfaces include `acquire_write_ownership` and
+  `release_write_ownership`.
 - The core Codex surface is:
   - `open_workspace`
   - `read`
@@ -58,6 +60,32 @@ the corresponding regression coverage in the same change.
 
 - Shell commands run with the local user's authority. Workspace path checks do
   not turn shell execution into a filesystem or process sandbox.
+
+## Host checkout write ownership
+
+- `open_workspace` reports a compact `write_ownership` snapshot: `state`,
+  optional `owner_workspace_id`, and `active_mutation_count`. It does not acquire.
+- The Host explicitly acquires before `apply_patch`, Claude `write`/`edit`,
+  `download_artifact`, or any `exec_command`/`bash` command, and explicitly
+  releases after its mutation phase. Shell commands are not classified as read-only.
+- Authority is workspace-scoped and keyed by canonical root in the accepted
+  stateDir-backed store. Another workspace on that checkout cannot mutate;
+  known read-only tools remain usable. Different roots are independent.
+- Same-owner acquisition and unowned release are idempotent. Release refuses
+  while any active mutation remains. Multiple owner-scoped mutations are allowed;
+  completing one removes only its own activity.
+- Process-session activity begins before spawn and ends at actual terminal
+  cleanup, not at the first result, polling, stdin, or cancellation request.
+  Claude bash tracks the actual shell executor for its full synchronous call.
+- Ownership errors use the common structured error envelope. They do not count
+  toward the patch repeat-failure circuit. Ownership never bypasses workspace,
+  path, revision, or patch-recovery checks.
+- Restart preserves claims and interrupted activities; there is no automatic
+  release, expiry, takeover, waiting, or scheduler. Arbitrary-shell executor
+  evidence is non-exhaustive, so crash recovery cannot trust a shell PID alone.
+- This Host integration does not enforce ownership in local agents/agentd or
+  retention, and adds no operator recovery CLI. Shell execution remains local-user
+  authority, not a sandbox or proof that detached descendants have stopped.
 
 ## `apply_patch`
 
@@ -167,6 +195,14 @@ the corresponding regression coverage in the same change.
 - Model-facing yield windows are bounded to 12 seconds.
 - `write_stdin` can poll a running process, send input, send Ctrl-C, and
   resize supported PTY sessions.
+- Completed process-session snapshots remain replayable in memory for
+  30 minutes after terminal completion. This window is intended to tolerate
+  ChatGPT connector interruptions and delayed Host follow-up; it is not durable
+  storage and does not survive a DevSpace server restart.
+- `PROCESS_SESSION_NOT_FOUND` means the session handle is unavailable, not
+  that the underlying command necessarily failed or never completed. The Host
+  should inspect existing process/log/artifact evidence before deciding whether
+  to start a replacement command.
 - Codex process results expose the current lifecycle fields, including
   `running`, `exit_code`, `signal`, `wall_time_ms`, and
   `output_truncated` when applicable.
@@ -206,7 +242,7 @@ the corresponding regression coverage in the same change.
 ### Current limitation
 
 - The structured coding-tool error taxonomy is currently guaranteed for Codex
-  `apply_patch`. Other tools and adapters still have legacy or domain-specific
+  `apply_patch` and Host write-ownership failures. Other errors and adapters still have legacy or domain-specific
   error contracts and may migrate incrementally.
 - The repeat-failure breaker is process-local and deliberately exact-request
   only. It is not a persistent or semantic loop detector.

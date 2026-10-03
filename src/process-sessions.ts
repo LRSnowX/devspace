@@ -8,11 +8,18 @@ const DEFAULT_POLL_YIELD_MS = 5_000;
 export const MAX_PROCESS_YIELD_MS = 12_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_BUFFER_CHARACTERS = 1_000_000;
-const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
+// ChatGPT Hosts can remain disconnected from a completed tool session for
+// several minutes before they resume polling. Keep completed snapshots long
+// enough for practical reconnect/replay without turning sessions into durable
+// storage.
+const COMPLETED_SESSION_TTL_MS = 30 * 60 * 1_000;
 const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
+const PROCESS_SHUTDOWN_GRACE_MS = 1_000;
 
 export interface StartCommandInput {
+  /** Host activity starts after validation and ends at actual terminal cleanup. */
+  mutation?: () => ProcessMutationLifecycle;
   workspaceId: string;
   command: string;
   cwd: string;
@@ -22,6 +29,11 @@ export interface StartCommandInput {
   rows?: number;
   yieldTimeMs?: number;
   maxOutputTokens?: number;
+}
+
+export interface ProcessMutationLifecycle {
+  spawned(pid: number): void;
+  finished(): void;
 }
 
 export interface WriteStdinInput {
@@ -51,6 +63,8 @@ interface ManagedProcess {
 }
 
 interface ProcessSession {
+  mutation?: ProcessMutationLifecycle;
+  terminalError?: unknown;
   id: number;
   workspaceId: string;
   process?: ManagedProcess;
@@ -217,6 +231,7 @@ export class ProcessSessionManager {
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
   private nextSessionId = 1;
+  private shutdownPromise?: Promise<void>;
 
   constructor(options: ProcessSessionManagerOptions = {}) {
     this.maxBufferCharacters = options.maxBufferCharacters ?? DEFAULT_BUFFER_CHARACTERS;
@@ -224,18 +239,25 @@ export class ProcessSessionManager {
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
+    const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_PROCESS_YIELD_MS);
+    boundedInteger(input.maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 100_000);
     const session = this.createSession(input);
+    session.mutation = input.mutation?.();
     this.sessions.set(session.id, session);
 
     try {
       if (input.tty && process.platform !== "win32") await this.startPty(session, input);
       else this.startPipe(session, input);
     } catch (error) {
-      this.sessions.delete(session.id);
+      if (session.process && session.running) {
+        session.process.kill("SIGTERM");
+        await session.exitPromise;
+      } else this.finish(session);
+      this.removeSession(session.id);
+      if (session.terminalError) throw session.terminalError;
       throw error;
     }
 
-    const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_PROCESS_YIELD_MS);
     await this.waitForExit(session, yieldTimeMs);
 
     const snapshot = this.consume(session, input.maxOutputTokens);
@@ -294,12 +316,9 @@ export class ProcessSessionManager {
     if (session.running) session.process?.kill("SIGTERM");
   }
 
-  shutdown(): void {
-    for (const session of this.sessions.values()) {
-      if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
-      if (session.running) session.process?.kill("SIGTERM");
-    }
-    this.sessions.clear();
+  shutdown(): Promise<void> {
+    this.shutdownPromise ??= this.shutdownSessions();
+    return this.shutdownPromise;
   }
 
   private async waitForExit(session: ProcessSession, yieldTimeMs: number): Promise<void> {
@@ -359,6 +378,7 @@ export class ProcessSessionManager {
     child.stderr.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
     child.on("error", (error) => this.append(session, `${error.message}\n`));
     child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
+    if (child.pid) this.recordSpawn(session, child.pid);
   }
 
   private async startPty(session: ProcessSession, input: StartCommandInput): Promise<void> {
@@ -395,6 +415,22 @@ export class ProcessSessionManager {
     pty.onExit(({ exitCode, signal }) => {
       this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
     });
+    this.recordSpawn(session, pty.pid);
+  }
+
+  private recordSpawn(session: ProcessSession, pid: number): void {
+    try {
+      session.mutation?.spawned(pid);
+    } catch (error) {
+      // Do not publish a usable session after persistence failed. Keep its
+      // activity until the process really exits, even after sending SIGTERM.
+      session.terminalError = error;
+      try {
+        session.process?.kill("SIGTERM");
+      } catch {
+        // Failed termination is not completion: keep the activity until exit.
+      }
+    }
   }
 
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
@@ -403,6 +439,14 @@ export class ProcessSessionManager {
     session.exitCode = exitCode;
     session.signal = signal;
     session.process = undefined;
+    try {
+      session.mutation?.finished();
+    } catch (error) {
+      // Failed cleanup leaves the persisted record fail-closed. Event callbacks
+      // must not throw; callers receive this failure instead of success/replay.
+      session.terminalError = error;
+    }
+    session.mutation = undefined;
     session.resolveExit();
     session.cleanupTimer = setTimeout(
       () => this.sessions.delete(session.id),
@@ -416,6 +460,7 @@ export class ProcessSessionManager {
   }
 
   private consume(session: ProcessSession, maxOutputTokens?: number): ProcessSnapshot {
+    if (session.terminalError) throw session.terminalError;
     if (!session.running && session.completedSnapshot) {
       return session.completedSnapshot;
     }
@@ -444,7 +489,10 @@ export class ProcessSessionManager {
       throw new ToolOperationError({
         code: "PROCESS_SESSION_NOT_FOUND",
         category: "not_found",
-        message: "Unknown process session: " + sessionId + ". Start a new command with exec_command.",
+        message:
+          "Unknown process session: " +
+          sessionId +
+          ". The session may have expired or the DevSpace server may have restarted. Inspect existing process, logs, and result artifacts before starting a replacement command.",
         retryable: true,
         session_id: sessionId,
       });
@@ -465,5 +513,60 @@ export class ProcessSessionManager {
     const session = this.sessions.get(sessionId);
     if (session?.cleanupTimer) clearTimeout(session.cleanupTimer);
     this.sessions.delete(sessionId);
+  }
+
+  private async shutdownSessions(): Promise<void> {
+    const sessions = [...this.sessions.values()];
+    const runningAtShutdown = sessions.filter((session) => session.running);
+    for (const session of sessions) {
+      if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+      if (!session.running) continue;
+      try {
+        session.process?.kill("SIGTERM");
+      } catch {
+        // Terminal cleanup remains tied to the actual process event.
+      }
+    }
+
+    await this.waitForTerminalSessions(sessions, PROCESS_SHUTDOWN_GRACE_MS);
+
+    for (const session of sessions) {
+      if (!session.running) continue;
+      try {
+        session.process?.kill("SIGKILL");
+      } catch {
+        // If termination cannot be proved, the persisted mutation stays
+        // fail-closed for explicit recovery after restart.
+      }
+    }
+
+    await this.waitForTerminalSessions(sessions, PROCESS_SHUTDOWN_GRACE_MS);
+    for (const session of sessions) {
+      if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+    }
+    this.sessions.clear();
+    const cleanupFailure = runningAtShutdown.find(
+      (session) => session.terminalError !== undefined,
+    )?.terminalError;
+    if (cleanupFailure) throw cleanupFailure;
+  }
+
+  private async waitForTerminalSessions(
+    sessions: readonly ProcessSession[],
+    timeoutMs: number,
+  ): Promise<void> {
+    const running = sessions.filter((session) => session.running);
+    if (running.length === 0) return;
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.all(running.map((session) => session.exitPromise)).then(() => undefined),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 }

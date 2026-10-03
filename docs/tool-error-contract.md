@@ -32,7 +32,9 @@ error: {
   conversation_id?,
   session_id?,
   repeat_count?,
-  previous_error_code?
+  previous_error_code?,
+  owner_workspace_id?,
+  active_mutation_count?
 }
 ```
 
@@ -52,6 +54,27 @@ do not include an `error` payload.
 Successful Claude `write` and `edit` mutations use `status: "applied"`.
 
 Successful `open_workspace` calls use `status: "opened"`.
+
+Ownership acquire uses `acquired`/`already_owned`; release uses
+`released`/`not_owned`. Both return a compact `write_ownership` snapshot.
+Successful Claude `bash` uses `status: "completed"`; ordinary upstream shell
+failures keep their existing error behavior.
+
+## Host ownership codes
+
+Ownership tools and direct Host mutations use the same ordinary structured
+error envelope, without `isError: true`:
+
+- `WRITE_OWNERSHIP_REQUIRED`: category `state`, retryable `true`.
+- `WRITE_OWNERSHIP_CONFLICT`: category `conflict`, retryable `true`; includes
+  `owner_workspace_id` when the store has a decoded owner.
+- `WRITE_OWNERSHIP_BUSY`: category `conflict`, retryable `true`; includes
+  `active_mutation_count` when available.
+- `WRITE_OWNERSHIP_RECOVERY_REQUIRED`: category `recovery`, retryable `false`.
+
+Internal claim/activity nonces, executor PIDs, and persistence filenames are
+not model-facing fields. Ownership failures do not advance the patch
+repeat-failure circuit; acquiring ownership does not clear patch-recovery state.
 
 Memory success results remain the read-only CHIM payload unchanged. Classified
 local Memory failures use the common `status: "error"` envelope.
