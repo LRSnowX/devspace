@@ -207,8 +207,8 @@ test("memory bootstrap preserves recent continuation tails within a dedicated se
     pendingItems: 0,
     continuationConversations: 2,
     continuationMessages: 11,
-    relevantHits: 4,
-    recentHits: 3,
+    relevantHits: 1,
+    recentHits: 1,
   });
   assert.ok(context.continuations.length >= 1);
   assert.equal(context.continuations[0]?.conversationId, "continuation-1");
@@ -222,6 +222,74 @@ test("memory bootstrap preserves recent continuation tails within a dedicated se
   }
   assert.equal(context.truncated, true);
   assert.ok(memoryEvidenceIdsFromBootstrapContext(context).includes("continuation-1"));
+});
+
+test("memory bootstrap deduplicates recent hits already represented by continuations", () => {
+  const raw = projectContext() as {
+    structuredContent: Record<string, unknown>;
+  };
+  raw.structuredContent.continuations = [{
+    conversation_id: "parent-1",
+    source: "chatgpt",
+    title: "Current project chat",
+    message_offset: 0,
+    total_messages: 2,
+    messages: [
+      { role: "user", turn_index: 0, text: "continue" },
+      { role: "assistant", turn_index: 1, text: "next" },
+    ],
+  }];
+  raw.structuredContent.relevant = [];
+  raw.structuredContent.recent = [
+    {
+      result: {
+        conversation_id: "parent-1",
+        source: "chatgpt",
+        title: "Duplicate continuation metadata",
+        topic_tags: [],
+      },
+      evidence_conversation_id: "evidence-1",
+    },
+    {
+      result: {
+        conversation_id: "parent-2",
+        source: "chatgpt",
+        title: "Distinct recent project chat",
+        topic_tags: [],
+      },
+      evidence_conversation_id: "evidence-2",
+    },
+    {
+      result: {
+        conversation_id: "parent-2",
+        source: "chatgpt",
+        title: "Duplicate recent hit",
+        topic_tags: [],
+      },
+      evidence_conversation_id: "evidence-2",
+    },
+    {
+      result: {
+        conversation_id: "parent-3",
+        source: "chatgpt",
+        title: "Distinct parent backed by the continuation evidence thread",
+        topic_tags: [],
+      },
+      evidence_conversation_id: "parent-1",
+    },
+  ];
+
+  const context = compactMemoryBootstrapContext(raw, "Jack", 12_288);
+  assert.deepEqual(
+    context.recent.map((hit) => hit.conversationId),
+    ["parent-2", "parent-3"],
+  );
+  assert.equal(context.truncated, false);
+  assert.equal(memoryBootstrapSourceCounts(context).recentHits, 2);
+  assert.deepEqual(
+    memoryEvidenceIdsFromBootstrapContext(context).sort(),
+    ["evidence-2", "parent-1", "parent-2", "parent-3"],
+  );
 });
 
 test("memory bootstrap does not let raw continuation history consume an otherwise empty packet", () => {

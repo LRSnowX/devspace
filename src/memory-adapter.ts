@@ -421,18 +421,6 @@ export function compactMemoryBootstrapContext(
     truncated: false,
     byteBudget,
   };
-  memoryBootstrapSourceCountsByContext.set(context, {
-    collaborationItems: collaborationMemoryCandidate.items.length,
-    workingItems: workingMemoryCandidate.items.length,
-    pendingItems: pendingMemoryCandidate.items.length,
-    continuationConversations: continuationCandidates.length,
-    continuationMessages: continuationCandidates.reduce(
-      (sum, continuation) => sum + continuation.messages.length,
-      0,
-    ),
-    relevantHits: candidates.relevant.length,
-    recentHits: candidates.recent.length,
-  });
   const collaborationMemoryBudget = Math.min(2_048, Math.floor(byteBudget * 0.2));
   for (const item of collaborationMemoryCandidate.items) {
     context.collaborationMemory.items.push(item);
@@ -511,8 +499,27 @@ export function compactMemoryBootstrapContext(
     continuation.messageOffset += omitted;
     context.truncated ||= omitted > 0;
   }
+  const continuationIds = new Set(
+    context.continuations.map((continuation) => continuation.conversationId),
+  );
+  const dedupedHits = {
+    relevant: dedupeBootstrapHits(candidates.relevant, continuationIds),
+    recent: dedupeBootstrapHits(candidates.recent, continuationIds),
+  };
+  memoryBootstrapSourceCountsByContext.set(context, {
+    collaborationItems: collaborationMemoryCandidate.items.length,
+    workingItems: workingMemoryCandidate.items.length,
+    pendingItems: pendingMemoryCandidate.items.length,
+    continuationConversations: continuationCandidates.length,
+    continuationMessages: continuationCandidates.reduce(
+      (sum, continuation) => sum + continuation.messages.length,
+      0,
+    ),
+    relevantHits: dedupedHits.relevant.length,
+    recentHits: dedupedHits.recent.length,
+  });
   for (const group of ["relevant", "recent"] as const) {
-    for (const hit of candidates[group]) {
+    for (const hit of dedupedHits[group]) {
       context[group].push(hit);
       if (byteLength(context) > byteBudget) {
         context[group].pop();
@@ -522,12 +529,30 @@ export function compactMemoryBootstrapContext(
     }
   }
   context.truncated ||=
-    context.relevant.length < candidates.relevant.length ||
-    context.recent.length < candidates.recent.length;
+    context.relevant.length < dedupedHits.relevant.length ||
+    context.recent.length < dedupedHits.recent.length;
   if (byteLength(context) > byteBudget) {
     throw new Error("Memory bootstrap byte budget is too small for its envelope");
   }
   return context;
+}
+
+function dedupeBootstrapHits(
+  hits: MemoryBootstrapHit[],
+  excludedConversationIds: ReadonlySet<string>,
+): MemoryBootstrapHit[] {
+  const seen = new Set<string>();
+  const output: MemoryBootstrapHit[] = [];
+  for (const hit of hits) {
+    if (excludedConversationIds.has(hit.conversationId)) {
+      continue;
+    }
+    const key = hit.conversationId + "\u0000" + (hit.evidenceConversationId ?? "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    output.push(hit);
+  }
+  return output;
 }
 
 export function compactMirroredMemoryResult(result: CallToolResult): CallToolResult {
