@@ -475,6 +475,68 @@ test("memory bootstrap synthesizes conservative verification for older CHIM resp
     sourceState: "unavailable",
     sourceReason: "CHIM working-memory verification metadata was unavailable",
   });
+  assert.deepEqual(context.workingMemory.confirmation[0], {
+    memoryId: "legacy-operational",
+    state: "not_applicable",
+    reason: "memory kind is not governed by historical decision confirmation",
+  });
+});
+
+test("older CHIM rule-like memory fails closed as requiring confirmation", () => {
+  const raw = projectContext() as { structuredContent: Record<string, unknown> };
+  raw.structuredContent.working_memory = {
+    project: "Jack",
+    items: [{
+      memory_id: "legacy-decision",
+      kind: "decision",
+      key: "prompt_policy",
+      value: { text: "Use the old prompt format." },
+      importance: 100,
+      confidence: 1,
+      evidence: [{
+        kind: "user_statement",
+        reference: "conversation:legacy:message:u1",
+      }],
+    }],
+  };
+
+  const context = compactMemoryBootstrapContext(raw, "Jack", 4_096);
+  assert.deepEqual(context.workingMemory.confirmation, [{
+    memoryId: "legacy-decision",
+    state: "requires_confirmation",
+    reason: "CHIM confirmation metadata was unavailable; fail closed for rule-like memory",
+  }]);
+});
+
+test("memory bootstrap preserves explicit CHIM project confirmation state", () => {
+  const raw = projectContext() as { structuredContent: Record<string, unknown> };
+  raw.structuredContent.working_memory = {
+    project: "Jack",
+    items: [{
+      memory_id: "confirmed-decision",
+      kind: "decision",
+      key: "prompt_policy",
+      value: { text: "Use the confirmed prompt format." },
+      importance: 100,
+      confidence: 1,
+      evidence: [{
+        kind: "user_statement",
+        reference: "conversation:current:confirmation",
+      }],
+    }],
+    confirmation: [{
+      memory_id: "confirmed-decision",
+      state: "confirmed",
+      reason: "user confirmed this project rule through the operator confirmation path",
+    }],
+  };
+
+  const context = compactMemoryBootstrapContext(raw, "Jack", 4_096);
+  assert.deepEqual(context.workingMemory.confirmation, [{
+    memoryId: "confirmed-decision",
+    state: "confirmed",
+    reason: "user confirmed this project rule through the operator confirmation path",
+  }]);
 });
 
 test("memory bootstrap bounds collaboration memory ahead of project memory without authorizing provenance", () => {
@@ -698,7 +760,7 @@ test("memory bootstrap skips semantic retrieval and requests only recent continu
   });
 });
 
-test("empty working memory requests only a read-only bootstrap plan and returns compact status", async () => {
+test("empty working memory stays ChatGPT-first without requesting a model bootstrap plan", async () => {
   const adapter = new MemoryAdapter({
     enabled: true,
     command: "/bin/false",
@@ -708,70 +770,18 @@ test("empty working memory requests only a read-only bootstrap plan and returns 
   const observedTools: string[] = [];
   adapter.call = async (toolName) => {
     observedTools.push(toolName);
-    if (toolName === "memory_project_context") return projectContext();
-    if (toolName === "memory_bootstrap_plan") {
-      return {
-        content: [],
-        structuredContent: {
-          project: "Jack",
-          project_aliases: ["J"],
-          source_policy: "recent_complete_chatgpt_only",
-          bootstrap_required: true,
-          bootstrap_skip_reason: null,
-          active_working_memory_items: 0,
-          max_conversations: 3,
-          max_messages: 8,
-          estimated_model_attempts: 3,
-          selected: [
-            { conversation_id: "private-bootstrap-1" },
-            { conversation_id: "private-bootstrap-2" },
-            { conversation_id: "private-bootstrap-3" },
-          ],
-          excluded: {},
-        },
-      };
-    }
-    throw new Error("unexpected tool");
+    return projectContext();
   };
 
   const context = await adapter.bootstrapProjectContext("Jack");
-  assert.deepEqual(observedTools, [
-    "memory_project_context",
-    "memory_bootstrap_plan",
-  ]);
+  assert.deepEqual(observedTools, ["memory_project_context"]);
   assert.deepEqual(context.bootstrapStatus, {
-    state: "required",
+    state: "not_required",
     activeWorkingMemoryItems: 0,
-    estimatedModelAttempts: 3,
-    selectedConversations: 3,
-    sourcePolicy: "recent_complete_chatgpt_only",
+    estimatedModelAttempts: 0,
+    selectedConversations: 0,
+    skipReason: "chatgpt_first_no_model_bootstrap",
   });
-  assert.equal(
-    memoryEvidenceIdsFromBootstrapContext(context).some((id) =>
-      id.startsWith("private-bootstrap-")
-    ),
-    false,
-  );
-});
-
-test("bootstrap plan failure leaves project context usable with unavailable status", async () => {
-  const adapter = new MemoryAdapter({
-    enabled: true,
-    command: "/bin/false",
-    bootstrapTimeoutMs: 5_000,
-    bootstrapByteBudget: 12_288,
-  });
-  adapter.call = async (toolName) => {
-    if (toolName === "memory_project_context") return projectContext();
-    throw new Error("bootstrap plan unavailable");
-  };
-
-  const context = await adapter.bootstrapProjectContext("Jack");
-  assert.equal(context.bootstrapStatus.state, "unavailable");
-  assert.equal(context.bootstrapStatus.activeWorkingMemoryItems, 0);
-  assert.equal(context.bootstrapStatus.estimatedModelAttempts, 0);
-  assert.equal(context.bootstrapStatus.selectedConversations, 0);
-  assert.equal(context.bootstrapStatus.skipReason, "bootstrap_plan_unavailable");
 });
 
 test("memory bootstrap enforces its timeout", async () => {

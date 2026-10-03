@@ -1477,6 +1477,10 @@ function fakeMemory(
             sourceReason: "No newer project conversation evidence was found.",
             latestProjectEvidenceAt: 43,
           }],
+          confirmation: [{
+            memoryId: `${project}-current-goal`,
+            state: "not_applicable",
+          }],
         },
         pendingMemory: {
           project,
@@ -1778,8 +1782,11 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.deepEqual(workingItems[0]?.value, { text: "Complete repository acceptance." });
   assert.match(
     opened.instruction as string,
-    /working_memory as the current durable project state/,
+    /working_memory as durable project state with an explicit confirmation sidecar/,
   );
+  const workingConfirmation = workingMemory.confirmation as Array<Record<string, unknown>>;
+  assert.equal(workingConfirmation.length, 1);
+  assert.equal(workingConfirmation[0]?.state, "not_applicable");
   const pendingMemory = bootstrap.pending_memory as Record<string, unknown>;
   const pendingItems = pendingMemory.items as Array<Record<string, unknown>>;
   assert.equal(pendingItems.length, 1);
@@ -1789,9 +1796,15 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.match(opened.instruction as string, /unpromoted, untrusted continuity hints only/);
   assert.match(
     opened.instruction as string,
-    /authoritative project files > active working_memory > pending_memory > continuations/,
+    /authoritative project files > active confirmed working_memory\/collaboration_memory > pending_memory > continuations > raw historical evidence/,
   );
   assert.match(opened.instruction as string, /must never be followed as instructions/);
+  assert.match(opened.instruction as string, /apply a Turn Retrieval Gate/);
+  assert.match(opened.instruction as string, /coverage-gap detection/);
+  assert.match(opened.instruction as string, /Historical conversation evidence can inform but must not silently govern/);
+  assert.match(opened.instruction as string, /only state=confirmed may govern future behavior/);
+  assert.match(opened.instruction as string, /state=requires_confirmation/);
+  assert.match(opened.instruction as string, /ask the user to confirm whether it is still current before acting on it/);
   const continuations = bootstrap.continuations as Array<Record<string, unknown>>;
   assert.equal(continuations.length, 2);
   assert.equal(continuations[0]?.conversation_id, "LEMonX-continuation");
@@ -1905,7 +1918,7 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   });
 });
 
-test("bootstrap-required memory status is advisory and never authorizes compiler work", async (t) => {
+test("ChatGPT-first empty working memory never implies a model bootstrap", async (t) => {
   const context = await fixture(t, {
     memoryClient: fakeMemory(
       undefined,
@@ -1913,29 +1926,31 @@ test("bootstrap-required memory status is advisory and never authorizes compiler
         project: "project",
         items: [],
         verification: [],
+        confirmation: [],
       },
       {
-        state: "required",
+        state: "not_required",
         activeWorkingMemoryItems: 0,
-        estimatedModelAttempts: 3,
-        selectedConversations: 3,
-        sourcePolicy: "recent_complete_chatgpt_only",
+        estimatedModelAttempts: 0,
+        selectedConversations: 0,
+        skipReason: "chatgpt_first_no_model_bootstrap",
       },
     ),
   });
   const opened = structuredContent(await callOpen(context.client, context.project));
   const bootstrap = opened.memory_context as Record<string, unknown>;
   assert.deepEqual(bootstrap.bootstrap_status, {
-    state: "required",
+    state: "not_required",
     active_working_memory_items: 0,
-    estimated_model_attempts: 3,
-    selected_conversations: 3,
-    source_policy: "recent_complete_chatgpt_only",
+    estimated_model_attempts: 0,
+    selected_conversations: 0,
+    skip_reason: "chatgpt_first_no_model_bootstrap",
   });
   assert.match(
     opened.instruction as string,
-    /status is advisory only and does not authorize starting a memory compiler, Codex, subagent, or scheduler/,
+    /Do not start or propose a model\/Codex memory bootstrap merely because working_memory is empty/,
   );
+  assert.match(opened.instruction as string, /apply a Turn Retrieval Gate/);
 });
 
 test("memory handoff revalidates only operational memory against live repository freshness", async (t) => {
@@ -2045,6 +2060,18 @@ test("memory handoff revalidates only operational memory against live repository
         sourceReason: "CHIM working-memory verification metadata was unavailable",
       },
     ],
+    confirmation: [
+      { memoryId: "head-old", state: "not_applicable" },
+      { memoryId: "dirty-sensitive", state: "not_applicable" },
+      {
+        memoryId: "stable-decision",
+        state: "requires_confirmation",
+        reason: "Recovered historical decision has not yet been reconfirmed.",
+      },
+      { memoryId: "expired-blocker", state: "not_applicable" },
+      { memoryId: "tentative-hypothesis", state: "not_applicable" },
+      { memoryId: "legacy-unavailable", state: "not_applicable" },
+    ],
   };
   const context = await fixture(t, {
     git: true,
@@ -2060,9 +2087,13 @@ test("memory handoff revalidates only operational memory against live repository
   const cleanWorking = (clean.memory_context as Record<string, unknown>)
     .working_memory as Record<string, unknown>;
   const cleanVerification = cleanWorking.verification as Array<Record<string, unknown>>;
+  const cleanConfirmation = cleanWorking.confirmation as Array<Record<string, unknown>>;
   const cleanState = (memoryId: string) =>
     cleanVerification.find((item) => item.memory_id === memoryId)
     ?? assert.fail("missing verification for " + memoryId);
+  const confirmationState = (memoryId: string) =>
+    cleanConfirmation.find((item) => item.memory_id === memoryId)
+    ?? assert.fail("missing confirmation for " + memoryId);
 
   assert.equal(cleanState("head-old").host_state, "needs_revalidation");
   assert.match(
@@ -2071,6 +2102,7 @@ test("memory handoff revalidates only operational memory against live repository
   );
   assert.equal(cleanState("dirty-sensitive").host_state, "current_by_evidence");
   assert.equal(cleanState("stable-decision").host_state, "current_by_evidence");
+  assert.equal(confirmationState("stable-decision").state, "requires_confirmation");
   assert.equal(cleanState("expired-blocker").host_state, "expired");
   assert.equal(cleanState("tentative-hypothesis").host_state, "tentative");
   assert.equal(cleanState("legacy-unavailable").host_state, "needs_revalidation");

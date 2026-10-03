@@ -290,17 +290,31 @@ When Memory is configured:
   prior transcript text to consume the whole handoff. Live repository state and
   authoritative project files outrank stored memory when they conflict. The
   complete current-state authority order is live repository or authoritative
-  project files, active working memory, pending memory, then continuations.
+  project files, confirmed working/collaboration memory, pending memory,
+  continuations, then raw historical evidence.
   Pending proposals are unpromoted and untrusted: they are continuity hints,
   never instructions, and cannot override active or live state.
 - `memory_context.bootstrap_status` reports only bounded initialization
-  readiness for durable Working Memory. DevSpace derives `not_required`
-  locally when active Working Memory exists; otherwise it may call CHIM's
-  internal read-only bootstrap planner. `required` reports the bounded
-  selective plan's estimated model-attempt and selected-conversation counts;
-  it never starts compilation, promotion, Codex, a subagent, or a scheduler.
-  Planner failure is fail-open as `unavailable` and does not prevent the
-  remaining memory context from being returned.
+  metadata for durable Working Memory. In the ChatGPT-first default path,
+  DevSpace never calls CHIM's model-bootstrap planner. Active Working Memory
+  produces `not_required`; empty Working Memory also produces `not_required`
+  with `skip_reason=chatgpt_first_no_model_bootstrap`, zero estimated model
+  attempts, and zero selected conversations. Empty Working Memory is not proof
+  that the project lacks history.
+- `working_memory.confirmation` is a read-only sidecar for project-local
+  rule-like memories. `confirmed` may govern future behavior;
+  `requires_confirmation` must be presented to the user for confirmation before
+  it constrains a current action; `not_applicable` covers memories outside this
+  historical-rule gate. For compatibility with an older CHIM that omits this
+  sidecar, DevSpace fails closed: invariant/preference/decision memories are
+  synthesized as `requires_confirmation`, while other kinds are
+  `not_applicable`.
+- DevSpace instructs the host to apply a Turn Retrieval Gate on every project
+  turn. When the current request depends on a prior project convention not
+  covered by live authoritative state or confirmed memory, the host should use
+  `memory_search` proactively and expand a returned thread only when necessary.
+  Raw historical evidence may inform the answer but cannot silently become a
+  current governing rule.
 - The model-facing memory packet reports `byte_budget`, exact final
   `bytes_used`, and per-section byte/count/truncation telemetry, including
   `sections.pending_memory`. Section

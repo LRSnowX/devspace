@@ -50,6 +50,10 @@ test("memory inspection combines live repository freshness, handoff and CHIM hea
     1,
   );
   assert.match(formatProjectMemoryInspection(inspection), /working items 1 · flagged 1/);
+  assert.match(
+    formatProjectMemoryInspection(inspection),
+    /confirmed rules 0 · needs confirmation 0/,
+  );
   assert.match(formatProjectMemoryInspection(inspection), /pending 1 items\/\d+ bytes/);
   assert.match(
     formatProjectMemoryInspection(inspection),
@@ -133,6 +137,10 @@ function fakeMemory(): MemoryClient {
         class: "operational",
         evidenceStrength: "conversation_only",
         sourceState: "current_by_evidence",
+      }],
+      confirmation: [{
+        memoryId: "current-goal",
+        state: "not_applicable",
       }],
     },
     pendingMemory: {

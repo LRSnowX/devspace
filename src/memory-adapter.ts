@@ -16,8 +16,7 @@ const MAX_PENDING_MEMORY_BOOTSTRAP_BYTES = 3_072;
 export type MemoryToolName = (typeof MEMORY_TOOL_NAMES)[number];
 export type MemoryAdapterToolName =
   | MemoryToolName
-  | "memory_health"
-  | "memory_bootstrap_plan";
+  | "memory_health";
 
 export interface MemoryBootstrapHit {
   conversationId: string;
@@ -83,11 +82,18 @@ export interface MemoryBootstrapWorkingVerification {
   latestProjectEvidenceAt?: number;
 }
 
+export interface MemoryBootstrapWorkingConfirmation {
+  memoryId: string;
+  state: "confirmed" | "requires_confirmation" | "not_applicable";
+  reason?: string;
+}
+
 export interface MemoryBootstrapWorkingMemory {
   project: string;
   generatedAt?: number;
   items: MemoryBootstrapWorkingItem[];
   verification: MemoryBootstrapWorkingVerification[];
+  confirmation: MemoryBootstrapWorkingConfirmation[];
 }
 
 export interface MemoryBootstrapCollaborationMemory {
@@ -364,39 +370,10 @@ export class MemoryAdapter {
       this.config.bootstrapTimeoutMs + 50,
       "Memory bootstrap timed out",
     );
-    const initial = compactMemoryBootstrapContext(
-      result,
-      project,
-      this.config.bootstrapByteBudget,
-    );
-    if (memoryBootstrapSourceCounts(initial).workingItems > 0) {
-      return initial;
-    }
-    let bootstrapStatus: MemoryBootstrapStatus;
-    try {
-      const planOperation = this.call(
-        "memory_bootstrap_plan",
-        {
-          project,
-          max_conversations: 3,
-          max_messages: 8,
-        },
-        { timeoutMs: this.config.bootstrapTimeoutMs },
-      );
-      const plan = await withTimeout(
-        planOperation,
-        this.config.bootstrapTimeoutMs + 50,
-        "Memory bootstrap plan timed out",
-      );
-      bootstrapStatus = compactMemoryBootstrapStatus(plan, project);
-    } catch {
-      bootstrapStatus = unavailableBootstrapStatus(0);
-    }
     return compactMemoryBootstrapContext(
       result,
       project,
       this.config.bootstrapByteBudget,
-      bootstrapStatus,
     );
   }
 }
@@ -440,7 +417,13 @@ export function compactMemoryBootstrapContext(
         selectedConversations: 0,
         skipReason: "active_working_memory_exists",
       }
-    : unavailableBootstrapStatus(0);
+    : {
+        state: "not_required" as const,
+        activeWorkingMemoryItems: 0,
+        estimatedModelAttempts: 0,
+        selectedConversations: 0,
+        skipReason: "chatgpt_first_no_model_bootstrap",
+      };
   const continuationCandidates = Array.isArray(structured.continuations)
     ? structured.continuations.map(compactContinuation)
     : structured.continuation === undefined || structured.continuation === null
@@ -463,6 +446,7 @@ export function compactMemoryBootstrapContext(
         : { generatedAt: workingMemoryCandidate.generatedAt }),
       items: [],
       verification: [],
+      confirmation: [],
     },
     pendingMemory: {
       project: expectedProject,
@@ -500,12 +484,17 @@ export function compactMemoryBootstrapContext(
       (candidate) => candidate.memoryId === item.memoryId,
     ) ?? fallbackWorkingMemoryVerification(item);
     context.workingMemory.verification.push(verification);
+    const confirmation = workingMemoryCandidate.confirmation.find(
+      (candidate) => candidate.memoryId === item.memoryId,
+    ) ?? fallbackWorkingMemoryConfirmation(item);
+    context.workingMemory.confirmation.push(confirmation);
     if (
       byteLength(context.workingMemory) > workingMemoryBudget
       || byteLength(context) > byteBudget
     ) {
       context.workingMemory.items.pop();
       context.workingMemory.verification.pop();
+      context.workingMemory.confirmation.pop();
       context.truncated = true;
       break;
     }
@@ -594,52 +583,6 @@ export function compactMemoryBootstrapContext(
   return context;
 }
 
-function compactMemoryBootstrapStatus(
-  raw: unknown,
-  expectedProject: string,
-): MemoryBootstrapStatus {
-  const result = record(raw);
-  const structured = record(result?.structuredContent);
-  if (
-    !structured
-    || structured.project !== expectedProject
-    || typeof structured.bootstrap_required !== "boolean"
-    || typeof structured.active_working_memory_items !== "number"
-    || !Number.isInteger(structured.active_working_memory_items)
-    || structured.active_working_memory_items < 0
-    || typeof structured.estimated_model_attempts !== "number"
-    || !Number.isInteger(structured.estimated_model_attempts)
-    || structured.estimated_model_attempts < 0
-    || !Array.isArray(structured.selected)
-  ) {
-    throw new Error("Malformed memory bootstrap plan response");
-  }
-  return {
-    state: structured.bootstrap_required ? "required" : "not_required",
-    activeWorkingMemoryItems: structured.active_working_memory_items,
-    estimatedModelAttempts: structured.estimated_model_attempts,
-    selectedConversations: structured.selected.length,
-    ...(typeof structured.source_policy === "string"
-      ? { sourcePolicy: clip(structured.source_policy, 80) }
-      : {}),
-    ...(typeof structured.bootstrap_skip_reason === "string"
-      ? { skipReason: clip(structured.bootstrap_skip_reason, 120) }
-      : {}),
-  };
-}
-
-function unavailableBootstrapStatus(
-  activeWorkingMemoryItems: number,
-): MemoryBootstrapStatus {
-  return {
-    state: "unavailable",
-    activeWorkingMemoryItems,
-    estimatedModelAttempts: 0,
-    selectedConversations: 0,
-    skipReason: "bootstrap_plan_unavailable",
-  };
-}
-
 function dedupeBootstrapHits(
   hits: MemoryBootstrapHit[],
   excludedConversationIds: ReadonlySet<string>,
@@ -706,18 +649,22 @@ function compactWorkingMemory(
 ): MemoryBootstrapWorkingMemory {
   const working = record(value);
   if (!working) {
-    return { project: expectedProject, items: [], verification: [] };
+    return { project: expectedProject, items: [], verification: [], confirmation: [] };
   }
   if (working.project !== expectedProject || !Array.isArray(working.items)) {
     throw new Error("Malformed project working memory");
   }
+  const items = working.items.map(compactWorkingMemoryItem);
   return {
     project: expectedProject,
     ...(typeof working.generated_at === "number" ? { generatedAt: working.generated_at } : {}),
-    items: working.items.map(compactWorkingMemoryItem),
+    items,
     verification: Array.isArray(working.verification)
       ? working.verification.map(compactWorkingMemoryVerification)
       : [],
+    confirmation: Array.isArray(working.confirmation)
+      ? working.confirmation.map(compactWorkingMemoryConfirmation)
+      : items.map(fallbackWorkingMemoryConfirmation),
   };
 }
 
@@ -933,6 +880,39 @@ function compactWorkingMemoryVerification(
   };
 }
 
+function compactWorkingMemoryConfirmation(
+  value: unknown,
+): MemoryBootstrapWorkingConfirmation {
+  const confirmation = record(value);
+  if (
+    !confirmation
+    || typeof confirmation.memory_id !== "string"
+    || !isWorkingMemoryConfirmationState(confirmation.state)
+  ) {
+    throw new Error("Malformed project working memory confirmation");
+  }
+  return {
+    memoryId: clip(confirmation.memory_id, 200),
+    state: confirmation.state,
+    ...(typeof confirmation.reason === "string"
+      ? { reason: clip(confirmation.reason, 600) }
+      : {}),
+  };
+}
+
+function fallbackWorkingMemoryConfirmation(
+  item: MemoryBootstrapWorkingItem,
+): MemoryBootstrapWorkingConfirmation {
+  const ruleLike = ["invariant", "preference", "decision"].includes(item.kind);
+  return {
+    memoryId: item.memoryId,
+    state: ruleLike ? "requires_confirmation" : "not_applicable",
+    reason: ruleLike
+      ? "CHIM confirmation metadata was unavailable; fail closed for rule-like memory"
+      : "memory kind is not governed by historical decision confirmation",
+  };
+}
+
 function fallbackWorkingMemoryVerification(
   item: MemoryBootstrapWorkingItem,
 ): MemoryBootstrapWorkingVerification {
@@ -987,6 +967,14 @@ function isWorkingMemorySourceState(
     || value === "tentative"
     || value === "expired"
     || value === "unavailable";
+}
+
+function isWorkingMemoryConfirmationState(
+  value: unknown,
+): value is MemoryBootstrapWorkingConfirmation["state"] {
+  return value === "confirmed"
+    || value === "requires_confirmation"
+    || value === "not_applicable";
 }
 
 function compactJsonValue(value: unknown, depth: number): unknown {

@@ -157,6 +157,7 @@ export function formatProjectMemoryInspection(inspection: ProjectMemoryInspectio
     const sections = record(context.sections);
     const pendingSection = record(sections?.pending_memory);
     const verification = Array.isArray(working?.verification) ? working.verification : [];
+    const confirmation = Array.isArray(working?.confirmation) ? working.confirmation : [];
     const flagged = verification.filter((entry) => {
       const value = record(entry);
       return value?.host_state === "needs_revalidation"
@@ -172,6 +173,10 @@ export function formatProjectMemoryInspection(inspection: ProjectMemoryInspectio
         + String(Array.isArray(working?.items) ? working.items.length : 0)
         + " · flagged "
         + flagged
+        + " · confirmed rules "
+        + confirmation.filter((entry) => record(entry)?.state === "confirmed").length
+        + " · needs confirmation "
+        + confirmation.filter((entry) => record(entry)?.state === "requires_confirmation").length
         + " · pending "
         + String(pendingSection?.items ?? 0)
         + " items/"

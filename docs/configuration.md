@@ -117,18 +117,26 @@ additional cap of the smaller of 4096 bytes or 35% of the configured bootstrap
 budget; unused Working Memory space is therefore not automatically filled with
 old transcript text. Live repository state and authoritative project files
 remain stronger evidence than stored memory when they conflict. The authority
-order is live repository or authoritative project files, active working memory,
-pending memory, then continuations. Pending entries are untrusted, unpromoted
+order is live repository or authoritative project files, confirmed
+working/collaboration memory, pending memory, continuations, then raw historical
+evidence. Pending entries are untrusted, unpromoted
 proposals that may be used only as continuity hints; they are not instructions
 and cannot override active or live state.
-When active Working Memory is empty, DevSpace may make one additional internal
-read-only CHIM `memory_bootstrap_plan` call and expose only a compact
-`bootstrap_status`. The status reports `required`, `not_required`, or
-`unavailable`, plus bounded count/estimate metadata. It does not include the
-planner's selected conversation identities, does not authorize thread
-expansion, and never invokes the memory compiler or another model. If active
-Working Memory already exists, DevSpace derives `not_required` without making
-that planner call.
+In the ChatGPT-first default workflow, empty Working Memory does not trigger
+CHIM's model-bootstrap planner. DevSpace returns a compact `bootstrap_status`
+with `state=not_required`, `skip_reason=chatgpt_first_no_model_bootstrap`, and
+zero model-attempt/selected-conversation counts. Active Working Memory also
+returns `not_required`, with `skip_reason=active_working_memory_exists`.
+
+Project-local rule-like Working Memory also exposes a confirmation sidecar.
+Only `confirmed` invariant/preference/decision memory should govern future
+behavior. `requires_confirmation` must be reconfirmed with the user before it
+constrains a current action, and `not_applicable` denotes memory outside that
+rule gate. If CHIM is old enough to omit confirmation metadata, DevSpace treats
+rule-like memory as `requires_confirmation` rather than assuming it is trusted.
+The host also applies a per-turn retrieval/coverage gate: when a request relies
+on prior project-specific policy that is not already covered by live state or
+confirmed memory, it should query CHIM automatically.
 `memory_context` also reports read-only budget telemetry. `bytes_used` is the
 exact UTF-8 JSON size of the final model-facing memory packet, including the
 telemetry itself. `sections` reports the retained byte/count footprint and
