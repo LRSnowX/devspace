@@ -104,6 +104,16 @@ const replayedCompleted = await manager.write({
 });
 assert.deepEqual(replayedCompleted, completed);
 
+const replayedCompletedWithInteraction = await manager.write({
+  workspaceId: "workspace-a",
+  sessionId: background.sessionId,
+  chars: "ignored-after-completion\n",
+  columns: 120,
+  rows: 30,
+  yieldTimeMs: 1,
+});
+assert.deepEqual(replayedCompletedWithInteraction, completed);
+
 await new Promise((resolve) => setTimeout(resolve, 1_100));
 await assert.rejects(
   manager.write({

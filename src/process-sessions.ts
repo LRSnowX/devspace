@@ -8,7 +8,7 @@ const DEFAULT_POLL_YIELD_MS = 5_000;
 export const MAX_PROCESS_YIELD_MS = 12_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
 const DEFAULT_BUFFER_CHARACTERS = 1_000_000;
-const COMPLETED_SESSION_TTL_MS = 30 * 60 * 1_000;
+const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
 const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
 
@@ -245,6 +245,10 @@ export class ProcessSessionManager {
 
   async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
     const session = this.getOwnedSession(input.workspaceId, input.sessionId);
+    if (!session.running) {
+      return this.consume(session, input.maxOutputTokens);
+    }
+
     const chars = input.chars ?? "";
     const interactionRequested =
       chars.length > 0 || input.columns !== undefined || input.rows !== undefined;
@@ -398,6 +402,7 @@ export class ProcessSessionManager {
     session.running = false;
     session.exitCode = exitCode;
     session.signal = signal;
+    session.process = undefined;
     session.resolveExit();
     session.cleanupTimer = setTimeout(
       () => this.sessions.delete(session.id),
