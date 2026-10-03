@@ -51,6 +51,10 @@ test("memory inspection combines live repository freshness, handoff and CHIM hea
   );
   assert.match(formatProjectMemoryInspection(inspection), /working items 1 · flagged 1/);
   assert.match(formatProjectMemoryInspection(inspection), /pending 1 items\/\d+ bytes/);
+  assert.match(
+    formatProjectMemoryInspection(inspection),
+    /Bootstrap: not_required · active working 1 · estimated model attempts 0 · selected conversations 0/,
+  );
 });
 
 test("memory inspection still reports repository state when memory is disabled", async (t) => {

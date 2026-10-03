@@ -152,6 +152,7 @@ export function formatProjectMemoryInspection(inspection: ProjectMemoryInspectio
 
   if (inspection.memory.context) {
     const context = inspection.memory.context;
+    const bootstrapStatus = record(context.bootstrap_status);
     const working = record(context.working_memory);
     const sections = record(context.sections);
     const pendingSection = record(sections?.pending_memory);
@@ -177,6 +178,16 @@ export function formatProjectMemoryInspection(inspection: ProjectMemoryInspectio
         + String(pendingSection?.bytes ?? 0)
         + " bytes"
         + (pendingSection?.truncated === true ? " (truncated)" : ""),
+    );
+    lines.push(
+      "Bootstrap: "
+        + String(bootstrapStatus?.state ?? "unknown")
+        + " · active working "
+        + String(bootstrapStatus?.active_working_memory_items ?? "?")
+        + " · estimated model attempts "
+        + String(bootstrapStatus?.estimated_model_attempts ?? "?")
+        + " · selected conversations "
+        + String(bootstrapStatus?.selected_conversations ?? "?"),
     );
   } else {
     lines.push("Handoff: unavailable (" + String(inspection.memory.context_error ?? "unknown") + ")");
