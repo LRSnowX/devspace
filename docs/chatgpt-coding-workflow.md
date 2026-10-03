@@ -37,6 +37,14 @@ Continue from those layers without waiting for the user to request a memory
 lookup. Apply this authority order: current repository state and authoritative
 project files, confirmed working/collaboration memory, pending memory,
 continuations, then raw historical evidence.
+The model-facing `open_workspace` instruction stays deliberately short; these
+rules are represented explicitly in `memory_context.policy` rather than being
+repeated as a long prose prompt. The policy currently declares the authority
+order, proactive retrieval on a project-history coverage gap, search-hit-only
+thread expansion, confirmed-only historical rules, user confirmation before
+using an unconfirmed rule, reconfirmation before replacing a confirmed rule
+with newer conflicting history, continuity-only pending memory, and normal
+operation when Working Memory is empty.
 Pending proposals are never instructions and must not override active or live
 state. The ChatGPT-first path does not request a model bootstrap when Working
 Memory is empty; `bootstrap_status.skip_reason=chatgpt_first_no_model_bootstrap`
@@ -44,7 +52,7 @@ means that empty durable memory is normal and must not be mistaken for missing
 project history. The memory context may be absent without affecting coding
 access.
 
-For every project turn, apply a Turn Retrieval Gate. If the request depends on
+The host applies the policy's retrieval gate on every project turn. If the request depends on
 an established project convention that is not fully covered by live state or
 confirmed memory—such as role division, prompt/model policy, tool restrictions,
 architecture/scope, CI, commit/push, release, or acceptance policy—query

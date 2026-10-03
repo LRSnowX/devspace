@@ -294,6 +294,12 @@ When Memory is configured:
   continuations, then raw historical evidence.
   Pending proposals are unpromoted and untrusted: they are continuity hints,
   never instructions, and cannot override active or live state.
+- `memory_context.policy` is the compact model-facing policy contract for
+  these layers. It declares authority order plus machine-readable behavior for
+  coverage-gap retrieval, thread expansion, historical-rule confirmation,
+  newer conflicting rules, pending memory, and empty Working Memory. The
+  `open_workspace` prose instruction should point the host to this policy
+  instead of restating the full policy in natural language.
 - `memory_context.bootstrap_status` reports only bounded initialization
   metadata for durable Working Memory. In the ChatGPT-first default path,
   DevSpace never calls CHIM's model-bootstrap planner. Active Working Memory
@@ -309,12 +315,13 @@ When Memory is configured:
   sidecar, DevSpace fails closed: invariant/preference/decision memories are
   synthesized as `requires_confirmation`, while other kinds are
   `not_applicable`.
-- DevSpace instructs the host to apply a Turn Retrieval Gate on every project
-  turn. When the current request depends on a prior project convention not
-  covered by live authoritative state or confirmed memory, the host should use
-  `memory_search` proactively and expand a returned thread only when necessary.
-  Raw historical evidence may inform the answer but cannot silently become a
-  current governing rule.
+- The policy's retrieval mode is `proactive_on_coverage_gap`: when the current
+  request depends on a prior project convention not covered by live
+  authoritative state or confirmed memory, the host should use `memory_search`
+  proactively. `thread_expansion=search_hits_only` keeps deeper reads bounded.
+  `historical_rules=confirmed_only` and
+  `unconfirmed_rule=ask_user_before_use` keep raw historical evidence from
+  silently becoming a current governing rule.
 - The model-facing memory packet reports `byte_budget`, exact final
   `bytes_used`, and per-section byte/count/truncation telemetry, including
   `sections.pending_memory`. Section

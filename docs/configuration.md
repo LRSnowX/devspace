@@ -122,6 +122,9 @@ working/collaboration memory, pending memory, continuations, then raw historical
 evidence. Pending entries are untrusted, unpromoted
 proposals that may be used only as continuity hints; they are not instructions
 and cannot override active or live state.
+The same policy is exposed in compact machine-readable form as
+`memory_context.policy`; the model-facing `open_workspace` instruction points
+to that policy instead of restating the full memory workflow in prose.
 In the ChatGPT-first default workflow, empty Working Memory does not trigger
 CHIM's model-bootstrap planner. DevSpace returns a compact `bootstrap_status`
 with `state=not_required`, `skip_reason=chatgpt_first_no_model_bootstrap`, and
@@ -134,9 +137,11 @@ behavior. `requires_confirmation` must be reconfirmed with the user before it
 constrains a current action, and `not_applicable` denotes memory outside that
 rule gate. If CHIM is old enough to omit confirmation metadata, DevSpace treats
 rule-like memory as `requires_confirmation` rather than assuming it is trusted.
-The host also applies a per-turn retrieval/coverage gate: when a request relies
-on prior project-specific policy that is not already covered by live state or
-confirmed memory, it should query CHIM automatically.
+`memory_context.policy.retrieval=proactive_on_coverage_gap` tells the host to
+query CHIM when a request relies on prior project-specific policy not covered
+by live state or confirmed memory. The policy also carries the bounded-thread,
+confirmed-only historical-rule, reconfirm-on-conflict, pending-memory, and
+empty-working-memory semantics.
 `memory_context` also reports read-only budget telemetry. `bytes_used` is the
 exact UTF-8 JSON size of the final model-facing memory packet, including the
 telemetry itself. `sections` reports the retained byte/count footprint and

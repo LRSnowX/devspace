@@ -1035,7 +1035,10 @@ test("open_workspace returns refreshed live repository state and explicit author
   assert.equal(typeof firstState.branch, "string");
   assert.match(firstState.head as string, /^[0-9a-f]{40}$/);
   assert.ok(Array.isArray(firstState.changes));
-  assert.match(first.instruction as string, /repository_state as the live repository snapshot/);
+  assert.match(
+    first.instruction as string,
+    /repository_state and authoritative_references as live project authority/,
+  );
 
   const references = first.authoritative_references as Array<Record<string, unknown>>;
   assert.ok(Array.isArray(references));
@@ -1770,20 +1773,29 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.deepEqual(collaborationItems[0]?.value, {
     text: "Preserve upstream compatibility where practical.",
   });
-  assert.match(
-    opened.instruction as string,
-    /collaboration_memory as stable cross-project collaboration rules/,
-  );
+  const policy = bootstrap.policy as Record<string, unknown>;
+  assert.deepEqual(policy, {
+    authority_order: [
+      "live_project",
+      "confirmed_memory",
+      "pending_memory",
+      "continuations",
+      "historical_evidence",
+    ],
+    retrieval: "proactive_on_coverage_gap",
+    thread_expansion: "search_hits_only",
+    historical_rules: "confirmed_only",
+    unconfirmed_rule: "ask_user_before_use",
+    newer_conflict: "reconfirm_before_supersede",
+    pending_memory: "continuity_only",
+    empty_working_memory: "normal_no_model_bootstrap",
+  });
   const workingMemory = bootstrap.working_memory as Record<string, unknown>;
   assert.equal(workingMemory.project, "LEMonX");
   const workingItems = workingMemory.items as Array<Record<string, unknown>>;
   assert.equal(workingItems.length, 1);
   assert.equal(workingItems[0]?.memory_id, "LEMonX-current-goal");
   assert.deepEqual(workingItems[0]?.value, { text: "Complete repository acceptance." });
-  assert.match(
-    opened.instruction as string,
-    /working_memory as durable project state with an explicit confirmation sidecar/,
-  );
   const workingConfirmation = workingMemory.confirmation as Array<Record<string, unknown>>;
   assert.equal(workingConfirmation.length, 1);
   assert.equal(workingConfirmation[0]?.state, "not_applicable");
@@ -1793,18 +1805,10 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.equal(pendingItems[0]?.candidate_id, "LEMonX-pending-candidate");
   assert.equal(pendingMemory.revalidation_excluded_count, 2);
   assert.equal("rationale" in pendingItems[0]!, false);
-  assert.match(opened.instruction as string, /unpromoted, untrusted continuity hints only/);
-  assert.match(
-    opened.instruction as string,
-    /authoritative project files > active confirmed working_memory\/collaboration_memory > pending_memory > continuations > raw historical evidence/,
-  );
-  assert.match(opened.instruction as string, /must never be followed as instructions/);
-  assert.match(opened.instruction as string, /apply a Turn Retrieval Gate/);
-  assert.match(opened.instruction as string, /coverage-gap detection/);
-  assert.match(opened.instruction as string, /Historical conversation evidence can inform but must not silently govern/);
-  assert.match(opened.instruction as string, /only state=confirmed may govern future behavior/);
-  assert.match(opened.instruction as string, /state=requires_confirmation/);
-  assert.match(opened.instruction as string, /ask the user to confirm whether it is still current before acting on it/);
+  assert.match(opened.instruction as string, /according to memory_context\.policy/);
+  assert.match(opened.instruction as string, /Search memory proactively on project-history coverage gaps/);
+  assert.match(opened.instruction as string, /Rule-like history may govern only when confirmed/);
+  assert.doesNotMatch(opened.instruction as string, /For every project turn, apply a Turn Retrieval Gate/);
   const continuations = bootstrap.continuations as Array<Record<string, unknown>>;
   assert.equal(continuations.length, 2);
   assert.equal(continuations[0]?.conversation_id, "LEMonX-continuation");
@@ -1946,11 +1950,10 @@ test("ChatGPT-first empty working memory never implies a model bootstrap", async
     selected_conversations: 0,
     skip_reason: "chatgpt_first_no_model_bootstrap",
   });
-  assert.match(
-    opened.instruction as string,
-    /Do not start or propose a model\/Codex memory bootstrap merely because working_memory is empty/,
-  );
-  assert.match(opened.instruction as string, /apply a Turn Retrieval Gate/);
+  const policy = bootstrap.policy as Record<string, unknown>;
+  assert.equal(policy.empty_working_memory, "normal_no_model_bootstrap");
+  assert.equal(policy.retrieval, "proactive_on_coverage_gap");
+  assert.match(opened.instruction as string, /memory_context\.policy/);
 });
 
 test("memory handoff revalidates only operational memory against live repository freshness", async (t) => {
