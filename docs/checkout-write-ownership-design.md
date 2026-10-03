@@ -118,6 +118,10 @@ Behavior:
 - resolve and validate the workspace normally;
 - derive its canonical root;
 - fail closed if that root is in unresolved ownership recovery;
+- if destructive retention currently holds a live guard for the root, return
+  `WRITE_OWNERSHIP_BUSY` without waiting;
+- if the destructive-retention guard is stale, corrupt, or cannot be verified
+  safely, return `WRITE_OWNERSHIP_RECOVERY_REQUIRED`;
 - if unowned, assign ownership to this workspace;
 - if already owned by this workspace, succeed idempotently;
 - if owned by another workspace, return a structured conflict;
@@ -173,6 +177,13 @@ not_owned
 
 This snapshot is informational and may become stale immediately. Every
 mutation-capable operation must re-check authoritative ownership state.
+
+The snapshot describes **write ownership**, not every root-lifecycle blocker.
+Checkpoint A does not add a `retention_in_progress` model-facing ownership
+state. A root may therefore be ownership-`unowned` while a short-lived
+destructive-retention guard makes a subsequent acquire return
+`WRITE_OWNERSHIP_BUSY`. This keeps lifecycle exclusion separate from the Host
+ownership model.
 
 The model-facing instruction should stay short:
 
@@ -358,10 +369,23 @@ Conceptually:
   write-ownership/
     <canonical-root-hash>.json
     <canonical-root-hash>.mutex
+    <canonical-root-hash>.retention.json
 ```
 
 The concrete filenames are implementation details and are not exposed as model
 choices.
+
+The optional retention record is a **destructive-retention guard**, not a
+second owner. It exists only while retention is performing a destructive
+filesystem lifecycle operation on that canonical root. Its purpose is to close
+the cross-process race between "verified unowned" and an asynchronous worktree
+deletion without holding the transition mutex for the duration of that
+deletion.
+
+Conceptually, the guard records only the information needed to identify the
+root, the exact guard instance, the destructive operation, its start time, and
+executor-liveness evidence. It does not contain a workspace owner and is not a
+model-facing authority state.
 
 The persisted record includes only state needed for coordination and
 diagnostics, conceptually:
@@ -400,7 +424,32 @@ Required atomic transitions include:
 - release ownership;
 - begin active mutation;
 - end active mutation;
-- operator recovery.
+- operator recovery;
+- begin destructive retention;
+- end destructive retention.
+
+The mutex remains short-lived. In particular, retention **must not** hold the
+transition mutex across `git worktree remove`, recursive filesystem removal,
+provider execution, or any other long-running asynchronous operation.
+
+Instead, destructive retention uses this sequence:
+
+1. under the root transition mutex, verify that the root has no ownership,
+   active mutation, or existing destructive-retention guard;
+2. atomically publish a guard for that exact canonical root and release the
+   mutex;
+3. perform the destructive retention operation without holding the mutex;
+4. on a known-safe terminal outcome, reacquire the mutex and remove only the
+   exact guard instance that started the operation.
+
+`acquire` and `beginMutation` check for a destructive-retention guard under the
+same root mutex. Therefore acquisition and destructive-retention start race as
+one atomic decision: exactly one side may proceed.
+
+A live guard makes new mutation authority temporarily unavailable. DevSpace
+does not wait or queue for it. A stale, corrupt, or executor-ambiguous guard
+fails closed and requires operator recovery; it is never removed merely because
+it is old.
 
 The implementation should reuse the existing daemon-lock design principles:
 
@@ -438,17 +487,21 @@ Checkpoint A adds typed errors to the common tool-error contract:
 
 - category: `conflict`
 - retryable: `true`
-- meaning: release or operator recovery cannot proceed because one or more
-  active mutations remain;
+- meaning: the requested ownership/lifecycle transition cannot proceed because
+  active mutation-capable work or a live destructive-retention guard is still
+  in progress;
 - may include active mutation kinds, count, and start times;
-- does not prevent the owning workspace from starting another mutation.
+- does not create a wait/queue and does not transfer authority;
+- an owner's existing right to start another same-owner mutation is unchanged
+  unless destructive retention already holds the root guard.
 
 ### `WRITE_OWNERSHIP_RECOVERY_REQUIRED`
 
 - category: `recovery`
 - retryable: `false`
 - meaning: persisted ownership state is ambiguous, corrupt, or contains stale
-  mutation evidence that DevSpace cannot safely resolve automatically;
+  mutation/retention evidence that DevSpace cannot safely resolve
+  automatically;
 - host action: stop mutation and use explicit operator recovery.
 
 Existing workspace/path/recovery errors keep their existing meaning. Acquiring
@@ -530,6 +583,14 @@ An undecodable/ambiguous record fails closed. Checkpoint A does not expose a
 model-facing force takeover and does not add a routine `--force-active`
 escape hatch.
 
+The same operator surface also diagnoses destructive-retention guards. A live
+retention executor makes recovery refuse. A dead executor is not by itself
+sufficient: recovery may clear the guard only when the root lifecycle can be
+classified as safe and the recorded executor evidence is complete enough to
+exclude a still-running destructive child. If the worktree deletion may be
+partial, executor evidence is incomplete, or filesystem identity is ambiguous,
+recovery leaves the guard in place for manual inspection.
+
 Manual intervention remains possible for an operator after inspecting the
 state, but that is outside normal model workflow.
 
@@ -580,6 +641,33 @@ An inactive/stale workspace record does not automatically release ownership.
 Managed-worktree retention must not delete a root while that root has active
 write ownership or an active mutation. A stale ownership claim must be
 recovered explicitly before destructive retention of that root.
+
+A pre-delete ownership check by itself is insufficient because another process
+could acquire ownership after the check and before asynchronous deletion. For
+managed-worktree deletion, retention must first publish the
+destructive-retention guard described above under the same canonical-root
+transition mutex used by ownership acquisition.
+
+While that guard exists:
+
+- ownership acquisition for the same canonical root is refused immediately;
+- existing read-only metadata inspection may continue where the underlying root
+  remains accessible;
+- DevSpace does not auto-wait, auto-transfer authority, or create another
+  worktree;
+- normal completion or a known-safe skipped outcome removes the exact guard;
+- a crash or ambiguous partial deletion leaves the guard fail-closed for
+  explicit operator recovery.
+
+The guard spans the destructive worktree lifecycle, including any compensation
+needed to restore a worktree after persistence failure. It must not be cleared
+between physical deletion and the terminal persistence/compensation outcome.
+
+Metadata-only retention should continue to use its existing transactional
+staleness checks. It must not delete the persisted workspace record that is the
+current ownership claimant; if a metadata path can race with ownership without
+such a transactional check, it must participate in the same destructive guard
+protocol rather than adding a check-then-delete exception.
 
 Workspace invalidation never retargets an existing ownership record to a new
 filesystem identity.
@@ -632,10 +720,16 @@ release(canonicalRoot, workspaceId)
 beginMutation(canonicalRoot, workspaceId, kind)
 endMutation(activity)
 recover(canonicalRoot)
+beginDestructiveRetention(canonicalRoot, kind)
+endDestructiveRetention(guard)
 ```
 
 Handlers consume this interface. They do not implement ownership policy
 independently.
+
+The destructive-retention seam is operator/lifecycle-facing, not model-facing.
+It is a persisted exclusion reservation around root destruction, not write
+ownership and not a scheduler.
 
 The local-agent daemon and MCP server instantiate the same store contract
 against the same `stateDir`.
@@ -713,6 +807,22 @@ Checkpoint A is not accepted without all applicable cases below.
 - corrupt/partial state -> recovery required, not deletion;
 - secure file/directory permissions are enforced where supported.
 
+### Destructive retention
+
+- ownership A present -> retention cannot publish a destructive guard or delete
+  the root;
+- retention guard present -> ownership acquisition cannot succeed;
+- acquire racing retention-start across separate processes -> exactly one wins;
+- transition mutex is released before asynchronous deletion begins;
+- normal deletion removes only its exact guard instance;
+- a safe skipped cleanup removes its guard without changing ownership state;
+- crash during deletion preserves the guard across restart;
+- live/ambiguous destructive executor -> operator recovery refuses;
+- ambiguous partial deletion -> operator recovery refuses;
+- persistence failure followed by compensation keeps the guard until the
+  compensation path reaches a terminal known-safe outcome;
+- no age-based guard expiry, background takeover, or automatic retry is added.
+
 ### Recovery
 
 - abandoned ownership with no active mutation can be operator-recovered;
@@ -726,6 +836,8 @@ Checkpoint A is not accepted without all applicable cases below.
 - persistent second workspace binding alone is not a conflict;
 - workspace invalidation does not transfer ownership;
 - managed-worktree retention cannot delete a root with active ownership;
+- managed-worktree retention and ownership acquisition have no check-then-delete
+  race;
 - worktree parallelism remains available through separate canonical roots.
 
 ### Real host path
@@ -778,7 +890,9 @@ Checkpoint A implementation is Repository Accepted only when:
 14. no provider-specific ownership model leaks into the core domain contract;
 15. real ChatGPT MCP acceptance demonstrates conflict and worktree escape
     behavior;
-16. the feature can later be removed in favor of a compatible upstream
+16. destructive managed-worktree retention cannot race a new ownership acquire,
+    and does not hold the transition mutex across deletion;
+17. the feature can later be removed in favor of a compatible upstream
     capability without rewriting workspace identity.
 
 Only after this design is accepted should implementation begin.
