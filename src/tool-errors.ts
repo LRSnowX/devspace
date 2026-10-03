@@ -1,5 +1,6 @@
 import * as z from "zod/v4";
 import { WriteOwnershipError } from "./write-ownership.js";
+import { AgentOwnershipError } from "./local-agent-errors.js";
 
 export const TOOL_ERROR_CODES = [
   "PATCH_INVALID",
@@ -94,6 +95,7 @@ export function isToolOperationError(error: unknown): error is ToolOperationErro
 }
 
 export function toolErrorPayload(error: unknown): ToolErrorPayload | undefined {
+  if (error instanceof AgentOwnershipError) return error.payload;
   if (error instanceof WriteOwnershipError) {
     return {
       code: error.code,

@@ -1,5 +1,6 @@
 import type { Result as BetterResult } from "better-result";
 import type { ServerConfig } from "./config.js";
+import { WriteOwnership } from "./write-ownership.js";
 import {
   cleanupManagedWorktrees,
   DEFAULT_MANAGED_WORKTREE_RETENTION_MS,
@@ -23,6 +24,7 @@ export async function pruneStaleManagedWorktrees(
   let closed!: BetterResult<void, WorkspaceStoreError>;
   try {
     result = await cleanupManagedWorktrees({
+      writeOwnership: new WriteOwnership(config.stateDir),
       store: opened.value,
       worktreeRoot: config.worktreeRoot,
       allowedRoots: config.allowedRoots,

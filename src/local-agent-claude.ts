@@ -161,6 +161,7 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
             }
           }
           if (record?.type !== "result") continue;
+          callbacks?.onTurnTerminal?.();
 
           const resultError = claudeResultError(record);
           if (resultError) {

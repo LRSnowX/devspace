@@ -1,6 +1,7 @@
 import type { Result } from "better-result";
 import type { AgentProviderError } from "./local-agent-errors.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import type { MutationExecutors } from "./write-ownership.js";
 
 export type LocalAgentWriteMode = "read_only" | "allowed" | "full_access";
 
@@ -29,6 +30,8 @@ export interface LocalAgentRunCallbacks {
    * could otherwise fail and lose that identity.
    */
   onSessionId?: (providerSessionId: string) => void | Promise<void>;
+  /** An acknowledged terminal turn, not a transport error or cancel request. */
+  onTurnTerminal?: () => void;
 }
 
 export interface LocalAgentRuntimeContext {
@@ -40,6 +43,7 @@ export interface LocalAgentRuntimeContext {
   model?: string;
   effort?: string;
   agentDir?: string;
+  onExecutors?: (executors: MutationExecutors) => void;
 }
 
 /**
@@ -56,6 +60,7 @@ export interface LocalAgentRuntime {
   releaseSession(providerSessionId: string): Promise<void>;
   close(): Promise<void>;
   isAlive(): boolean;
+  executorEvidence?(): MutationExecutors;
 }
 
 export interface LocalAgentDriver {

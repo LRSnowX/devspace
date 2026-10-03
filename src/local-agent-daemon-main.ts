@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { loadConfig } from "./config.js";
+import { WriteOwnership } from "./write-ownership.js";
 import { createLocalAgentDrivers } from "./local-agent-adapters.js";
 import { loadLocalAgentProfiles } from "./local-agent-profiles.js";
 import { LocalAgentDaemon, writeLocalAgentDaemonLog } from "./local-agent-daemon.js";
@@ -22,6 +23,7 @@ const log = (
 ) => writeLocalAgentDaemonLog(paths, level, event, fields);
 const store = new LocalAgentStore(paths.stateDir);
 const manager = new LocalAgentManager({
+  writeOwnership: new WriteOwnership(config.stateDir),
   store,
   drivers: createLocalAgentDrivers({ subagents: config.subagents }),
   pool: new LocalAgentRuntimePool({ logger: log }),

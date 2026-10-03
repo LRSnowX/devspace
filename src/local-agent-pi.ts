@@ -85,6 +85,7 @@ export class PiSessionRuntime implements LocalAgentRuntime {
         this.collectingEvents = true;
         try {
           await this.session.prompt(input.prompt);
+          callbacks?.onTurnTerminal?.();
         } finally {
           this.collectingEvents = false;
         }

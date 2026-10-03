@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { WriteOwnership } from "./write-ownership.js";
+import { writeOwnershipPaths } from "./write-ownership-store.js";
 import { execFile, execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform } from "node:os";
@@ -26,6 +28,7 @@ test("stale clean worktrees at their base are removed without recovery refs", as
 
   const result = unwrap(await cleanupManagedWorktrees({
     store: fixture.store,
+    writeOwnership: fixture.ownership,
     worktreeRoot: fixture.worktreeRoot,
     allowedRoots: [fixture.root],
     staleBefore: futureCutoff(),
@@ -34,6 +37,7 @@ test("stale clean worktrees at their base are removed without recovery refs", as
   assert.equal(result.removed.length, 1);
   assert.equal(result.removed[0]?.recoverySha, undefined);
   assert.equal(await pathExists(fixture.worktreePath), false);
+  assert.equal(await pathExists(writeOwnershipPaths(join(fixture.root, "state"), await realpath(fixture.worktreeRoot) + "/ws_clean").retention), false);
   assert.equal(fixture.store.getSession("ws_clean")?.status, "pruned");
   assert.equal(fixture.store.getSession("ws_clean")?.recoveryKind, undefined);
   await assert.rejects(() => git(
@@ -60,6 +64,7 @@ test("detached commits remain reachable through a recovery ref", async (t) => {
 
   const result = unwrap(await cleanupManagedWorktrees({
     store: fixture.store,
+    writeOwnership: fixture.ownership,
     worktreeRoot: fixture.worktreeRoot,
     allowedRoots: [fixture.root],
     staleBefore: futureCutoff(),
@@ -89,6 +94,7 @@ test("tracked worktree changes are snapshotted before cleanup", async (t) => {
 
   const result = unwrap(await cleanupManagedWorktrees({
     store: fixture.store,
+    writeOwnership: fixture.ownership,
     worktreeRoot: fixture.worktreeRoot,
     allowedRoots: [fixture.root],
     staleBefore: futureCutoff(),
@@ -119,6 +125,7 @@ test("non-ignored untracked files keep a stale worktree alive", async (t) => {
 
   const result = unwrap(await cleanupManagedWorktrees({
     store: fixture.store,
+    writeOwnership: fixture.ownership,
     worktreeRoot: fixture.worktreeRoot,
     allowedRoots: [fixture.root],
     staleBefore: futureCutoff(),
@@ -134,6 +141,7 @@ test("patch recovery protects a stale managed worktree from cleanup", async (t) 
 
   const result = unwrap(await cleanupManagedWorktrees({
     store: fixture.store,
+    writeOwnership: fixture.ownership,
     worktreeRoot: fixture.worktreeRoot,
     allowedRoots: [fixture.root],
     staleBefore: futureCutoff(),
@@ -155,6 +163,7 @@ test("ignored worktree files are discarded during cleanup", async (t) => {
 
   const result = unwrap(await cleanupManagedWorktrees({
     store: fixture.store,
+    writeOwnership: fixture.ownership,
     worktreeRoot: fixture.worktreeRoot,
     allowedRoots: [fixture.root],
     staleBefore: futureCutoff(),
@@ -170,6 +179,7 @@ test("missing worktree directories only clear stale persisted sessions", async (
 
   const result = unwrap(await cleanupManagedWorktrees({
     store: fixture.store,
+    writeOwnership: fixture.ownership,
     worktreeRoot: fixture.worktreeRoot,
     allowedRoots: [fixture.root],
     staleBefore: futureCutoff(),
@@ -192,6 +202,7 @@ test("one broken stale session does not block cleanup of another", async (t) => 
 
   const result = unwrap(await cleanupManagedWorktrees({
     store: fixture.store,
+    writeOwnership: fixture.ownership,
     worktreeRoot: fixture.worktreeRoot,
     allowedRoots: [fixture.root],
     staleBefore: futureCutoff(),
@@ -204,11 +215,13 @@ test("one broken stale session does not block cleanup of another", async (t) => 
 });
 
 test("prune persistence failure restores the removed worktree", async (t) => {
+  let checkGuard = () => {};
   class FailPruneStore extends SqliteWorkspaceStore {
     override markSessionPruned(
       id: string,
       _recoveryKind?: WorkspaceRecoveryKind,
     ): BetterResult<void, WorkspaceStoreError> {
+      checkGuard();
       return Result.err(new WorkspaceStoreError(
         "mark_session_pruned",
         new Error("injected persistence failure"),
@@ -220,10 +233,16 @@ test("prune persistence failure restores the removed worktree", async (t) => {
   const fixture = await worktreeFixture(t, "ws_store_failure", {
     createStore: (stateDir) => new FailPruneStore(stateDir),
   });
+  const canonicalRoot = await realpath(fixture.worktreePath);
+  checkGuard = () => {
+    assert.ok(fixture.ownership.diagnostics(canonicalRoot).retention);
+    assert.throws(() => fixture.ownership.acquire(canonicalRoot, "ws_new"), /Destructive retention/);
+  };
   await writeFile(join(fixture.worktreePath, "README.md"), "recover me\n");
 
   const result = unwrap(await cleanupManagedWorktrees({
     store: fixture.store,
+    writeOwnership: fixture.ownership,
     worktreeRoot: fixture.worktreeRoot,
     allowedRoots: [fixture.root],
     staleBefore: futureCutoff(),
@@ -234,6 +253,7 @@ test("prune persistence failure restores the removed worktree", async (t) => {
   assert.equal(await pathExists(fixture.worktreePath), true);
   assert.equal(await git(fixture.worktreePath, ["status", "--short"]), "M README.md");
   assert.equal(fixture.store.getSession("ws_store_failure")?.status, "active");
+  assert.equal(fixture.ownership.diagnostics(canonicalRoot).retention, undefined);
 });
 
 test("failed prune compensation leaves the session pruned for later recovery", async (t) => {
@@ -268,11 +288,13 @@ test("failed prune compensation leaves the session pruned for later recovery", a
       return store;
     },
   });
+  const canonicalRoot = await realpath(fixture.worktreePath);
   store.sourceRoot = fixture.sourceRoot;
   await writeFile(join(fixture.worktreePath, "README.md"), "recover later\n");
 
   const result = unwrap(await cleanupManagedWorktrees({
     store: fixture.store,
+    writeOwnership: fixture.ownership,
     worktreeRoot: fixture.worktreeRoot,
     allowedRoots: [fixture.root],
     staleBefore: futureCutoff(),
@@ -283,6 +305,32 @@ test("failed prune compensation leaves the session pruned for later recovery", a
   assert.equal(await pathExists(fixture.worktreePath), false);
   assert.equal(fixture.store.getSession("ws_failed_compensation")?.status, "pruned");
   assert.equal(fixture.store.getSession("ws_failed_compensation")?.recoveryKind, "stash");
+  assert.ok(fixture.ownership.diagnostics(canonicalRoot).retention);
+  assert.throws(() => fixture.ownership.acquire(canonicalRoot, "ws_other"), /Destructive retention/);
+});
+
+test("ownership and recovery state protect a stale worktree; a safe skip clears only its guard", async (t) => {
+  const fixture = await worktreeFixture(t, "ws_owned");
+  const root = await realpath(fixture.worktreePath);
+  fixture.ownership.acquire(root, "ws_owner");
+  const cleanup = () => cleanupManagedWorktrees({ store: fixture.store, writeOwnership: fixture.ownership,
+    worktreeRoot: fixture.worktreeRoot, allowedRoots: [fixture.root], staleBefore: futureCutoff() });
+  assert.deepEqual(unwrap(await cleanup()).skipped, [{ workspaceId: "ws_owned", reason: "write_ownership_present" }]);
+  assert.equal(await pathExists(fixture.worktreePath), true);
+  const activity = fixture.ownership.beginMutation(root, "ws_owner", "subagent_turn");
+  assert.equal(unwrap(await cleanup()).removed.length, 0);
+  fixture.ownership.endMutation(activity);
+  fixture.ownership.release(root, "ws_owner");
+  await writeFile(join(fixture.worktreePath, "untracked.txt"), "keep");
+  assert.equal(unwrap(await cleanup()).skipped[0]?.reason, "untracked_files");
+  assert.equal(fixture.ownership.diagnostics(root).retention, undefined);
+  const guard = fixture.ownership.beginDestructiveRetention(root, "managed_worktree", { processIds: [process.pid], complete: false });
+  const ambiguous = new WriteOwnership(join(fixture.root, "state"), { processLiveness: () => "unknown" });
+  const protectedResult = unwrap(await cleanupManagedWorktrees({ store: fixture.store, writeOwnership: ambiguous,
+    worktreeRoot: fixture.worktreeRoot, allowedRoots: [fixture.root], staleBefore: futureCutoff() }));
+  assert.equal(protectedResult.skipped[0]?.reason, "write_ownership_recovery_required");
+  assert.equal(await pathExists(fixture.worktreePath), true);
+  fixture.ownership.endDestructiveRetention(guard);
 });
 
 test("restore rejects a pruned worktree path through an escaping symlink", async (t) => {
@@ -336,6 +384,7 @@ test("cleanup rejects a managed worktree path replaced by a symlink", { skip: pl
 
   const result = unwrap(await cleanupManagedWorktrees({
     store: fixture.store,
+    writeOwnership: fixture.ownership,
     worktreeRoot: fixture.worktreeRoot,
     allowedRoots: [fixture.root],
     staleBefore: futureCutoff(),
@@ -347,6 +396,7 @@ test("cleanup rejects a managed worktree path replaced by a symlink", { skip: pl
 });
 
 interface WorktreeFixture {
+  ownership: WriteOwnership;
   root: string;
   sourceRoot: string;
   worktreeRoot: string;
@@ -395,7 +445,7 @@ async function worktreeFixture(
     await rm(root, { recursive: true, force: true });
   });
 
-  return { root, sourceRoot, worktreeRoot, worktreePath, store };
+  return { root, sourceRoot, worktreeRoot, worktreePath, store, ownership: new WriteOwnership(stateDir) };
 }
 
 function futureCutoff(): Date {

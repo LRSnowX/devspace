@@ -124,6 +124,7 @@ export class LocalAgentRuntimePool {
       }
     };
     const callbacks: LocalAgentRunCallbacks = {
+      onTurnTerminal: inputCallbacks?.onTurnTerminal,
       onSessionId: async (providerSessionId) => {
         const reservationError = await reserveSession(providerSessionId);
         if (reservationError) throw reservationError;
@@ -134,6 +135,7 @@ export class LocalAgentRuntimePool {
     try {
       const inputReservationError = await reserveSession(input.providerSessionId ?? "");
       if (inputReservationError) return Result.err(inputReservationError);
+      context.onExecutors?.(runtime.executorEvidence?.() ?? { processIds: [process.pid], complete: false });
       const result = await runtime.run(input, callbacks);
       if (result.isErr()) {
         if (!runtime.isAlive()) {

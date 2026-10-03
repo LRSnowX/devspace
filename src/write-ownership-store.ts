@@ -10,6 +10,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
   realpathSync,
   renameSync,
   unlinkSync,
@@ -80,6 +81,31 @@ const mutexSchema = z
   })
   .strict();
 
+const retentionSchema = z
+  .object({
+    schema_version: z.literal(1),
+    canonical_root: z.string().min(1),
+    guard_id: z.string().uuid(),
+    kind: z.enum(["managed_worktree", "workspace_metadata"]),
+    started_at: z.iso.datetime(),
+    executor_processes: z.array(pidSchema),
+    executor_processes_complete: z.boolean(),
+    root_identity: z
+      .object({ dev: z.string(), ino: z.string() })
+      .strict()
+      .nullable(),
+  })
+  .strict()
+  .refine(
+    (record) =>
+      new Set(record.executor_processes).size ===
+        record.executor_processes.length &&
+      (!record.executor_processes_complete ||
+        record.executor_processes.length > 0),
+  );
+
+export type DestructiveRetentionRecord = z.infer<typeof retentionSchema>;
+
 export type WriteOwnershipRecord = z.infer<typeof ownershipSchema>;
 export type MutationKind = z.infer<typeof kindSchema>;
 export type ProcessLiveness = "live" | "dead" | "unknown";
@@ -135,6 +161,7 @@ export function writeOwnershipPaths(stateDir: string, canonicalRoot: string) {
   return {
     directory,
     state: join(directory, `${hash}.json`),
+    retention: join(directory, `${hash}.retention.json`),
     mutex: join(directory, `${hash}.mutex`),
     recoveryGate: join(directory, `${hash}.recovery`),
     hash,
@@ -144,6 +171,7 @@ export function writeOwnershipPaths(stateDir: string, canonicalRoot: string) {
 /** Short, nonwaiting transitions. The filesystem mutex reserves no write
  * authority; the atomically replaced JSON record does. No age-based reclamation. */
 export class WriteOwnershipStore {
+  private readonly retentionSnapshots = new WeakMap<DestructiveRetentionRecord, Snapshot>();
   private readonly stateDir: string;
   private readonly platform: NodeJS.Platform;
   readonly processLiveness: (pid: number) => ProcessLiveness;
@@ -174,14 +202,151 @@ export class WriteOwnershipStore {
         "Unfinished ownership transition requires explicit recovery.",
       );
     }
-    return this.readState(paths.state, root).record;
+    const guard = this.readRetention(root);
+    if (guard && this.retentionLiveness(guard) !== "live")
+      throw recoveryError("Unfinished destructive retention requires explicit recovery.");
+    const record = this.readState(paths.state, root).record;
+    if (guard && record) throw recoveryError("Ownership and destructive retention coexist unexpectedly.");
+    return record;
+  }
+
+  readRetention(root: string): DestructiveRetentionRecord | undefined {
+    const snapshot = readSnapshot(this.paths(root).retention);
+    if (!snapshot) return undefined;
+    try {
+      const guard = retentionSchema.parse(JSON.parse(snapshot.content));
+      if (guard.canonical_root !== root)
+        throw new Error("Retention root mismatch");
+      this.retentionSnapshots.set(guard, snapshot);
+      return guard;
+    } catch (error) {
+      throw recoveryError("Undecodable or mismatched retention guard.", error);
+    }
+  }
+
+  retentionLiveness(guard: DestructiveRetentionRecord): ProcessLiveness {
+    const states = guard.executor_processes.map((pid) =>
+      this.processLiveness(pid),
+    );
+    if (states.includes("live")) return "live";
+    if (
+      !guard.executor_processes_complete ||
+      states.length === 0 ||
+      states.includes("unknown")
+    )
+      return "unknown";
+    return "dead";
+  }
+
+  /** Called only within transition/recovery's short root mutex. */
+  replaceRetention(
+    root: string,
+    next: DestructiveRetentionRecord | undefined,
+    expected?: DestructiveRetentionRecord,
+  ): void {
+    const paths = this.paths(root);
+    const before = expected ? this.retentionSnapshots.get(expected) : undefined;
+    if (expected && !before)
+      throw recoveryError("Retention guard was not inspected by this store.");
+    assertExactFile(paths.retention, before);
+    const mutex = this.readMutex(paths.mutex, root, "transition");
+    if (!mutex || mutex.record.pid !== process.pid)
+      throw recoveryError("Retention transition has no root mutex.");
+    const staged = join(paths.directory, mutex.record.staged_file);
+    try {
+      if (next) {
+        const decoded = retentionSchema.parse(next);
+        if (decoded.canonical_root !== root)
+          throw recoveryError("Retention root mismatch.");
+        writeFileSync(staged, `${JSON.stringify(decoded)}\n`, {
+          flag: "wx",
+          mode: 0o600,
+        });
+        this.options.beforePublish?.();
+        assertExactFile(paths.retention, before);
+        assertExactFile(mutex.path, mutex.snapshot);
+        // POSIX atomic replacement; on Windows a failed replacement preserves
+        // the guard. Do not retire it before a successful update.
+        renameSync(staged, paths.retention);
+      } else if (before) {
+        this.options.beforePublish?.();
+        assertExactFile(paths.retention, before);
+        assertExactFile(mutex.path, mutex.snapshot);
+        renameSync(paths.retention, staged);
+        unlinkSync(staged);
+      }
+    } finally {
+      removeIfPresent(staged);
+    }
+  }
+
+  /** Operator-only diagnostics: malformed entries remain visible, never reaped. */
+  list() {
+    const directory = join(this.stateDir, "write-ownership");
+    ensureSecureDirectory(directory);
+    const roots = new Set<string>();
+    const errors: Array<{ path: string; error: string }> = [];
+    for (const name of readdirSync(directory).sort()) {
+      const path = join(directory, name);
+      try {
+        const raw = JSON.parse(readSnapshot(path)!.content) as {
+          canonical_root?: unknown;
+        };
+        if (typeof raw.canonical_root !== "string")
+          throw new Error("Missing canonical root");
+        const paths = this.paths(raw.canonical_root);
+        if (
+          ![
+            paths.state,
+            paths.retention,
+            paths.mutex,
+            paths.recoveryGate,
+          ].includes(path)
+        )
+          throw new Error("Unexpected recovery artifact or root hash mismatch");
+        roots.add(raw.canonical_root);
+      } catch (error) {
+        errors.push({
+          path,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    return { roots: [...roots].sort(), errors };
   }
 
   transition<T>(
     root: string,
     operation: (record: WriteOwnershipRecord | undefined) => Transition<T>,
   ): T {
-    return this.withMutex(root, false, operation);
+    return this.withMutex(root, false, (record) => {
+      const guard = this.readRetention(root);
+      if (guard && record)
+        throw recoveryError(
+          "Ownership and destructive retention coexist unexpectedly.",
+        );
+      if (guard) {
+        if (this.retentionLiveness(guard) === "live")
+          throw busyError("Destructive retention is in progress.");
+        throw recoveryError(
+          "Destructive retention requires explicit recovery.",
+        );
+      }
+      return operation(record);
+    });
+  }
+
+  retentionTransition<T>(
+    root: string,
+    operation: (record: WriteOwnershipRecord | undefined) => Transition<T>,
+  ): T {
+    return this.withMutex(root, false, (record) => {
+      if (record && this.readRetention(root))
+        throw recoveryError(
+          "Ownership and destructive retention coexist unexpectedly.",
+        );
+      return operation(record);
+    });
   }
 
   recover<T>(

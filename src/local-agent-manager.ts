@@ -1,7 +1,15 @@
 import { resolve } from "node:path";
+import { realpathSync } from "node:fs";
+import {
+  WriteOwnership,
+  WriteOwnershipError,
+  type MutationActivity,
+} from "./write-ownership.js";
 import { Result, type Result as BetterResult } from "better-result";
 import {
   AgentConflictError,
+  AgentOwnershipError,
+  agentOwnershipError,
   AgentScopeError,
   AgentStoreError,
   AgentTargetError,
@@ -31,7 +39,7 @@ import {
   type LocalAgentWriteMode,
 } from "./local-agent-runtime.js";
 import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
-import { assertAllowedPath } from "./roots.js";
+import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
 import {
   isSubagentProviderEnabled,
   type SubagentsConfig,
@@ -58,6 +66,7 @@ export interface LocalAgentManagerLogger {
 }
 
 export interface LocalAgentManagerOptions {
+  writeOwnership: WriteOwnership;
   store: LocalAgentStore;
   drivers: readonly LocalAgentDriver[];
   pool: LocalAgentRuntimePool;
@@ -68,7 +77,12 @@ export interface LocalAgentManagerOptions {
   subagents: SubagentsConfig;
 }
 
-export type AgentStartError = AgentTargetError | AgentScopeError | AgentConflictError | AgentStoreError;
+export type AgentStartError =
+  | AgentTargetError
+  | AgentScopeError
+  | AgentConflictError
+  | AgentStoreError
+  | AgentOwnershipError;
 export type AgentContinueError = AgentStartError;
 export type AgentLookupError = AgentTargetError | AgentScopeError | AgentStoreError;
 export type AgentListError = AgentScopeError | AgentStoreError;
@@ -91,6 +105,7 @@ interface ActiveLocalAgentTurn {
  * persists the result.
  */
 export class LocalAgentManager {
+  private readonly writeOwnership: WriteOwnership;
   private readonly store: LocalAgentStore;
   private readonly drivers = new Map<LocalAgentProvider, LocalAgentDriver>();
   private readonly pool: LocalAgentRuntimePool;
@@ -104,6 +119,7 @@ export class LocalAgentManager {
   private closePromise?: Promise<void>;
 
   constructor(options: LocalAgentManagerOptions) {
+    this.writeOwnership = options.writeOwnership;
     this.store = options.store;
     for (const driver of options.drivers) this.drivers.set(driver.provider, driver);
     this.pool = options.pool;
@@ -295,29 +311,95 @@ export class LocalAgentManager {
     prompt: string,
     overrides: RunOverrides,
     workspaceId?: string,
-  ): BetterResult<LocalAgentRecord, AgentConflictError | AgentStoreError> {
+  ): BetterResult<
+    LocalAgentRecord,
+    AgentConflictError | AgentStoreError | AgentScopeError | AgentOwnershipError
+  > {
     if (this.activeTurns.has(record.id)) {
-      return Result.err(new AgentConflictError({
-        code: "AGENT_CONFLICT",
-        agentId: record.id,
-        operation: "continue",
-        retryable: true,
-        message: `Agent ${record.id} already has a running turn.`,
-      }));
+      return Result.err(
+        new AgentConflictError({
+          code: "AGENT_CONFLICT",
+          agentId: record.id,
+          operation: "continue",
+          retryable: true,
+          message: `Agent ${record.id} already has a running turn.`,
+        }),
+      );
     }
 
+    let activity: MutationActivity | undefined;
+    if ((overrides.writeMode ?? "allowed") !== "read_only") {
+      if (!record.workspaceId)
+        return Result.err(
+          new AgentScopeError({
+            code: "WORKSPACE_SCOPE_REQUIRED",
+            operation: "write_ownership",
+            retryable: false,
+            message:
+              "Mutation-capable subagent turns require an originating workspace_id.",
+          }),
+        );
+      try {
+        if (this.allowedRoots)
+          assertAllowedPath(record.workspaceRoot, [...this.allowedRoots]);
+        const canonicalRoot = realpathSync(record.workspaceRoot);
+        if (
+          this.allowedRoots &&
+          !this.allowedRoots.some((root) => {
+            try { return isPathInsideRoot(canonicalRoot, realpathSync(root)); }
+            catch { return false; }
+          })
+        )
+          throw new Error("Canonical checkout is outside allowed roots.");
+        activity = this.writeOwnership.beginMutation(
+          canonicalRoot,
+          record.workspaceId,
+          "subagent_turn",
+        );
+      } catch (error) {
+        if (error instanceof WriteOwnershipError)
+          return Result.err(agentOwnershipError(error));
+        return Result.err(
+          new AgentScopeError({
+            code: "WORKSPACE_NOT_ALLOWED",
+            operation: "write_ownership",
+            retryable: false,
+            cause: error,
+            message: "Cannot resolve the originating checkout identity.",
+          }),
+        );
+      }
+    }
     const begun = this.store.beginTurnResult(record.id, {
       prompt,
       model: overrides.model ?? record.model,
       effort: overrides.effort ?? record.effort,
     });
-    if (begun.isErr()) return begun;
+    if (begun.isErr()) {
+      if (activity) {
+        try { this.writeOwnership.endMutation(activity); } catch (error) {
+          if (error instanceof WriteOwnershipError) return Result.err(agentOwnershipError(error));
+          throw error;
+        }
+      }
+      return begun;
+    }
     // Defer invocation until after the tracking entry is visible. This keeps
     // cleanup correct even if runTurn later gains a synchronous completion path.
-    const turn = Promise.resolve().then(() => (
-      this.runTurn(begun.value.agent, begun.value.turn.id, prompt, overrides, workspaceId)
-    ));
-    this.activeTurns.set(record.id, { turnId: begun.value.turn.id, completion: turn });
+    const turn = Promise.resolve().then(() =>
+      this.runTurn(
+        begun.value.agent,
+        begun.value.turn.id,
+        prompt,
+        overrides,
+        workspaceId,
+        activity,
+      ),
+    );
+    this.activeTurns.set(record.id, {
+      turnId: begun.value.turn.id,
+      completion: turn,
+    });
     void turn.catch(() => undefined);
     return Result.ok(begun.value.agent);
   }
@@ -328,7 +410,10 @@ export class LocalAgentManager {
     prompt: string,
     overrides: RunOverrides,
     workspaceId?: string,
+    activity?: MutationActivity,
   ): Promise<void> {
+    let providerEntered = false;
+    let terminal = false;
     const startedAt = Date.now();
     this.log("info", "agent_run_started", {
       provider: record.provider,
@@ -374,8 +459,23 @@ export class LocalAgentManager {
         model: input.value.model,
         effort: input.value.effort,
         agentDir: this.agentDir,
+        onExecutors: activity
+          ? (executors) =>
+              this.writeOwnership.recordMutationExecutors(activity, executors)
+          : undefined,
       };
+      if (activity && realpathSync(workspaceRoot) !== activity.canonicalRoot)
+        throw new AgentScopeError({
+          code: "WORKSPACE_NOT_ALLOWED",
+          operation: "run",
+          retryable: false,
+          message:
+            "The originating checkout identity changed before provider execution.",
+        });
       const callbacks: LocalAgentRunCallbacks = {
+        onTurnTerminal: () => {
+          terminal = true;
+        },
         onSessionId: (providerSessionId) => {
           const current = this.store.getByIdResult(record.id);
           if (current.isErr()) throw current.error;
@@ -384,12 +484,19 @@ export class LocalAgentManager {
           if (updated.isErr()) throw updated.error;
         },
       };
-      const result = await this.pool.run(driver.value, context, input.value, callbacks);
+      providerEntered = true;
+      const result = await this.pool.run(
+        driver.value,
+        context,
+        input.value,
+        callbacks,
+      );
       if (result.isErr()) {
         this.persistRunError(record, turnId, result.error, startedAt);
         return;
       }
       const runResult = result.value;
+      terminal = true;
       const current = this.store.getByIdResult(record.id);
       if (current.isErr()) throw current.error;
       if (!current.value) return;
@@ -406,6 +513,15 @@ export class LocalAgentManager {
         durationMs: Math.max(0, Date.now() - startedAt),
       });
     } catch (error) {
+      if (error instanceof WriteOwnershipError) {
+        this.persistRunError(
+          record,
+          turnId,
+          agentOwnershipError(error),
+          startedAt,
+        );
+        return;
+      }
       if (isLocalAgentError(error)) {
         this.persistRunError(record, turnId, error, startedAt);
         return;
@@ -427,7 +543,21 @@ export class LocalAgentManager {
       });
       throw error;
     } finally {
-      this.activeTurns.delete(record.id);
+      try {
+        if (activity && (!providerEntered || terminal))
+          this.writeOwnership.endMutation(activity);
+      } catch (error) {
+        if (error instanceof WriteOwnershipError)
+          this.persistRunError(
+            record,
+            turnId,
+            agentOwnershipError(error),
+            startedAt,
+          );
+        else throw error;
+      } finally {
+        this.activeTurns.delete(record.id);
+      }
     }
   }
 

@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { WriteOwnership } from "./write-ownership.js";
 import type { Stats } from "node:fs";
 import { Result, type Result as BetterResult } from "better-result";
 import type {
@@ -360,64 +361,105 @@ export class WorkspaceRegistry {
     session: WorkspaceSession,
   ): Promise<BetterResult<void, ManagedWorktreeFeatureError>> {
     if (!this.store || session.mode !== "worktree" || !session.managed) {
-      return Result.err(new ManagedWorktreeError({
-        code: "WORKTREE_INVALID_STATE",
-        workspaceId: session.id,
-        operation: "reactivate",
-        message: unavailableWorkspaceError(session.id).message,
-      }));
+      return Result.err(
+        new ManagedWorktreeError({
+          code: "WORKTREE_INVALID_STATE",
+          workspaceId: session.id,
+          operation: "reactivate",
+          message: unavailableWorkspaceError(session.id).message,
+        }),
+      );
     }
 
-    const restored = await restoreManagedWorktree({
-      session,
-      worktreeRoot: this.config.worktreeRoot,
-      allowedRoots: this.config.allowedRoots,
-    });
-    if (restored.isErr()) return restored;
-
-    const reactivated = this.store.reactivateSession(session.id);
-    if (reactivated.isErr() || !reactivated.value) {
-      const discarded = await discardRestoredManagedWorktree({
+    const canonicalRoot = await resolveCanonicalAllowedPath(
+      session.root,
+      session.root,
+      [this.config.worktreeRoot],
+    );
+    const ownership = new WriteOwnership(this.config.stateDir);
+    const guard = ownership.beginDestructiveRetention(
+      canonicalRoot,
+      "managed_worktree",
+    );
+    let safeTerminal = true;
+    const onExecutor = (pid: number) => {
+      safeTerminal = false;
+      ownership.recordRetentionExecutors(guard, {
+        processIds: [pid],
+        complete: false,
+      });
+    };
+    try {
+      const restored = await restoreManagedWorktree({
+        onExecutor,
+        onSafeTerminal: () => {
+          safeTerminal = true;
+        },
         session,
         worktreeRoot: this.config.worktreeRoot,
         allowedRoots: this.config.allowedRoots,
       });
-      if (discarded.isErr()) {
-        return Result.err(new ManagedWorktreeError({
-          code: "WORKTREE_RESTORE_FAILED",
-          workspaceId: session.id,
-          operation: "reactivate",
-          message: `Restored workspace ${session.id}, but its persisted session could not be reactivated and the restored worktree could not be discarded.`,
-          cause: {
-            reactivate: reactivated.isErr() ? reactivated.error : undefined,
-            discard: discarded.error,
-          },
-        }));
-      }
-      if (reactivated.isErr()) return reactivated;
-      return Result.err(new ManagedWorktreeError({
-        code: "WORKTREE_RESTORE_FAILED",
-        workspaceId: session.id,
-        operation: "reactivate",
-        message: `Restored workspace ${session.id}, but its persisted session could not be reactivated.`,
-      }));
-    }
+      if (restored.isErr()) return restored;
 
-    if (session.recoveryKind) {
-      const cleanup = await deleteManagedWorktreeRecoveryRef({
-        session,
-        allowedRoots: this.config.allowedRoots,
-      });
-      if (cleanup.isErr()) {
-        logEvent(this.config.logging, "warn", "managed_worktree_recovery_ref_cleanup_failed", {
-          workspaceId: session.id,
-          error: cleanup.error.message,
-          operation: cleanup.error.operation,
+      const reactivated = this.store.reactivateSession(session.id);
+      if (reactivated.isErr() || !reactivated.value) {
+        const discarded = await discardRestoredManagedWorktree({
+          onExecutor,
+          session,
+          worktreeRoot: this.config.worktreeRoot,
+          allowedRoots: this.config.allowedRoots,
         });
+        if (discarded.isErr()) {
+          return Result.err(
+            new ManagedWorktreeError({
+              code: "WORKTREE_RESTORE_FAILED",
+              workspaceId: session.id,
+              operation: "reactivate",
+              message: `Restored workspace ${session.id}, but its persisted session could not be reactivated and the restored worktree could not be discarded.`,
+              cause: {
+                reactivate: reactivated.isErr() ? reactivated.error : undefined,
+                discard: discarded.error,
+              },
+            }),
+          );
+        }
+        safeTerminal = true;
+        if (reactivated.isErr()) return reactivated;
+        return Result.err(
+          new ManagedWorktreeError({
+            code: "WORKTREE_RESTORE_FAILED",
+            workspaceId: session.id,
+            operation: "reactivate",
+            message: `Restored workspace ${session.id}, but its persisted session could not be reactivated.`,
+          }),
+        );
       }
-    }
 
-    return Result.ok(undefined);
+      safeTerminal = true;
+
+      if (session.recoveryKind) {
+        const cleanup = await deleteManagedWorktreeRecoveryRef({
+          session,
+          allowedRoots: this.config.allowedRoots,
+        });
+        if (cleanup.isErr()) {
+          logEvent(
+            this.config.logging,
+            "warn",
+            "managed_worktree_recovery_ref_cleanup_failed",
+            {
+              workspaceId: session.id,
+              error: cleanup.error.message,
+              operation: cleanup.error.operation,
+            },
+          );
+        }
+      }
+
+      return Result.ok(undefined);
+    } finally {
+      if (safeTerminal) ownership.endDestructiveRetention(guard);
+    }
   }
 
   async resolvePath(workspace: Workspace, inputPath: string): Promise<string> {

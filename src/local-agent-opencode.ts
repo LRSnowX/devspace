@@ -36,6 +36,7 @@ export type OpencodeClientLike = Pick<OpencodeClient, "global" | "session">;
 
 export interface OpencodeServerLike {
   close(): void;
+  executorProcesses?: number[];
 }
 
 export type OpencodeFactory = (
@@ -58,6 +59,10 @@ export class OpencodeRuntime implements LocalAgentRuntime {
     private readonly promptTimeoutMs = OPENCODE_PROMPT_TIMEOUT_MS,
   ) {}
 
+  executorEvidence() {
+    return { processIds: this.server.executorProcesses ?? [process.pid], complete: false };
+  }
+
   async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks) {
     return captureAgentProviderResult({
       provider: this.provider,
@@ -77,6 +82,7 @@ export class OpencodeRuntime implements LocalAgentRuntime {
           const sessionId = input.providerSessionId ?? await createOpencodeSession(this.client, input);
           await callbacks?.onSessionId?.(sessionId);
           const promptResult = await this.prompt(sessionId, input);
+          callbacks?.onTurnTerminal?.();
           assertOpenCodePromptSucceeded(promptResult);
           const finalResponse = requireFinalResponse(extractOpenCodeFinalResponse(promptResult));
           return {
@@ -174,7 +180,7 @@ export class OpencodeLocalAgentDriver implements LocalAgentDriver {
 }
 
 async function defaultOpencodeFactory(
-  _context?: LocalAgentRuntimeContext,
+  context?: LocalAgentRuntimeContext,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ client: OpencodeClientLike; server: OpencodeServerLike }> {
   const { createOpencodeClient } = await import("@opencode-ai/sdk/v2");
@@ -185,7 +191,7 @@ async function defaultOpencodeFactory(
       devspace_full_access: opencodeAgentConfig("full_access"),
     },
   };
-  const server = await startOpencodeServer(env, config);
+  const server = await startOpencodeServer(env, config, context);
   return {
     client: createOpencodeClient({ baseUrl: server.url }),
     server,
@@ -195,11 +201,12 @@ async function defaultOpencodeFactory(
 async function startOpencodeServer(
   env: NodeJS.ProcessEnv,
   config: Record<string, unknown>,
+  context?: LocalAgentRuntimeContext,
 ): Promise<OpencodeServerLike & { url: string }> {
   for (let attempt = 1; attempt <= OPENCODE_SERVER_START_ATTEMPTS; attempt += 1) {
     const port = await allocateOpencodePort();
     try {
-      return await launchOpencodeServer(env, config, port);
+      return await launchOpencodeServer(env, config, port, context);
     } catch (error) {
       if (attempt === OPENCODE_SERVER_START_ATTEMPTS || !await isOpencodePortInUse(port)) throw error;
     }
@@ -211,6 +218,7 @@ async function launchOpencodeServer(
   env: NodeJS.ProcessEnv,
   config: Record<string, unknown>,
   port: number,
+  context?: LocalAgentRuntimeContext,
 ): Promise<OpencodeServerLike & { url: string }> {
   const detached = process.platform !== "win32";
   const child = spawn("opencode", [
@@ -268,8 +276,15 @@ async function launchOpencodeServer(
       close();
       reject(new Error(`OpenCode server exited with code ${code}${output.trim() ? `\n${output.trim()}` : ""}`));
     });
+    try {
+      context?.onExecutors?.({ processIds: child.pid ? [child.pid] : [], complete: false });
+    } catch (error) {
+      clearTimeout(timer);
+      close();
+      reject(error);
+    }
   });
-  return { url, close };
+  return { url, close, executorProcesses: child.pid ? [child.pid] : [] };
 }
 
 async function allocateOpencodePort(): Promise<number> {

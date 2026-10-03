@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { WriteOwnership } from "./write-ownership.js";
+import { WriteOwnershipError } from "./write-ownership.js";
+import { resolveCanonicalAllowedPath } from "./roots.js";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
@@ -176,6 +179,7 @@ test("using a pruned workspace id restores its tracked worktree state", async (t
   const context = await fixture(t);
   const gitRoot = await createGitProject(context.root);
   const stateDir = await mkdtemp(join(tmpdir(), "devspace-pruned-restore-state-test-"));
+  context.config.stateDir = stateDir;
   const store = new SqliteWorkspaceStore(stateDir);
   t.after(async () => {
     store.close();
@@ -192,6 +196,7 @@ test("using a pruned workspace id restores its tracked worktree state", async (t
 
   unwrap(await cleanupManagedWorktrees({
     store,
+    writeOwnership: new WriteOwnership(stateDir),
     worktreeRoot: context.config.worktreeRoot,
     allowedRoots: context.config.allowedRoots,
     staleBefore: new Date(Date.now() + 60_000),
@@ -200,6 +205,10 @@ test("using a pruned workspace id restores its tracked worktree state", async (t
   assert.equal(store.getSession(workspaceId)?.status, "pruned");
   await assert.rejects(() => stat(worktreePath), /ENOENT/);
   const recoveryRef = managedWorktreeRecoveryRef(workspaceId);
+  const ownership = new WriteOwnership(stateDir);
+  const guard = ownership.beginDestructiveRetention(await resolveCanonicalAllowedPath(worktreePath, worktreePath, [context.config.worktreeRoot]), "managed_worktree");
+  await assert.rejects(() => registry.getWorkspace(workspaceId), (error) => error instanceof WriteOwnershipError && error.code === "WRITE_OWNERSHIP_BUSY");
+  ownership.endDestructiveRetention(guard);
   assert.ok(
     (await git(gitRoot, ["show-ref", "--verify", recoveryRef]))
       .endsWith(" " + recoveryRef),
@@ -228,6 +237,7 @@ test("concurrent lookups share one pruned workspace restoration", async (t) => {
 
   unwrap(await cleanupManagedWorktrees({
     store,
+    writeOwnership: new WriteOwnership(stateDir),
     worktreeRoot: context.config.worktreeRoot,
     allowedRoots: context.config.allowedRoots,
     staleBefore: new Date(Date.now() + 60_000),
@@ -271,6 +281,7 @@ test("failed session reactivation does not strand a restored worktree", async (t
 
   unwrap(await cleanupManagedWorktrees({
     store,
+    writeOwnership: new WriteOwnership(stateDir),
     worktreeRoot: context.config.worktreeRoot,
     allowedRoots: context.config.allowedRoots,
     staleBefore: new Date(Date.now() + 60_000),
@@ -282,6 +293,15 @@ test("failed session reactivation does not strand a restored worktree", async (t
   );
   assert.equal(store.getSession(workspaceId)?.status, "pruned");
   await assert.rejects(() => stat(worktreePath), /ENOENT/);
+  const canonicalRoot = await resolveCanonicalAllowedPath(
+    worktreePath,
+    worktreePath,
+    [context.config.worktreeRoot],
+  );
+  assert.equal(
+    new WriteOwnership(stateDir).diagnostics(canonicalRoot).retention,
+    undefined,
+  );
 
   const retried = await registry.getWorkspace(workspaceId);
   assert.equal(retried.id, workspaceId);

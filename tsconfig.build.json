@@ -1,4 +1,10 @@
 {
   "extends": "./tsconfig.json",
-  "exclude": ["src/ui/**/*", "src/**/*.test.ts", "src/patch-recovery-crash-child.ts"]
+  "exclude": [
+    "src/ui/**/*",
+    "src/**/*.test.ts",
+    "src/patch-recovery-crash-child.ts",
+    "src/test-support/write-ownership-child.ts",
+    "src/test-support/ownership-process-fixture.ts"
+  ]
 }

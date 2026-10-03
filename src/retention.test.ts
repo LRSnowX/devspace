@@ -13,6 +13,38 @@ import {
   pruneWorkspaceMetadataRetention,
 } from "./retention.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
+import { WriteOwnership } from "./write-ownership.js";
+
+test("metadata retention preserves ownership/recovery roots and continues on unrelated roots", async (t) => {
+  const base = await realpath(await mkdtemp(join(tmpdir(), "ds-retention-owner-")));
+  const root = join(base, "project"); const unrelated = join(base, "other");
+  await mkdir(root); await mkdir(unrelated);
+  const stateDir = join(base, "state");
+  t.after(() => rm(base, { recursive: true, force: true }));
+  const store = new SqliteWorkspaceStore(stateDir);
+  store.createSession({ id: "ws_owner", root });
+  store.createSession({ id: "ws_same_root", root });
+  store.createSession({ id: "ws_other", root: unrelated });
+  store.close();
+  const sqlite = new Database(databasePath(stateDir));
+  sqlite.prepare("update workspace_sessions set last_used_at = ?").run(new Date(Date.now() - DEFAULT_WORKSPACE_METADATA_RETENTION_MS - 60_000).toISOString());
+  sqlite.close();
+  const ownership = new WriteOwnership(stateDir);
+  ownership.acquire(root, "ws_owner");
+  const config = { stateDir, allowedRoots: [base], worktreeRoot: join(base, "worktrees") };
+  const result = await pruneWorkspaceMetadataRetention(config);
+  assert.ok(result.isOk());
+  assert.deepEqual(result.value.pruned, ["ws_other"]);
+  assert.equal(result.value.skipped.length, 2);
+  const remaining = new SqliteWorkspaceStore(stateDir);
+  assert.ok(remaining.getSession("ws_owner")); assert.ok(remaining.getSession("ws_same_root")); remaining.close();
+  ownership.release(root, "ws_owner");
+  ownership.beginDestructiveRetention(root, "managed_worktree");
+  const guarded = await pruneWorkspaceMetadataRetention(config);
+  assert.ok(guarded.isOk()); assert.deepEqual(guarded.value.pruned, []);
+  assert.equal(guarded.value.skipped.length, 2);
+  assert.ok(ownership.diagnostics(root).retention);
+});
 
 test("workspace metadata retention prunes only safe stale metadata and matching review refs", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-retention-test-"));
@@ -96,7 +128,7 @@ test("workspace metadata retention prunes only safe stale metadata and matching 
   git(staleProject, ["update-ref", "refs/devspace/recovery/ws_hidden_ref", head]);
 
   const protectedRoot = await realpath(protectedProject);
-  const config = { stateDir, allowedRoots: [root] };
+  const config = { stateDir, allowedRoots: [root], worktreeRoot: root };
   const inspected = await inspectWorkspaceMetadataRetention(
     config,
     now,

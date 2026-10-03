@@ -65,6 +65,8 @@ export interface LocalAgentDaemonHello {
 }
 
 export interface LocalAgentDaemonErrorPayload {
+  owner_workspace_id?: string;
+  active_mutation_count?: number;
   code: string;
   message: string;
   retryable?: boolean;
@@ -203,6 +205,9 @@ export function decodeLocalAgentDaemonResponse(value: unknown): LocalAgentDaemon
         workspaceId: optionalString(error?.workspaceId),
         operation: optionalString(error?.operation),
         target: optionalString(error?.target),
+        owner_workspace_id: optionalString(error?.owner_workspace_id),
+        active_mutation_count: error?.active_mutation_count === undefined ? undefined
+          : requiredInteger(error.active_mutation_count, "error.active_mutation_count"),
       },
     };
   }

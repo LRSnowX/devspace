@@ -5,6 +5,7 @@ import { lstat, mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import { Result, TaggedError, type Result as BetterResult } from "better-result";
 import type { ServerConfig } from "./config.js";
+import { WriteOwnership, WriteOwnershipError } from "./write-ownership.js";
 import {
   assertAllowedPath,
   isPathInsideRoot,
@@ -72,7 +73,7 @@ export interface ManagedWorktreeCleanupResult {
   missing: string[];
   skipped: Array<{
     workspaceId: string;
-    reason: "untracked_files" | "patch_recovery_required";
+    reason: "untracked_files" | "patch_recovery_required" | "write_ownership_present" | "write_ownership_recovery_required";
   }>;
   failed: Array<{
     workspaceId: string;
@@ -138,6 +139,7 @@ export async function createManagedWorktree(input: {
 }
 
 export async function cleanupManagedWorktrees(input: {
+  writeOwnership: WriteOwnership;
   store: WorkspaceStore;
   worktreeRoot: string;
   allowedRoots: string[];
@@ -173,7 +175,72 @@ export async function cleanupManagedWorktrees(input: {
       });
       continue;
     }
-    const cleaned = await cleanupManagedWorktree({ ...input, session });
+    let guard;
+    try {
+      canonicalSessionRoot = await resolveCanonicalAllowedPath(
+        session.root,
+        session.root,
+        [input.worktreeRoot],
+      );
+      guard = input.writeOwnership.beginDestructiveRetention(
+        canonicalSessionRoot,
+        "managed_worktree",
+      );
+    } catch (error) {
+      if (error instanceof WriteOwnershipError) {
+        result.skipped.push({
+          workspaceId: session.id,
+          reason:
+            error.code === "WRITE_OWNERSHIP_BUSY"
+              ? "write_ownership_present"
+              : "write_ownership_recovery_required",
+        });
+        continue;
+      }
+      result.failed.push({
+        workspaceId: session.id,
+        error: worktreeError(
+          session.id,
+          "WORKTREE_GIT_FAILED",
+          "prune",
+          "Cannot validate retention root.",
+          error,
+        ),
+      });
+      continue;
+    }
+    let safeTerminal = true;
+    let completionError: unknown;
+    let cleaned;
+    try {
+      cleaned = await cleanupManagedWorktree({
+        ...input,
+        session,
+        canonicalRoot: canonicalSessionRoot,
+        onDeletionStarted: () => {
+          safeTerminal = false;
+        },
+        onSafeTerminal: () => {
+          safeTerminal = true;
+        },
+        onExecutor: (pid) =>
+          input.writeOwnership.recordRetentionExecutors(guard, {
+            processIds: [pid],
+            complete: false,
+          }),
+      });
+    } finally {
+      // No mutex spans Git/filesystem work or its persistence compensation.
+      // Ambiguous deletion keeps the durable guard, including on exceptions.
+      if (safeTerminal) {
+        try { input.writeOwnership.endDestructiveRetention(guard); } catch (error) { completionError = error; }
+      }
+    }
+    if (completionError) {
+      result.failed.push({ workspaceId: session.id, error: worktreeError(session.id,
+        "WORKTREE_GIT_FAILED", "prune", "Retention guard cleanup requires operator inspection.", completionError) });
+      continue;
+    }
     if (cleaned.isErr()) {
       result.failed.push({
         workspaceId: session.id,
@@ -199,6 +266,8 @@ export async function cleanupManagedWorktrees(input: {
 }
 
 export async function restoreManagedWorktree(input: {
+  onExecutor?: (pid: number) => void;
+  onSafeTerminal?: () => void;
   session: WorkspaceSession;
   worktreeRoot: string;
   allowedRoots: string[];
@@ -241,15 +310,16 @@ export async function restoreManagedWorktree(input: {
 
     let created = false;
     try {
-      await git(["worktree", "add", "--detach", worktreePath, restoreRef], sourceRoot);
+      await git(["worktree", "add", "--detach", worktreePath, restoreRef], sourceRoot, input.onExecutor);
       created = true;
       if (session.recoveryKind === "stash") {
-        await git(["stash", "apply", "--index", recoveryRef], worktreePath);
+        await git(["stash", "apply", "--index", recoveryRef], worktreePath, input.onExecutor);
       }
     } catch (cause) {
       if (created) {
         try {
-          await git(["worktree", "remove", "--force", worktreePath], sourceRoot);
+          await git(["worktree", "remove", "--force", worktreePath], sourceRoot, input.onExecutor);
+          input.onSafeTerminal?.();
         } catch (cleanupCause) {
           throw new AggregateError(
             [cause, cleanupCause],
@@ -263,6 +333,7 @@ export async function restoreManagedWorktree(input: {
 }
 
 export async function discardRestoredManagedWorktree(input: {
+  onExecutor?: (pid: number) => void;
   session: WorkspaceSession;
   worktreeRoot: string;
   allowedRoots: string[];
@@ -284,7 +355,7 @@ export async function discardRestoredManagedWorktree(input: {
 
     const sourceRoot = await assertCleanupSourceRootAllowed(sourceRootPath, input.allowedRoots);
     await assertManagedWorktreePath(worktreePath, input.worktreeRoot);
-    await git(["worktree", "remove", "--force", worktreePath], sourceRoot);
+    await git(["worktree", "remove", "--force", worktreePath], sourceRoot, input.onExecutor);
   }, "WORKTREE_PATH_INVALID");
 }
 
@@ -297,6 +368,10 @@ type CleanupOutcome =
   | { kind: "skipped" };
 
 async function cleanupManagedWorktree(input: {
+  canonicalRoot: string;
+  onDeletionStarted: () => void;
+  onSafeTerminal: () => void;
+  onExecutor: (pid: number) => void;
   session: WorkspaceSession;
   store: WorkspaceStore;
   worktreeRoot: string;
@@ -348,7 +423,11 @@ async function cleanupManagedWorktree(input: {
 
     // Revalidate immediately before the only destructive filesystem operation.
     await assertManagedWorktreePath(worktreePath, input.worktreeRoot);
-    await git(["worktree", "remove", "--force", worktreePath], sourceRoot);
+    if (await realpath(worktreePath) !== input.canonicalRoot) {
+      throw new Error("Retention root identity changed.");
+    }
+    input.onDeletionStarted();
+    await git(["worktree", "remove", "--force", worktreePath], sourceRoot, input.onExecutor);
     return {
       kind: "removed",
       entry: { workspaceId: session.id, recoveryRef, recoverySha },
@@ -365,10 +444,12 @@ async function cleanupManagedWorktree(input: {
 
   const markedPruned = input.store.markSessionPruned(session.id, prepared.value.recoveryKind);
   if (markedPruned.isOk()) {
+    input.onSafeTerminal();
     return Result.ok({ kind: "removed", entry: prepared.value.entry });
   }
 
   const restored = await restoreManagedWorktree({
+    onExecutor: input.onExecutor,
     session: { ...session, recoveryKind: prepared.value.recoveryKind },
     worktreeRoot: input.worktreeRoot,
     allowedRoots: input.allowedRoots,
@@ -392,6 +473,7 @@ async function cleanupManagedWorktree(input: {
       },
     ));
   }
+  input.onSafeTerminal();
   return Result.err(markedPruned.error);
 }
 
@@ -609,12 +691,20 @@ async function isDirectory(path: string): Promise<boolean> {
   }
 }
 
-async function git(args: string[], cwd: string): Promise<string> {
+async function git(args: string[], cwd: string, onExecutor?: (pid: number) => void): Promise<string> {
   try {
-    const { stdout } = await execFileAsync("git", args, {
+    const pending = execFileAsync("git", args, {
       cwd,
       maxBuffer: 10 * 1024 * 1024,
     });
+    try {
+      if (pending.child.pid) onExecutor?.(pending.child.pid);
+    } catch (error) {
+      pending.child.kill("SIGTERM");
+      await pending.catch(() => undefined);
+      throw error;
+    }
+    const { stdout } = await pending;
     return stdout;
   } catch (error) {
     if (isGitUnavailable(error)) throw error;

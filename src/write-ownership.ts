@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { lstatSync } from "node:fs";
 import {
   WriteOwnershipStore,
   WriteOwnershipError,
   type WriteOwnershipRecord,
   type WriteOwnershipStoreOptions,
   type MutationKind,
+  type DestructiveRetentionRecord,
 } from "./write-ownership-store.js";
 
 export { WriteOwnershipError } from "./write-ownership-store.js";
@@ -28,6 +30,11 @@ export interface MutationExecutors {
   /** True only when these identify every executor that could still mutate.
    * A parent PID alone is insufficient for a shell/provider operation. */
   complete: boolean;
+}
+
+export interface DestructiveRetentionGuard {
+  canonicalRoot: string;
+  guardId: string;
 }
 
 export class WriteOwnership {
@@ -180,12 +187,151 @@ export class WriteOwnership {
     });
   }
 
-  recover(canonicalRoot: string) {
+  beginDestructiveRetention(
+    canonicalRoot: string,
+    kind: DestructiveRetentionRecord["kind"],
+    executors: MutationExecutors = {
+      processIds: [process.pid],
+      complete: false,
+    },
+  ): DestructiveRetentionGuard {
+    validateExecutors(executors);
+    return this.store.retentionTransition(canonicalRoot, (record) => {
+      if (record)
+        throw new WriteOwnershipError(
+          "WRITE_OWNERSHIP_BUSY",
+          "Write ownership prevents destructive retention.",
+          record,
+        );
+      const existing = this.store.readRetention(canonicalRoot);
+      if (existing)
+        throw new WriteOwnershipError(
+          this.store.retentionLiveness(existing) === "live"
+            ? "WRITE_OWNERSHIP_BUSY"
+            : "WRITE_OWNERSHIP_RECOVERY_REQUIRED",
+          "Destructive retention already reserves this root.",
+        );
+      const guardId = randomUUID();
+      let rootIdentity: DestructiveRetentionRecord["root_identity"] = null;
+      try {
+        const metadata = lstatSync(canonicalRoot);
+        if (!metadata.isDirectory() || metadata.isSymbolicLink())
+          throw new WriteOwnershipError(
+            "WRITE_OWNERSHIP_RECOVERY_REQUIRED",
+            "Retention requires an unambiguous canonical directory.",
+          );
+        rootIdentity = { dev: String(metadata.dev), ino: String(metadata.ino) };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      this.store.replaceRetention(canonicalRoot, {
+        schema_version: 1,
+        canonical_root: canonicalRoot,
+        guard_id: guardId,
+        kind,
+        started_at: new Date().toISOString(),
+        executor_processes: [...executors.processIds],
+        executor_processes_complete: executors.complete,
+        root_identity: rootIdentity,
+      });
+      return { result: { canonicalRoot, guardId } };
+    });
+  }
+
+  endDestructiveRetention(guard: DestructiveRetentionGuard): void {
+    this.store.retentionTransition(guard.canonicalRoot, () => {
+      const record = this.store.readRetention(guard.canonicalRoot);
+      if (!record) return { result: undefined };
+      if (record.guard_id !== guard.guardId)
+        throw new WriteOwnershipError(
+          "WRITE_OWNERSHIP_RECOVERY_REQUIRED",
+          "Retention handle belongs to a different guard.",
+        );
+      this.store.replaceRetention(guard.canonicalRoot, undefined, record);
+      return { result: undefined };
+    });
+  }
+
+  recordRetentionExecutors(
+    guard: DestructiveRetentionGuard,
+    executors: MutationExecutors,
+  ): void {
+    validateExecutors(executors);
+    this.store.retentionTransition(guard.canonicalRoot, () => {
+      const record = this.store.readRetention(guard.canonicalRoot);
+      if (!record || record.guard_id !== guard.guardId)
+        throw new WriteOwnershipError(
+          "WRITE_OWNERSHIP_RECOVERY_REQUIRED",
+          "Retention handle no longer identifies the current guard.",
+        );
+      record.executor_processes = [
+        ...new Set([...record.executor_processes, ...executors.processIds]),
+      ];
+      record.executor_processes_complete = executors.complete;
+      this.store.replaceRetention(guard.canonicalRoot, record, record);
+      return { result: undefined };
+    });
+  }
+
+  diagnostics(canonicalRoot: string) {
+    const errors: string[] = [];
+    let ownership: WriteOwnershipRecord | undefined;
+    let retention: DestructiveRetentionRecord | undefined;
+    try {
+      ownership = this.store.inspect(canonicalRoot);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+    try {
+      retention = this.store.readRetention(canonicalRoot);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+    return { canonical_root: canonicalRoot, ownership, retention, errors };
+  }
+
+
+  list() {
+    const discovered = this.store.list();
+    return {
+      roots: discovered.roots.map((root) => this.diagnostics(root)),
+      errors: discovered.errors,
+    };
+  }
+
+  recover(
+    canonicalRoot: string,
+    verifyRetentionSafe?: (guard: DestructiveRetentionRecord) => boolean,
+  ) {
     return this.store.recover<{
       status: "recovered" | "not_owned";
       previousOwnerWorkspaceId?: string;
       recoveredActivityIds: string[];
     }>(canonicalRoot, (record) => {
+      const guard = this.store.readRetention(canonicalRoot);
+      if (guard) {
+        if (record)
+          throw new WriteOwnershipError(
+            "WRITE_OWNERSHIP_RECOVERY_REQUIRED",
+            "Ownership and retention coexist unexpectedly.",
+            record,
+          );
+        const liveness = this.store.retentionLiveness(guard);
+        if (liveness === "live")
+          throw new WriteOwnershipError(
+            "WRITE_OWNERSHIP_BUSY",
+            "A destructive retention executor is still alive.",
+          );
+        if (liveness !== "dead" || !verifyRetentionSafe?.(guard))
+          throw new WriteOwnershipError(
+            "WRITE_OWNERSHIP_RECOVERY_REQUIRED",
+            "Retention executor evidence or filesystem lifecycle is ambiguous.",
+          );
+        this.store.replaceRetention(canonicalRoot, undefined, guard);
+        return {
+          result: { status: "recovered" as const, recoveredActivityIds: [] },
+        };
+      }
       if (!record)
         return {
           result: {
@@ -234,6 +380,8 @@ export class WriteOwnership {
       };
     });
   }
+
+
 }
 
 function validateWorkspaceId(workspaceId: string): void {

@@ -91,6 +91,10 @@ export class AcpRuntime implements LocalAgentRuntime {
   private readonly grokCompletionRegistry?: GrokPromptCompletionRegistry;
   private readonly promptCompletionTimeoutMs: number;
   private readonly activeSessions = new Set<string>();
+  executorEvidence() {
+    return { processIds: this.child?.pid ? [this.child.pid] : [process.pid], complete: false };
+  }
+
   private promptSequence = 0;
   private alive = true;
   private closed = false;
@@ -169,6 +173,7 @@ export class AcpRuntime implements LocalAgentRuntime {
           const response = completion
             ? await Promise.race([standardResponse, completion])
             : await standardResponse;
+          callbacks?.onTurnTerminal?.();
           if (completion && isGrokPromptCompletion(response)) {
             await yieldToAcpQueue();
           } else if (promptId) {
@@ -486,6 +491,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
           stderrTail = appendTail(stderrTail, chunk, MAX_ACP_STDERR_BYTES);
         });
         try {
+          context.onExecutors?.({ processIds: child.pid ? [child.pid] : [], complete: false });
           const { client, methods, ndJsonStream } = await import("@agentclientprotocol/sdk");
           const queues = new Map<string, AcpSessionQueue>();
           const sessionWriteModes = new Map<string, LocalAgentWriteMode>();

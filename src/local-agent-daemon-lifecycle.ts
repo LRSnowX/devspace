@@ -13,7 +13,9 @@ import {
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
-export const LOCAL_AGENT_DAEMON_PROTOCOL_VERSION = 5;
+// v6 requires originating-workspace ownership for mutation-capable turns.
+// Reusing a pre-ownership daemon would bypass that enforcement boundary.
+export const LOCAL_AGENT_DAEMON_PROTOCOL_VERSION = 6;
 export const LOCAL_AGENT_DAEMON_SOCKET_NAME = "agentd.sock";
 export const LOCAL_AGENT_DAEMON_PID_NAME = "agentd.pid";
 export const LOCAL_AGENT_DAEMON_LOCK_NAME = "agentd.lock";

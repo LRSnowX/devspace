@@ -4,6 +4,8 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { LocalAgentManager } from "./local-agent-manager.js";
+import { realpathSync } from "node:fs";
+import { WriteOwnership } from "./write-ownership.js";
 import {
   AgentProviderExecutionError,
   type AgentProviderError,
@@ -126,6 +128,7 @@ const staleTurn = store.beginTurn(stale.id, { prompt: "interrupted turn" });
 store.update(stale.id, { latestResponse: "previous response" });
 
 const manager = new LocalAgentManager({
+  writeOwnership: new WriteOwnership(stateDir),
   store,
   drivers: [driver],
   pool: new LocalAgentRuntimePool(),
@@ -136,6 +139,7 @@ const manager = new LocalAgentManager({
 
 const defectStore = new LocalAgentStore(join(root, "defect-state"));
 const defectManager = new LocalAgentManager({
+  writeOwnership: new WriteOwnership(join(root, "defect-state")),
   store: defectStore,
   drivers: [driver],
   pool: new LocalAgentRuntimePool(),
@@ -155,6 +159,7 @@ await assert.rejects(
   (error: unknown) => Panic.is(error) && error.cause instanceof TypeError,
 );
 await defectManager.close();
+new WriteOwnership(stateDir).acquire(realpathSync(root), scope.workspaceId);
 
 const outside = await manager.start({
   target: "reviewer",
@@ -393,6 +398,7 @@ assert.equal(wrongWorkspaceId.isErr(), true);
 if (wrongWorkspaceId.isErr()) assert.equal(wrongWorkspaceId.error.code, "WORKSPACE_MISMATCH");
 
 const directOutside = unwrap(await manager.start({
+  writeMode: "read_only",
   target: "reviewer",
   prompt: "direct outside allowed roots",
   workspaceRoot: directRoot,
@@ -404,6 +410,7 @@ assert.deepEqual(unwrap(manager.list({ workspaceRoot: directRoot })).map((record
 ]);
 
 const direct = unwrap(await manager.start({
+  writeMode: "read_only",
   target: "reviewer",
   prompt: "direct harness",
   workspaceRoot: root,

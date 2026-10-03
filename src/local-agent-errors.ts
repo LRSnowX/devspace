@@ -8,6 +8,46 @@ import {
   isLocalAgentProvider,
   type LocalAgentProvider,
 } from "./local-agent-profiles.js";
+import { WriteOwnershipError } from "./write-ownership.js";
+import type { ToolErrorPayload, ToolErrorCategory } from "./tool-errors.js";
+
+export class AgentOwnershipError extends TaggedError("AgentOwnershipError")<{
+  code: WriteOwnershipError["code"];
+  operation: string;
+  retryable: boolean;
+  message: string;
+  owner_workspace_id?: string;
+  active_mutation_count?: number;
+}>() {
+  get payload(): ToolErrorPayload & { code: WriteOwnershipError["code"] } {
+    return {
+      code: this.code,
+      category:
+        this.code === "WRITE_OWNERSHIP_REQUIRED"
+          ? "state"
+          : this.code === "WRITE_OWNERSHIP_RECOVERY_REQUIRED"
+            ? "recovery"
+            : "conflict",
+      message: this.message,
+      retryable: this.retryable,
+      owner_workspace_id: this.owner_workspace_id,
+      active_mutation_count: this.active_mutation_count,
+    };
+  }
+}
+
+export function agentOwnershipError(
+  error: WriteOwnershipError,
+): AgentOwnershipError {
+  return new AgentOwnershipError({
+    code: error.code,
+    operation: "write_ownership",
+    message: error.message,
+    retryable: error.code !== "WRITE_OWNERSHIP_RECOVERY_REQUIRED",
+    owner_workspace_id: error.record?.owner_workspace_id,
+    active_mutation_count: error.record?.active_mutations.length,
+  });
+}
 
 export type AgentTargetErrorCode =
   | "UNKNOWN_TARGET"
@@ -153,6 +193,7 @@ export class AgentStoreError extends TaggedError("AgentStoreError")<{
 }
 
 export type AgentManagerError =
+  | AgentOwnershipError
   | AgentTargetError
   | AgentConflictError
   | AgentScopeError
@@ -162,6 +203,9 @@ export type AgentManagerError =
 export type LocalAgentError = AgentManagerError | AgentDaemonError;
 
 export interface AgentErrorPayload {
+  category?: ToolErrorCategory;
+  owner_workspace_id?: string;
+  active_mutation_count?: number;
   code: LocalAgentError["code"];
   message: string;
   retryable?: boolean;
@@ -192,7 +236,7 @@ export function isAgentDaemonError(error: unknown): error is AgentDaemonError {
 }
 
 export function isLocalAgentError(error: unknown): error is LocalAgentError {
-  return AgentTargetError.is(error)
+  return AgentOwnershipError.is(error) || AgentTargetError.is(error)
     || AgentConflictError.is(error)
     || AgentScopeError.is(error)
     || isAgentProviderError(error)
@@ -202,6 +246,10 @@ export function isLocalAgentError(error: unknown): error is LocalAgentError {
 
 export function toAgentErrorPayload(error: LocalAgentError): AgentErrorPayload {
   return matchError(error, {
+    AgentOwnershipError: (ownership) => ({
+      ...ownership.payload,
+      operation: ownership.operation,
+    }),
     AgentTargetError: targetErrorPayload,
     AgentConflictError: conflictErrorPayload,
     AgentScopeError: scopeErrorPayload,
@@ -223,6 +271,8 @@ export function toAgentErrorPayload(error: LocalAgentError): AgentErrorPayload {
 }
 
 export function agentErrorFromPayload(payload: {
+  owner_workspace_id?: string;
+  active_mutation_count?: number;
   code: string;
   message: string;
   retryable?: boolean;
@@ -237,6 +287,18 @@ export function agentErrorFromPayload(payload: {
     ? payload.provider
     : undefined;
   switch (payload.code) {
+    case "WRITE_OWNERSHIP_REQUIRED":
+    case "WRITE_OWNERSHIP_CONFLICT":
+    case "WRITE_OWNERSHIP_BUSY":
+    case "WRITE_OWNERSHIP_RECOVERY_REQUIRED":
+      return new AgentOwnershipError({
+        code: payload.code,
+        message: payload.message,
+        operation: payload.operation ?? "write_ownership",
+        retryable,
+        owner_workspace_id: payload.owner_workspace_id,
+        active_mutation_count: payload.active_mutation_count,
+      });
     case "UNKNOWN_TARGET":
     case "AGENT_NOT_FOUND":
     case "PROVIDER_DISABLED":

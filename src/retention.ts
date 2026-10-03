@@ -1,6 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { Result, type Result as BetterResult } from "better-result";
 import type { ServerConfig } from "./config.js";
+import { WriteOwnership, WriteOwnershipError } from "./write-ownership.js";
 import { managedWorktreeRecoveryRefExists } from "./git-worktrees.js";
 import { deleteWorkspaceReviewRefs } from "./review-checkpoints.js";
 import { resolveCanonicalAllowedPath } from "./roots.js";
@@ -26,6 +27,8 @@ export interface WorkspaceMetadataRetentionSkipped {
   root: string;
   reason:
     | "patch_recovery_required"
+    | "write_ownership_present"
+    | "write_ownership_recovery_required"
     | "root_invalid"
     | "recovery_metadata_present"
     | "recovery_ref_present"
@@ -46,7 +49,7 @@ export interface WorkspaceMetadataRetentionPruneResult extends WorkspaceMetadata
   reviewCleanupFailed: Array<{ workspaceId: string; error: string }>;
 }
 
-type RetentionConfig = Pick<ServerConfig, "stateDir" | "allowedRoots">;
+type RetentionConfig = Pick<ServerConfig, "stateDir" | "allowedRoots" | "worktreeRoot">;
 
 export async function inspectWorkspaceMetadataRetention(
   config: RetentionConfig,
@@ -82,16 +85,13 @@ export async function inspectWorkspaceMetadataRetention(
     config.allowedRoots,
     protectedRoots,
   );
+  const classified = await protectOwnedMetadata(config, {
+    eligible: [...classifiedCheckouts.eligible, ...classifiedPrunedWorktrees.eligible],
+    skipped: [...classifiedCheckouts.skipped, ...classifiedPrunedWorktrees.skipped],
+  });
   return Result.ok({
     cutoff: cutoff.toISOString(),
-    eligible: [
-      ...classifiedCheckouts.eligible,
-      ...classifiedPrunedWorktrees.eligible,
-    ],
-    skipped: [
-      ...classifiedCheckouts.skipped,
-      ...classifiedPrunedWorktrees.skipped,
-    ],
+    ...classified,
   });
 }
 
@@ -99,17 +99,22 @@ export async function pruneWorkspaceMetadataRetention(
   config: RetentionConfig,
   now = new Date(),
   protectedRoots: ReadonlySet<string> = new Set(),
-): Promise<BetterResult<WorkspaceMetadataRetentionPruneResult, WorkspaceStoreError>> {
+): Promise<
+  BetterResult<WorkspaceMetadataRetentionPruneResult, WorkspaceStoreError>
+> {
   const opened = createWorkspaceStoreResult(config.stateDir);
   if (opened.isErr()) return opened;
 
-  const cutoff = new Date(now.getTime() - DEFAULT_WORKSPACE_METADATA_RETENTION_MS);
+  const cutoff = new Date(
+    now.getTime() - DEFAULT_WORKSPACE_METADATA_RETENTION_MS,
+  );
   const listedCheckouts = opened.value.listStaleCheckoutSessions(cutoff);
   if (listedCheckouts.isErr()) {
     closeWorkspaceStoreResult(opened.value);
     return listedCheckouts;
   }
-  const listedPrunedWorktrees = opened.value.listStalePrunedManagedWorktrees(cutoff);
+  const listedPrunedWorktrees =
+    opened.value.listStalePrunedManagedWorktrees(cutoff);
   if (listedPrunedWorktrees.isErr()) {
     closeWorkspaceStoreResult(opened.value);
     return listedPrunedWorktrees;
@@ -125,7 +130,7 @@ export async function pruneWorkspaceMetadataRetention(
     config.allowedRoots,
     protectedRoots,
   );
-  const classified = {
+  const classified = await protectOwnedMetadata(config, {
     eligible: [
       ...classifiedCheckouts.eligible,
       ...classifiedPrunedWorktrees.eligible,
@@ -134,7 +139,8 @@ export async function pruneWorkspaceMetadataRetention(
       ...classifiedCheckouts.skipped,
       ...classifiedPrunedWorktrees.skipped,
     ],
-  };
+  });
+  const ownership = new WriteOwnership(config.stateDir);
   const result: WorkspaceMetadataRetentionPruneResult = {
     cutoff: cutoff.toISOString(),
     ...classified,
@@ -147,35 +153,88 @@ export async function pruneWorkspaceMetadataRetention(
 
   try {
     for (const candidate of classified.eligible) {
-      const deleted = candidate.kind === "stale_checkout"
-        ? opened.value.deleteStaleCheckoutSession(candidate.workspaceId, cutoff)
-        : opened.value.deleteDisposablePrunedWorktreeSession(
-            candidate.workspaceId,
-            cutoff,
-          );
-      if (deleted.isErr()) {
-        result.failed.push({
-          workspaceId: candidate.workspaceId,
-          error: deleted.error.message,
-        });
-        continue;
-      }
-      if (!deleted.value) {
-        result.stateChanged.push(candidate.workspaceId);
-        continue;
-      }
-      result.pruned.push(candidate.workspaceId);
-
+      let guard;
       try {
-        result.reviewRefsDeleted += await deleteWorkspaceReviewRefs(
-          candidate.reviewRoot,
-          candidate.workspaceId,
+        const canonicalRoot = await metadataCanonicalRoot(config, candidate);
+        guard = ownership.beginDestructiveRetention(
+          canonicalRoot,
+          "workspace_metadata",
+          { processIds: [process.pid], complete: true },
         );
       } catch (error) {
-        result.reviewCleanupFailed.push({
+        if (!(error instanceof WriteOwnershipError)) {
+          result.skipped.push({
+            workspaceId: candidate.workspaceId,
+            root: candidate.root,
+            reason: "root_invalid",
+          });
+          continue;
+        }
+        result.skipped.push({
           workspaceId: candidate.workspaceId,
-          error: error instanceof Error ? error.message : String(error),
+          root: candidate.root,
+          reason:
+            error.code === "WRITE_OWNERSHIP_BUSY"
+              ? "write_ownership_present"
+              : "write_ownership_recovery_required",
         });
+        continue;
+      }
+      let safeTerminal = false;
+      try {
+        const deleted =
+          candidate.kind === "stale_checkout"
+            ? opened.value.deleteStaleCheckoutSession(
+                candidate.workspaceId,
+                cutoff,
+              )
+            : opened.value.deleteDisposablePrunedWorktreeSession(
+                candidate.workspaceId,
+                cutoff,
+              );
+        // SQLite has returned a definite transactional outcome. Review ref
+        // cleanup is inside the reservation but does not delete checkout files.
+        safeTerminal = true;
+        if (deleted.isErr()) {
+          result.failed.push({
+            workspaceId: candidate.workspaceId,
+            error: deleted.error.message,
+          });
+          continue;
+        }
+        if (!deleted.value) {
+          result.stateChanged.push(candidate.workspaceId);
+          continue;
+        }
+        result.pruned.push(candidate.workspaceId);
+
+        try {
+          // External Git work makes a parent PID insufficient crash evidence.
+          ownership.recordRetentionExecutors(guard, {
+            processIds: [process.pid],
+            complete: false,
+          });
+          result.reviewRefsDeleted += await deleteWorkspaceReviewRefs(
+            candidate.reviewRoot,
+            candidate.workspaceId,
+          );
+        } catch (error) {
+          result.reviewCleanupFailed.push({
+            workspaceId: candidate.workspaceId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      } finally {
+        if (safeTerminal) {
+          try {
+            ownership.endDestructiveRetention(guard);
+          } catch (error) {
+            result.failed.push({
+              workspaceId: candidate.workspaceId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+        }
       }
     }
   } finally {
@@ -184,6 +243,60 @@ export async function pruneWorkspaceMetadataRetention(
   }
 
   return Result.ok(result);
+}
+
+async function protectOwnedMetadata(
+  config: RetentionConfig,
+  classified: Pick<
+    WorkspaceMetadataRetentionInspection,
+    "eligible" | "skipped"
+  >,
+): Promise<Pick<WorkspaceMetadataRetentionInspection, "eligible" | "skipped">> {
+  const ownership = new WriteOwnership(config.stateDir);
+  const eligible: WorkspaceMetadataRetentionCandidate[] = [];
+  for (const candidate of classified.eligible) {
+    try {
+      const root = await metadataCanonicalRoot(config, candidate);
+      const snapshot = ownership.inspect(root, candidate.workspaceId);
+      const diagnostics = ownership.diagnostics(root);
+      if (
+        snapshot.state !== "unowned" ||
+        diagnostics.retention ||
+        diagnostics.errors.length
+      ) {
+        classified.skipped.push({
+          workspaceId: candidate.workspaceId,
+          root: candidate.root,
+          reason:
+            snapshot.state === "recovery_required" || diagnostics.errors.length
+              ? "write_ownership_recovery_required"
+              : "write_ownership_present",
+        });
+      } else eligible.push(candidate);
+    } catch {
+      classified.skipped.push({
+        workspaceId: candidate.workspaceId,
+        root: candidate.root,
+        reason: "write_ownership_recovery_required",
+      });
+    }
+  }
+  return { eligible, skipped: classified.skipped };
+}
+
+function metadataCanonicalRoot(
+  config: RetentionConfig,
+  candidate: WorkspaceMetadataRetentionCandidate,
+) {
+  const boundaries =
+    candidate.kind === "stale_checkout"
+      ? [...config.allowedRoots]
+      : [config.worktreeRoot];
+  return resolveCanonicalAllowedPath(
+    candidate.root,
+    candidate.root,
+    boundaries,
+  );
 }
 
 async function classifyCheckoutCandidates(

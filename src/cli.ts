@@ -57,6 +57,7 @@ import { shutdownHttpServer } from "./server-shutdown.js";
 import { logEvent } from "./logger.js";
 import { pruneStaleManagedWorktrees } from "./worktree-prune.js";
 import { ProjectRegistry } from "./project-registry.js";
+import { inspectWriteOwnershipCommand } from "./write-ownership-management.js";
 import { PatchRecoveryManager, runPatchStartupRecovery } from "./patch-recovery.js";
 import {
   type WorkspaceMetadataRetentionInspection,
@@ -76,6 +77,7 @@ type Command =
   | "doctor"
   | "config"
   | "projects"
+  | "write-ownership"
   | "recovery"
   | "retention"
   | "memory"
@@ -109,6 +111,9 @@ async function main(argv: string[]): Promise<void> {
       return;
     case "projects":
       runProjectsCommand(args);
+      return;
+    case "write-ownership":
+      console.log(JSON.stringify(await inspectWriteOwnershipCommand(loadConfig(), args), null, 2));
       return;
     case "recovery":
       await runRecoveryCommand(args);
@@ -144,6 +149,7 @@ function normalizeCommand(command: string | undefined): Command {
     || command === "doctor"
     || command === "config"
     || command === "projects"
+    || command === "write-ownership"
     || command === "recovery"
     || command === "retention"
     || command === "memory"
@@ -557,6 +563,8 @@ async function runWorktreesCommand(args: string[]): Promise<void> {
   const skippedUntracked = result.skipped.filter(
     (entry) => entry.reason === "untracked_files",
   ).length;
+  const skippedOwnership = result.skipped.filter((entry) => entry.reason.startsWith("write_ownership_")).length;
+  if (skippedOwnership) console.log(`Protected ${skippedOwnership} worktree(s) with ownership or ownership recovery state.`);
   const skippedPatchRecovery = result.skipped.filter(
     (entry) => entry.reason === "patch_recovery_required",
   ).length;
@@ -659,6 +667,8 @@ function printRetentionInspection(result: WorkspaceMetadataRetentionInspection):
   const protectedCount = result.skipped.filter(
     (entry) => entry.reason === "patch_recovery_required",
   ).length;
+  const ownershipCount = result.skipped.filter((entry) => entry.reason.startsWith("write_ownership_")).length;
+  if (ownershipCount) console.log(`Protected ${ownershipCount} session(s) with ownership or ownership recovery state.`);
   const invalidRootCount = result.skipped.filter(
     (entry) => entry.reason === "root_invalid",
   ).length;
@@ -758,6 +768,7 @@ function printHelp(): void {
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
       "  devspace projects list   List canonical project registrations",
+      "  devspace write-ownership list|show <project-or-path>|recover <project-or-path>",
       "  devspace projects register <name> <path> [--alias <alias>]...",
       "  devspace recovery list|show <id>|resolve <id> --accept-current",
       "  devspace retention inspect|prune [--json]  Inspect or prune safe workspace metadata idle for 90 days",

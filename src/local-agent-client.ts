@@ -666,6 +666,7 @@ function isRequestError(
   error: LocalAgentError,
 ): boolean {
   const category = matchError(error, {
+    AgentOwnershipError: () => "conflict" as const,
     AgentTargetError: () => "target" as const,
     AgentConflictError: () => "conflict" as const,
     AgentScopeError: () => "scope" as const,

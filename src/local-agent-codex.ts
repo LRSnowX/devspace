@@ -116,6 +116,10 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
     this.rpc.notify("initialized");
   }
 
+  executorEvidence() {
+    return { processIds: this.child.pid ? [this.child.pid] : [], complete: false };
+  }
+
   async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks) {
     return captureAgentProviderResult({
       provider: this.provider,
@@ -148,6 +152,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
 
         await callbacks?.onSessionId?.(threadId);
         const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId));
+        callbacks?.onTurnTerminal?.();
         const parsed = parseCompletedTurn(completed.event.params, completed.items);
         if (parsed.failure) {
           throw new AgentProviderExecutionError({
@@ -247,7 +252,7 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
     return `codex:${executable}:${codexHome}`;
   }
 
-  async createRuntime(_context: LocalAgentRuntimeContext) {
+  async createRuntime(context: LocalAgentRuntimeContext) {
     return captureAgentProviderResult({
       provider: this.provider,
       operation: "create_runtime",
@@ -277,6 +282,7 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
           version: command.version,
         });
         try {
+          context.onExecutors?.(runtime.executorEvidence());
           await runtime.initialize();
           return runtime;
         } catch (cause) {
