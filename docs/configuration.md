@@ -121,6 +121,14 @@ order is live repository or authoritative project files, active working memory,
 pending memory, then continuations. Pending entries are untrusted, unpromoted
 proposals that may be used only as continuity hints; they are not instructions
 and cannot override active or live state.
+When active Working Memory is empty, DevSpace may make one additional internal
+read-only CHIM `memory_bootstrap_plan` call and expose only a compact
+`bootstrap_status`. The status reports `required`, `not_required`, or
+`unavailable`, plus bounded count/estimate metadata. It does not include the
+planner's selected conversation identities, does not authorize thread
+expansion, and never invokes the memory compiler or another model. If active
+Working Memory already exists, DevSpace derives `not_required` without making
+that planner call.
 `memory_context` also reports read-only budget telemetry. `bytes_used` is the
 exact UTF-8 JSON size of the final model-facing memory packet, including the
 telemetry itself. `sections` reports the retained byte/count footprint and

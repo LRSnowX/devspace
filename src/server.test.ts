@@ -1421,6 +1421,7 @@ test("server shutdown waits for an active MCP tool call", async (t) => {
 function fakeMemory(
   bootstrapFailure?: Error,
   workingMemory?: MemoryBootstrapContext["workingMemory"],
+  bootstrapStatus?: MemoryBootstrapContext["bootstrapStatus"],
 ): MemoryClient {
   return {
     enabled: true,
@@ -1429,6 +1430,13 @@ function fakeMemory(
       return {
         project,
         sourcePolicy: "relevance-filter",
+        bootstrapStatus: bootstrapStatus ?? {
+          state: "not_required",
+          activeWorkingMemoryItems: workingMemory?.items.length ?? 1,
+          estimatedModelAttempts: 0,
+          selectedConversations: 0,
+          skipReason: "active_working_memory_exists",
+        },
         collaborationMemory: {
           generatedAt: 45,
           items: [{
@@ -1693,6 +1701,10 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
     ?.outputSchema as Record<string, unknown>;
   const schemaText = JSON.stringify(openWorkspaceSchema);
   for (const field of [
+    "bootstrap_status",
+    "active_working_memory_items",
+    "estimated_model_attempts",
+    "selected_conversations",
     "pending_memory",
     "candidate_id",
     "operation",
@@ -1725,6 +1737,13 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.equal(opened.project_name, "LEMonX");
   assert.ok(Buffer.byteLength(JSON.stringify(bootstrap), "utf8") <= 12_288);
   assert.equal(bootstrap.byte_budget, 12_288);
+  assert.deepEqual(bootstrap.bootstrap_status, {
+    state: "not_required",
+    active_working_memory_items: 1,
+    estimated_model_attempts: 0,
+    selected_conversations: 0,
+    skip_reason: "active_working_memory_exists",
+  });
   assert.equal(
     bootstrap.bytes_used,
     Buffer.byteLength(JSON.stringify(bootstrap), "utf8"),
@@ -1884,6 +1903,39 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
     retryable: true,
     conversation_id: "LEMonX-search-evidence",
   });
+});
+
+test("bootstrap-required memory status is advisory and never authorizes compiler work", async (t) => {
+  const context = await fixture(t, {
+    memoryClient: fakeMemory(
+      undefined,
+      {
+        project: "project",
+        items: [],
+        verification: [],
+      },
+      {
+        state: "required",
+        activeWorkingMemoryItems: 0,
+        estimatedModelAttempts: 3,
+        selectedConversations: 3,
+        sourcePolicy: "recent_complete_chatgpt_only",
+      },
+    ),
+  });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+  const bootstrap = opened.memory_context as Record<string, unknown>;
+  assert.deepEqual(bootstrap.bootstrap_status, {
+    state: "required",
+    active_working_memory_items: 0,
+    estimated_model_attempts: 3,
+    selected_conversations: 3,
+    source_policy: "recent_complete_chatgpt_only",
+  });
+  assert.match(
+    opened.instruction as string,
+    /status is advisory only and does not authorize starting a memory compiler, Codex, subagent, or scheduler/,
+  );
 });
 
 test("memory handoff revalidates only operational memory against live repository freshness", async (t) => {

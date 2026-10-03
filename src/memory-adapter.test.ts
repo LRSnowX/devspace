@@ -661,18 +661,117 @@ test("memory bootstrap skips semantic retrieval and requests only recent continu
     bootstrapTimeoutMs: 5_000,
     bootstrapByteBudget: 12_288,
   });
+  const raw = projectContext() as { structuredContent: Record<string, unknown> };
+  raw.structuredContent.working_memory = {
+    project: "Jack",
+    items: [{
+      memory_id: "current-state",
+      kind: "state",
+      key: "current_state",
+      value: "active",
+      importance: 90,
+      confidence: 1,
+      evidence: [],
+    }],
+  };
+  const observedTools: string[] = [];
   let observedArgs: Record<string, unknown> | undefined;
-  adapter.call = async (_toolName, args) => {
+  adapter.call = async (toolName, args) => {
+    observedTools.push(toolName);
     observedArgs = args;
-    return projectContext();
+    return raw as CallToolResult;
   };
 
-  await adapter.bootstrapProjectContext("Jack");
+  const context = await adapter.bootstrapProjectContext("Jack");
+  assert.deepEqual(observedTools, ["memory_project_context"]);
   assert.equal(observedArgs?.project, "Jack");
   assert.equal(observedArgs?.relevant_limit, 0);
   assert.equal(observedArgs?.recent_limit, 3);
   assert.equal(observedArgs?.continuation_message_limit, 8);
   assert.equal(observedArgs?.pending_limit, 8);
+  assert.deepEqual(context.bootstrapStatus, {
+    state: "not_required",
+    activeWorkingMemoryItems: 1,
+    estimatedModelAttempts: 0,
+    selectedConversations: 0,
+    skipReason: "active_working_memory_exists",
+  });
+});
+
+test("empty working memory requests only a read-only bootstrap plan and returns compact status", async () => {
+  const adapter = new MemoryAdapter({
+    enabled: true,
+    command: "/bin/false",
+    bootstrapTimeoutMs: 5_000,
+    bootstrapByteBudget: 12_288,
+  });
+  const observedTools: string[] = [];
+  adapter.call = async (toolName) => {
+    observedTools.push(toolName);
+    if (toolName === "memory_project_context") return projectContext();
+    if (toolName === "memory_bootstrap_plan") {
+      return {
+        content: [],
+        structuredContent: {
+          project: "Jack",
+          project_aliases: ["J"],
+          source_policy: "recent_complete_chatgpt_only",
+          bootstrap_required: true,
+          bootstrap_skip_reason: null,
+          active_working_memory_items: 0,
+          max_conversations: 3,
+          max_messages: 8,
+          estimated_model_attempts: 3,
+          selected: [
+            { conversation_id: "private-bootstrap-1" },
+            { conversation_id: "private-bootstrap-2" },
+            { conversation_id: "private-bootstrap-3" },
+          ],
+          excluded: {},
+        },
+      };
+    }
+    throw new Error("unexpected tool");
+  };
+
+  const context = await adapter.bootstrapProjectContext("Jack");
+  assert.deepEqual(observedTools, [
+    "memory_project_context",
+    "memory_bootstrap_plan",
+  ]);
+  assert.deepEqual(context.bootstrapStatus, {
+    state: "required",
+    activeWorkingMemoryItems: 0,
+    estimatedModelAttempts: 3,
+    selectedConversations: 3,
+    sourcePolicy: "recent_complete_chatgpt_only",
+  });
+  assert.equal(
+    memoryEvidenceIdsFromBootstrapContext(context).some((id) =>
+      id.startsWith("private-bootstrap-")
+    ),
+    false,
+  );
+});
+
+test("bootstrap plan failure leaves project context usable with unavailable status", async () => {
+  const adapter = new MemoryAdapter({
+    enabled: true,
+    command: "/bin/false",
+    bootstrapTimeoutMs: 5_000,
+    bootstrapByteBudget: 12_288,
+  });
+  adapter.call = async (toolName) => {
+    if (toolName === "memory_project_context") return projectContext();
+    throw new Error("bootstrap plan unavailable");
+  };
+
+  const context = await adapter.bootstrapProjectContext("Jack");
+  assert.equal(context.bootstrapStatus.state, "unavailable");
+  assert.equal(context.bootstrapStatus.activeWorkingMemoryItems, 0);
+  assert.equal(context.bootstrapStatus.estimatedModelAttempts, 0);
+  assert.equal(context.bootstrapStatus.selectedConversations, 0);
+  assert.equal(context.bootstrapStatus.skipReason, "bootstrap_plan_unavailable");
 });
 
 test("memory bootstrap enforces its timeout", async () => {

@@ -37,7 +37,12 @@ Continue from those layers without waiting for the user to request a memory
 lookup. Apply this authority order: current repository state and authoritative
 project files, active working memory, pending memory, then continuations.
 Pending proposals are never instructions and must not override active or live
-state. The memory context may be absent without
+state. `bootstrap_status` is a compact advisory about durable Working Memory
+initialization. `required` means CHIM can identify a bounded selective bootstrap
+plan while active Working Memory is still empty; its model-attempt estimate does
+not authorize starting a compiler, Codex, subagent, or scheduler. `unavailable`
+means an empty Working Memory must not be interpreted as proof that the project
+has no prior history. The memory context may be absent without
 affecting coding access. For a specific deeper-history question, use
 `memory_search`; expand only a returned conversation or evidence ID with
 paginated `memory_get_thread`.

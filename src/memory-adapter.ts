@@ -14,7 +14,10 @@ const MAX_CONTINUATION_BOOTSTRAP_BYTES = 4_096;
 const MAX_PENDING_MEMORY_BOOTSTRAP_BYTES = 3_072;
 
 export type MemoryToolName = (typeof MEMORY_TOOL_NAMES)[number];
-export type MemoryAdapterToolName = MemoryToolName | "memory_health";
+export type MemoryAdapterToolName =
+  | MemoryToolName
+  | "memory_health"
+  | "memory_bootstrap_plan";
 
 export interface MemoryBootstrapHit {
   conversationId: string;
@@ -150,6 +153,15 @@ export interface MemoryBootstrapPendingMemory {
   revalidationExcludedCount: number;
 }
 
+export interface MemoryBootstrapStatus {
+  state: "required" | "not_required" | "unavailable";
+  activeWorkingMemoryItems: number;
+  estimatedModelAttempts: number;
+  selectedConversations: number;
+  sourcePolicy?: string;
+  skipReason?: string;
+}
+
 export interface MemoryBootstrapSourceCounts {
   collaborationItems: number;
   workingItems: number;
@@ -163,6 +175,7 @@ export interface MemoryBootstrapSourceCounts {
 export interface MemoryBootstrapContext {
   project: string;
   sourcePolicy: string;
+  bootstrapStatus: MemoryBootstrapStatus;
   collaborationMemory: MemoryBootstrapCollaborationMemory;
   workingMemory: MemoryBootstrapWorkingMemory;
   pendingMemory: MemoryBootstrapPendingMemory;
@@ -351,7 +364,40 @@ export class MemoryAdapter {
       this.config.bootstrapTimeoutMs + 50,
       "Memory bootstrap timed out",
     );
-    return compactMemoryBootstrapContext(result, project, this.config.bootstrapByteBudget);
+    const initial = compactMemoryBootstrapContext(
+      result,
+      project,
+      this.config.bootstrapByteBudget,
+    );
+    if (memoryBootstrapSourceCounts(initial).workingItems > 0) {
+      return initial;
+    }
+    let bootstrapStatus: MemoryBootstrapStatus;
+    try {
+      const planOperation = this.call(
+        "memory_bootstrap_plan",
+        {
+          project,
+          max_conversations: 3,
+          max_messages: 8,
+        },
+        { timeoutMs: this.config.bootstrapTimeoutMs },
+      );
+      const plan = await withTimeout(
+        planOperation,
+        this.config.bootstrapTimeoutMs + 50,
+        "Memory bootstrap plan timed out",
+      );
+      bootstrapStatus = compactMemoryBootstrapStatus(plan, project);
+    } catch {
+      bootstrapStatus = unavailableBootstrapStatus(0);
+    }
+    return compactMemoryBootstrapContext(
+      result,
+      project,
+      this.config.bootstrapByteBudget,
+      bootstrapStatus,
+    );
   }
 }
 
@@ -363,6 +409,7 @@ export function compactMemoryBootstrapContext(
   raw: unknown,
   expectedProject: string,
   byteBudget: number,
+  bootstrapStatus?: MemoryBootstrapStatus,
 ): MemoryBootstrapContext {
   const result = record(raw);
   const structured = record(result?.structuredContent);
@@ -385,6 +432,15 @@ export function compactMemoryBootstrapContext(
     structured.pending_memory,
     expectedProject,
   );
+  const defaultBootstrapStatus = workingMemoryCandidate.items.length > 0
+    ? {
+        state: "not_required" as const,
+        activeWorkingMemoryItems: workingMemoryCandidate.items.length,
+        estimatedModelAttempts: 0,
+        selectedConversations: 0,
+        skipReason: "active_working_memory_exists",
+      }
+    : unavailableBootstrapStatus(0);
   const continuationCandidates = Array.isArray(structured.continuations)
     ? structured.continuations.map(compactContinuation)
     : structured.continuation === undefined || structured.continuation === null
@@ -393,6 +449,7 @@ export function compactMemoryBootstrapContext(
   const context: MemoryBootstrapContext = {
     project: expectedProject,
     sourcePolicy: clip(structured.source_policy, 80),
+    bootstrapStatus: bootstrapStatus ?? defaultBootstrapStatus,
     collaborationMemory: {
       ...(collaborationMemoryCandidate.generatedAt === undefined
         ? {}
@@ -535,6 +592,52 @@ export function compactMemoryBootstrapContext(
     throw new Error("Memory bootstrap byte budget is too small for its envelope");
   }
   return context;
+}
+
+function compactMemoryBootstrapStatus(
+  raw: unknown,
+  expectedProject: string,
+): MemoryBootstrapStatus {
+  const result = record(raw);
+  const structured = record(result?.structuredContent);
+  if (
+    !structured
+    || structured.project !== expectedProject
+    || typeof structured.bootstrap_required !== "boolean"
+    || typeof structured.active_working_memory_items !== "number"
+    || !Number.isInteger(structured.active_working_memory_items)
+    || structured.active_working_memory_items < 0
+    || typeof structured.estimated_model_attempts !== "number"
+    || !Number.isInteger(structured.estimated_model_attempts)
+    || structured.estimated_model_attempts < 0
+    || !Array.isArray(structured.selected)
+  ) {
+    throw new Error("Malformed memory bootstrap plan response");
+  }
+  return {
+    state: structured.bootstrap_required ? "required" : "not_required",
+    activeWorkingMemoryItems: structured.active_working_memory_items,
+    estimatedModelAttempts: structured.estimated_model_attempts,
+    selectedConversations: structured.selected.length,
+    ...(typeof structured.source_policy === "string"
+      ? { sourcePolicy: clip(structured.source_policy, 80) }
+      : {}),
+    ...(typeof structured.bootstrap_skip_reason === "string"
+      ? { skipReason: clip(structured.bootstrap_skip_reason, 120) }
+      : {}),
+  };
+}
+
+function unavailableBootstrapStatus(
+  activeWorkingMemoryItems: number,
+): MemoryBootstrapStatus {
+  return {
+    state: "unavailable",
+    activeWorkingMemoryItems,
+    estimatedModelAttempts: 0,
+    selectedConversations: 0,
+    skipReason: "bootstrap_plan_unavailable",
+  };
 }
 
 function dedupeBootstrapHits(

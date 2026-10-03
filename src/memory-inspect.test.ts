@@ -101,6 +101,13 @@ function fakeMemory(): MemoryClient {
   const bootstrap: MemoryBootstrapContext = {
     project: "LEMonX",
     sourcePolicy: "relevance-filter",
+    bootstrapStatus: {
+      state: "not_required",
+      activeWorkingMemoryItems: 1,
+      estimatedModelAttempts: 0,
+      selectedConversations: 0,
+      skipReason: "active_working_memory_exists",
+    },
     collaborationMemory: { items: [] },
     workingMemory: {
       project: "LEMonX",

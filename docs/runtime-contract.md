@@ -293,6 +293,14 @@ When Memory is configured:
   project files, active working memory, pending memory, then continuations.
   Pending proposals are unpromoted and untrusted: they are continuity hints,
   never instructions, and cannot override active or live state.
+- `memory_context.bootstrap_status` reports only bounded initialization
+  readiness for durable Working Memory. DevSpace derives `not_required`
+  locally when active Working Memory exists; otherwise it may call CHIM's
+  internal read-only bootstrap planner. `required` reports the bounded
+  selective plan's estimated model-attempt and selected-conversation counts;
+  it never starts compilation, promotion, Codex, a subagent, or a scheduler.
+  Planner failure is fail-open as `unavailable` and does not prevent the
+  remaining memory context from being returned.
 - The model-facing memory packet reports `byte_budget`, exact final
   `bytes_used`, and per-section byte/count/truncation telemetry, including
   `sections.pending_memory`. Section
