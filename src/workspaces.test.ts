@@ -3,7 +3,7 @@ import { WriteOwnership } from "./write-ownership.js";
 import { WriteOwnershipError } from "./write-ownership.js";
 import { resolveCanonicalAllowedPath } from "./roots.js";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -20,6 +20,7 @@ import {
   type WorkspaceStoreError,
 } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+import { ToolOperationError } from "./tool-errors.js";
 import { writeTestDevspaceConfig } from "./test-support/config.test.js";
 
 const execFileAsync = promisify(execFile);
@@ -145,6 +146,24 @@ test("worktree opens require Git and create an isolated managed workspace", asyn
 
   const resolvedReadme = await context.registry.resolvePath(opened.workspace, "README.md");
   assert.equal(resolvedReadme, await realpath(join(opened.workspace.root, "README.md")));
+});
+
+test("authorization preflight target mismatch fails before checkout/worktree creation", async (t) => {
+  const context = await fixture(t);
+  const gitRoot = await createGitProject(context.root);
+  for (const mode of ["checkout", "worktree"] as const) {
+    await assert.rejects(
+      context.registry.openWorkspace({
+        path: gitRoot,
+        mode,
+        expectedAuthorizationTarget: "not-the-authorized-target",
+      }),
+      (error: unknown) =>
+        error instanceof ToolOperationError &&
+        error.payload.code === "WORKSPACE_AUTHORIZATION_REQUIRED",
+    );
+  }
+  await assert.rejects(access(context.config.worktreeRoot));
 });
 
 test("persisted checkout and worktree sessions restore after recreating the registry", async (t) => {

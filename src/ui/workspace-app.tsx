@@ -29,6 +29,7 @@ import {
   type ChatGptToolGlobals,
 } from "./tool-result.js";
 import "./workspace-app.css";
+import { appendAuthorizationControls } from "./authorization-controls.js";
 
 interface CardDisplay {
   icon: ToolIcon;
@@ -259,6 +260,11 @@ function render(): void {
     return;
   }
 
+  if (card.authorization) {
+    renderAuthorizationCard(card.authorization);
+    return;
+  }
+
   const display = cardDisplay(card);
   if (card.tool === "show_changes") {
     renderReviewCard(card, display);
@@ -320,6 +326,41 @@ function render(): void {
 function renderEmpty(message: string, tone: "muted" | "error" = "muted"): void {
   const main = element("main", { className: "shell" });
   main.append(element("section", { className: `empty ${tone}`, text: message }));
+  appRoot.replaceChildren(main);
+}
+
+function renderAuthorizationCard(
+  request: NonNullable<ToolResultCard["authorization"]>,
+): void {
+  const main = element("main", { className: "shell" });
+  const section = element("section", {
+    className: "tool-card authorization-card",
+  });
+  section.append(
+    element("h2", { text: "Workspace access requested" }),
+    element("p", { text: request.workspace }),
+    element("p", {
+      text: `Requested access: ${request.requested_access}. Modify includes inspect and permits local-user shell execution; it is not a sandbox.`,
+    }),
+    element("p", {
+      text: "After approving, retry open_workspace. Write Ownership is still required for mutations.",
+    }),
+  );
+  if (request.requested_access === "inspect") {
+    section.append(
+      element("p", {
+        text: "For modify access, request open_workspace with access=modify and approve the new card.",
+      }),
+    );
+  }
+  const now = Date.now();
+  const expired = now >= Date.parse(request.expires_at);
+  appendAuthorizationControls(section, request, app, now);
+  if (expired)
+    section.append(
+      element("p", { text: "This request expired. Retry open_workspace." }),
+    );
+  main.append(section);
   appRoot.replaceChildren(main);
 }
 

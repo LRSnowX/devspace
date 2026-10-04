@@ -14,6 +14,25 @@ export interface ChatGptToolGlobals {
 export function decodeToolResult(result: CallToolResult): DecodedToolResult {
   const structured = asRecord(result.structuredContent);
   const metaCard = cardFields(asRecord(asRecord(result._meta)?.card));
+  const authorization = asRecord(structured?.authorization_request)
+    ?? asRecord(asRecord(asRecord(result._meta)?.card)?.authorization);
+  if (authorization
+    && typeof authorization.request_id === "string"
+    && /^[a-f0-9]{64}$/.test(authorization.request_id)
+    && typeof authorization.workspace === "string"
+    && (authorization.requested_access === "inspect" || authorization.requested_access === "modify")
+    && typeof authorization.expires_at === "string"
+    && Number.isFinite(Date.parse(authorization.expires_at))) {
+    return { kind: "card", card: {
+      tool: "open_workspace",
+      authorization: {
+        request_id: authorization.request_id,
+        workspace: authorization.workspace,
+        requested_access: authorization.requested_access,
+        expires_at: authorization.expires_at,
+      },
+    } };
+  }
 
   if (structured) {
     const workspaceId = stringField(structured.workspace_id);

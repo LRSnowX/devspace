@@ -33,6 +33,7 @@ Run `devspace init` to create both files. `devspace config set publicBaseUrl
   "workspaces": {
     "allowedRoots": ["~/personal", "~/work"],
     "worktreeRoot": "~/.devspace/worktrees",
+    "conversationAuthorization": false,
   },
   "storage": {
     "stateDir": "~/.local/share/devspace",
@@ -85,6 +86,31 @@ Run `devspace init` to create both files. `devspace config set publicBaseUrl
 Omitted sections and keys use the defaults shown above. An empty
 `workspaces.allowedRoots` uses the current working directory. Unknown keys are
 rejected so spelling mistakes cannot silently alter behavior.
+
+## Conversation workspace authorization (opt-in)
+
+Set `workspaces.conversationAuthorization: true` and keep `ui.enabled: true`
+for the ChatGPT MCP App approval flow. With usable Host-provided
+`_meta["openai/session"]`, `open_workspace` requests `inspect` by default;
+use `access: "modify"` for mutation work. Worktree creation always requires
+modify. The user approves Inspect, Modify, or Deny in the App, then the Host
+retries `open_workspace`. An inspect-only request cannot be escalated by the
+approval call; request modify with a new card. With UI disabled, scoped requests
+remain blocked; there is no model-callable approval fallback.
+
+Each conversation can authorize multiple canonical checkout targets. Managed
+worktrees inherit their source Git checkout's target, including when opened from
+a source subdirectory. Approvals and pending requests are process-local;
+restart removes them. Requests expire after two minutes and are single-use and
+conversation-bound. Inspect permits annotated read-only tools; modify permits
+mutation-capable and unclassified workspace tools, but does not acquire Write
+Ownership or authorize subagents.
+
+Disabled behavior, and hosts without usable `openai/session`, retain the existing
+upstream-compatible behavior. This is a trusted-Host conversation boundary, not
+OAuth identity, a replacement for `allowedRoots`, or a shell sandbox. The Host
+must enforce MCP Apps app-only visibility and propagate the same conversation
+metadata on App calls. Real connector acceptance remains a separate check.
 
 ## Project Registry and Memory Adapter
 

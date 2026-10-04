@@ -60,6 +60,19 @@ Ownership acquire uses `acquired`/`already_owned`; release uses
 Successful Claude `bash` uses `status: "completed"`; ordinary upstream shell
 failures keep their existing error behavior.
 
+## Conversation authorization codes
+
+Enabled conversation-scoped calls use ordinary structured errors (not
+`isError: true`):
+
+- `WORKSPACE_AUTHORIZATION_REQUIRED`: category `scope`, retryable `true`.
+  Request the necessary access using `open_workspace`, approve its App card,
+  and retry. An unauthorized open also includes `authorization_request` but no
+  workspace binding or bootstrap fields.
+- `WORKSPACE_AUTHORIZATION_REQUEST_INVALID`: category `scope`, retryable `true`.
+  The opaque App request is expired, consumed, mismatched, missing, or attempts
+  escalation. Retry open to obtain a new request. No grant is created.
+
 ## Host ownership codes
 
 Ownership tools and direct Host mutations use the same ordinary structured

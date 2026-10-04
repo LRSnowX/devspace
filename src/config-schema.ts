@@ -15,6 +15,7 @@ const serverConfigSchema = z.object({
 
 const workspacesConfigSchema = z.object({
   allowedRoots: z.array(z.string().trim().min(1)).default([]),
+  conversationAuthorization: z.boolean().default(false),
   worktreeRoot: z.string().trim().min(1).default("~/.devspace/worktrees"),
 }).strict().prefault({});
 

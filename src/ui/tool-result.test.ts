@@ -6,6 +6,44 @@ import {
   toolResultFromChatGptGlobals,
 } from "./tool-result.js";
 
+test("authorization cards decode without exposing internal workspace or session identities", () => {
+  const request = {
+    request_id: "a".repeat(64),
+    workspace: "/work/project",
+    requested_access: "modify",
+    expires_at: "2099-01-01T00:00:00.000Z",
+  };
+  assert.deepEqual(
+    decodeToolResult({
+      content: [],
+      structuredContent: { status: "error", authorization_request: request },
+    }),
+    {
+      kind: "card",
+      card: { tool: "open_workspace", authorization: request },
+    },
+  );
+  assert.deepEqual(
+    decodeToolResult({
+      content: [],
+      structuredContent: {
+        authorization_request: { ...request, request_id: "not-opaque" },
+      },
+    }),
+    { kind: "invalid" },
+  );
+  assert.deepEqual(
+    decodeToolResult({
+      content: [],
+      _meta: { card: { authorization: request } },
+    }),
+    {
+      kind: "card",
+      card: { tool: "open_workspace", authorization: request },
+    },
+  );
+});
+
 test("workspace cards can be rebuilt from structured content without result metadata", () => {
   const decoded = decodeToolResult({
     content: [],

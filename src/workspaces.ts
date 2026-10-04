@@ -18,6 +18,7 @@ import {
   discardRestoredManagedWorktree,
   ManagedWorktreeError,
   restoreManagedWorktree,
+  resolveGitRoot,
   type ManagedWorktreeFeatureError,
 } from "./git-worktrees.js";
 import { logEvent } from "./logger.js";
@@ -89,6 +90,8 @@ export interface OpenWorkspaceInput {
   path: string;
   mode?: WorkspaceMode;
   baseRef?: string;
+  // Internal preflight identity, never a model-provided grant.
+  expectedAuthorizationTarget?: string;
 }
 
 export interface OpenWorkspaceOptions {
@@ -127,8 +130,11 @@ export class WorkspaceRegistry {
 
     const projectKey = await this.conversationProjectKey(workspaceInput);
     const mode = workspaceInput.mode ?? "checkout";
+    if (mode === "checkout") {
+      assertAuthorizationTarget(projectKey, workspaceInput.expectedAuthorizationTarget);
+    }
     if (mode === "worktree") {
-      const context = await this.openWorktreeWorkspace(workspaceInput.path, workspaceInput.baseRef);
+      const context = await this.openWorktreeWorkspace(workspaceInput.path, workspaceInput.baseRef, workspaceInput.expectedAuthorizationTarget);
       return {
         ...context,
         // A new worktree always has its own workspace-specific context.
@@ -168,10 +174,10 @@ export class WorkspaceRegistry {
     const mode = options.mode ?? "checkout";
 
     if (mode === "worktree") {
-      return this.openWorktreeWorkspace(options.path, options.baseRef);
+      return this.openWorktreeWorkspace(options.path, options.baseRef, options.expectedAuthorizationTarget);
     }
 
-    return this.openCheckoutWorkspace(options.path);
+    return this.openCheckoutWorkspace(options.path, options.expectedAuthorizationTarget);
   }
 
   private async openConversationCheckout(
@@ -184,6 +190,7 @@ export class WorkspaceRegistry {
       const reusableWorkspace = await this.findReusableCheckoutWorkspace(binding);
 
       if (reusableWorkspace) {
+        assertAuthorizationTarget(reusableWorkspace.canonicalRoot, input.expectedAuthorizationTarget);
         const context = await this.reusedWorkspaceContext(reusableWorkspace);
         this.store?.touchConversationBinding(conversationScopeId, targetKey);
         return {
@@ -196,7 +203,7 @@ export class WorkspaceRegistry {
       this.store?.deleteConversationBinding(conversationScopeId, targetKey);
     }
 
-    const context = await this.openCheckoutWorkspace(input.path);
+    const context = await this.openCheckoutWorkspace(input.path, input.expectedAuthorizationTarget);
     this.store?.setConversationBinding({
       conversationScopeId,
       targetKey,
@@ -244,6 +251,40 @@ export class WorkspaceRegistry {
 
   private conversationCheckoutTargetKey(projectKey: string): string {
     return JSON.stringify(["checkout", projectKey, null]);
+  }
+
+  // No binding, restore, touch, instructions, skills, or bootstrap during preflight.
+  async authorizationTargetForPath(path: string, mode: WorkspaceMode = "checkout"): Promise<string> {
+    const target = await this.conversationProjectKey({ path });
+    if (!(await ensureCheckoutWorkspaceRoot(target)).isDirectory()) {
+      throw new ToolOperationError({
+        code: "PROJECT_NOT_DIRECTORY", category: "invalid_request", retryable: false,
+        message: "Project target is not a directory.", path,
+      });
+    }
+    return mode === "worktree"
+      ? this.conversationProjectKey({ path: await resolveGitRoot(path, this.config.allowedRoots) })
+      : target;
+  }
+
+  async authorizationTargetForWorkspace(workspaceId: string): Promise<{ target: string; requiresModify: boolean }> {
+    const lookup = this.store?.getSessionResult(workspaceId);
+    if (lookup?.isErr()) throw lookup.error;
+    const session = lookup?.isOk() ? lookup.value : undefined;
+    const cached = this.workspaces.get(workspaceId);
+    if (this.store ? !session : !cached) throw unavailableWorkspaceError(workspaceId);
+    const workspace = session ?? cached!;
+    const root = this.assertWorkspaceRootAllowed(workspace.root, workspace.mode, workspace.sourceRoot);
+    const requiresModify = session?.status === "pruned";
+    if (!requiresModify) {
+      if (cached) await this.assertWorkspaceRootUnchanged(cached);
+      else await this.resolveCanonicalWorkspaceRoot(root, workspace.mode, workspace.sourceRoot);
+    }
+    return {
+      target: await this.authorizationTargetForPath(workspace.sourceRoot ?? root),
+      // Restoring a pruned worktree mutates even when requested by a read tool.
+      requiresModify,
+    };
   }
 
   private async reusedWorkspaceContext(workspace: Workspace): Promise<WorkspaceContext> {
@@ -498,7 +539,7 @@ export class WorkspaceRegistry {
     return workingDirectory ? this.resolvePath(workspace, workingDirectory) : workspace.root;
   }
 
-  private async openCheckoutWorkspace(path: string): Promise<WorkspaceContext> {
+  private async openCheckoutWorkspace(path: string, expectedTarget?: string): Promise<WorkspaceContext> {
     const root = assertAllowedPath(path, this.config.allowedRoots);
     const canonicalRoot = await resolveCanonicalAllowedPath(
       root,
@@ -506,6 +547,7 @@ export class WorkspaceRegistry {
       this.config.allowedRoots,
     );
     const rootStats = await ensureCheckoutWorkspaceRoot(root);
+    assertAuthorizationTarget(canonicalRoot, expectedTarget);
     if (!rootStats.isDirectory()) {
       throw new ToolOperationError({
         code: "PROJECT_NOT_DIRECTORY",
@@ -519,11 +561,12 @@ export class WorkspaceRegistry {
     return this.createWorkspaceContext({ root, canonicalRoot, mode: "checkout" });
   }
 
-  private async openWorktreeWorkspace(path: string, baseRef: string | undefined): Promise<WorkspaceContext> {
+  private async openWorktreeWorkspace(path: string, baseRef: string | undefined, expectedTarget?: string): Promise<WorkspaceContext> {
     const worktree = await createManagedWorktree({
       sourcePath: path,
       baseRef,
       config: this.config,
+      expectedAuthorizationTarget: expectedTarget,
     });
     await resolveCanonicalAllowedPath(
       worktree.sourceRoot,
@@ -833,6 +876,15 @@ async function walkWorkspace(
     }
 
     await visit(path, entry);
+  }
+}
+
+function assertAuthorizationTarget(actual: string, expected: string | undefined): void {
+  if (expected !== undefined && actual !== expected) {
+    throw new ToolOperationError({
+      code: "WORKSPACE_AUTHORIZATION_REQUIRED", category: "scope", retryable: true,
+      message: "Workspace target changed after authorization preflight. Retry open_workspace.",
+    });
   }
 }
 

@@ -61,6 +61,31 @@ the corresponding regression coverage in the same change.
 - Shell commands run with the local user's authority. Workspace path checks do
   not turn shell execution into a filesystem or process sandbox.
 
+## Conversation workspace authorization
+
+- Opt-in through `workspaces.conversationAuthorization` (default false).
+- With usable Host `openai/session` metadata, inspect/modify grants apply to
+  canonical targets; modify includes inspect. Conversations may authorize many
+  targets. Managed worktrees inherit their source Git checkout's authorization.
+- Before authorization, `open_workspace` only resolves/validates the target and
+  returns a bounded pending request and App card, with no workspace binding,
+  worktree creation, project instructions, memory bootstrap, or ownership acquire.
+- `open_workspace.access` requests inspect (default) or modify; worktree mode
+  requires modify. It is not itself approval. The user decides through the
+  app-only `approve_workspace_access` contract and retries open afterward.
+- Pending requests bind an opaque ID to the conversation, target, requested
+  authority and timestamps. They expire after two minutes, are single-use and
+  cannot be rewritten or escalated. The server retains at most 1024 pending
+  requests. Grants and requests are process-local and disappear on restart.
+- Central registration enforcement uses `readOnlyHint` for inspect; mutations
+  and unclassified workspace operations require modify. Restoring a pruned
+  worktree requires modify even for a read-only operation. A known workspace ID
+  does not substitute for the current conversation's grant.
+- Authorization precedes, and does not replace, Write Ownership. Disabled mode
+  and hosts without usable conversation metadata preserve existing behavior.
+  The trusted Host must enforce app-only visibility and preserve conversation
+  metadata; neither shell sandboxing nor session authentication is added.
+
 ## Checkout write ownership
 
 - `open_workspace` reports a compact `write_ownership` snapshot: `state`,

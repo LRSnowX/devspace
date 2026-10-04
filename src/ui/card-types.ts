@@ -65,6 +65,12 @@ export interface ToolResultCard {
     effort?: string;
   }>;
   instruction?: string;
+  authorization?: {
+    request_id: string;
+    workspace: string;
+    requested_access: "inspect" | "modify";
+    expires_at: string;
+  };
 }
 
 export function summaryNumber(

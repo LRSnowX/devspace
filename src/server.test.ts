@@ -25,6 +25,7 @@ import { WriteOwnership } from "./write-ownership.js";
 import { writeOwnershipPaths } from "./write-ownership-store.js";
 import type { ToolErrorPayload } from "./tool-errors.js";
 import { randomUUID } from "node:crypto";
+import type { WorkspaceAuthorizationRequest } from "./workspace-authorization.js";
 import {
   MemoryAdapter,
   memoryContinuationByteBudget,
@@ -34,6 +35,463 @@ import {
 } from "./memory-adapter.js";
 
 const execFileAsync = promisify(execFile);
+
+test("conversation authorization gates open, read, ownership and mutations in both surfaces", async (t) => {
+  for (const toolMode of ["codex", "claude"] as const) {
+    await t.test(toolMode, async (t) => {
+      const context = await fixture(t, {
+        toolMode,
+        conversationAuthorization: true,
+      });
+      const call = async (
+        name: string,
+        args: Record<string, unknown>,
+        scope = "chat-a",
+      ) => {
+        const response = await context.client.callTool({
+          name,
+          arguments: args,
+          _meta: { "openai/session": scope },
+        });
+        assert.notEqual(response.isError, true);
+        return structuredContent(response);
+      };
+      const request = await call("open_workspace", { path: context.project });
+      assert.equal(request.error?.code, "WORKSPACE_AUTHORIZATION_REQUIRED");
+      assert.equal(request.workspace_id, undefined);
+      assert.equal(request.agents_files, undefined);
+      assert.equal(request.memory_context, undefined);
+      assert.equal(
+        context.store
+          .listStaleCheckoutSessions(new Date(Date.now() + 1000))
+          .unwrap().length,
+        0,
+      );
+      const pending = { request_id: authorizationRequest(request).request_id };
+      const wrong = await call(
+        "approve_workspace_access",
+        { ...pending, decision: "inspect" },
+        "chat-b",
+      );
+      assert.equal(
+        wrong.error?.code,
+        "WORKSPACE_AUTHORIZATION_REQUEST_INVALID",
+      );
+      assert.equal(
+        (
+          await call("approve_workspace_access", {
+            ...pending,
+            decision: "inspect",
+          })
+        ).status,
+        "approved",
+      );
+      assert.equal(
+        (
+          await call("approve_workspace_access", {
+            ...pending,
+            decision: "inspect",
+          })
+        ).error?.code,
+        "WORKSPACE_AUTHORIZATION_REQUEST_INVALID",
+      );
+      const opened = await call("open_workspace", { path: context.project });
+      const workspace_id = opened.workspace_id;
+      assert.equal(opened.status, "opened");
+      assert.equal(
+        (await call("open_workspace", { path: context.project })).workspace_id,
+        workspace_id,
+      );
+      assert.equal(
+        (await call("read", { workspace_id, path: "AGENTS.md" })).status,
+        "read",
+      );
+      assert.equal(
+        (await call("read", { workspace_id, path: "AGENTS.md" }, "chat-b"))
+          .error?.code,
+        "WORKSPACE_AUTHORIZATION_REQUIRED",
+      );
+      assert.equal(
+        (await call("show_changes", { workspace_id }, "chat-b")).error?.code,
+        "WORKSPACE_AUTHORIZATION_REQUIRED",
+      );
+      assert.equal(
+        (await call("acquire_write_ownership", { workspace_id })).error?.code,
+        "WORKSPACE_AUTHORIZATION_REQUIRED",
+      );
+      const shell = toolMode === "codex" ? "exec_command" : "bash";
+      const shellArgs =
+        toolMode === "codex"
+          ? { cmd: "echo authorized" }
+          : { command: "echo authorized" };
+      assert.equal(
+        (await call(shell, { workspace_id, ...shellArgs })).error?.code,
+        "WORKSPACE_AUTHORIZATION_REQUIRED",
+      );
+      const mutation = toolMode === "codex" ? "apply_patch" : "write";
+      const args =
+        toolMode === "codex"
+          ? {
+              patch:
+                "*** Begin Patch\n*** Add File: authorized.txt\n+yes\n*** End Patch",
+            }
+          : { path: "authorized.txt", content: "yes\n" };
+      assert.equal(
+        (await call(mutation, { workspace_id, ...args })).error?.code,
+        "WORKSPACE_AUTHORIZATION_REQUIRED",
+      );
+      const upgrade = await call("open_workspace", {
+        path: context.project,
+        access: "modify",
+      });
+      assert.equal(
+        (
+          await call("approve_workspace_access", {
+            request_id: authorizationRequest(upgrade).request_id,
+            decision: "modify",
+          })
+        ).status,
+        "approved",
+      );
+      assert.equal(
+        (await call(mutation, { workspace_id, ...args })).error?.code,
+        "WRITE_OWNERSHIP_REQUIRED",
+      );
+      assert.equal(
+        (await call("acquire_write_ownership", { workspace_id })).status,
+        "acquired",
+      );
+      assert.equal(
+        (await call(mutation, { workspace_id, ...args })).status,
+        "applied",
+      );
+      assert.equal(
+        (await call(shell, { workspace_id, ...shellArgs })).status,
+        "completed",
+      );
+      assert.equal(
+        await readFile(join(context.project, "authorized.txt"), "utf8"),
+        "yes\n",
+      );
+      const other = join(context.root, "other");
+      await mkdir(other);
+      const second = await call("open_workspace", { path: other });
+      assert.equal(
+        (
+          await call("approve_workspace_access", {
+            request_id: authorizationRequest(second).request_id,
+            decision: "inspect",
+          })
+        ).status,
+        "approved",
+      );
+      assert.equal(
+        (await call("open_workspace", { path: other })).status,
+        "opened",
+      );
+      assert.equal(
+        (await call("read", { workspace_id, path: "AGENTS.md" })).status,
+        "read",
+      );
+      const b = await call(
+        "open_workspace",
+        { path: context.project },
+        "chat-b",
+      );
+      await call(
+        "approve_workspace_access",
+        { request_id: authorizationRequest(b).request_id, decision: "deny" },
+        "chat-b",
+      );
+      assert.equal(
+        (await call("open_workspace", { path: context.project }, "chat-b"))
+          .error?.code,
+        "WORKSPACE_AUTHORIZATION_REQUIRED",
+      );
+      // An unscoped host remains upstream-compatible even when the feature is enabled.
+      assert.equal(
+        structuredContent(await callOpen(context.client, context.project))
+          .status,
+        "opened",
+      );
+      const inventory = await context.client.listTools();
+      const approval = inventory.tools.find(
+        (tool) => tool.name === "approve_workspace_access",
+      );
+      assert.deepEqual(approval?._meta?.ui, {
+        resourceUri: "ui://devspace/workspace-app.html",
+        visibility: ["app"],
+      });
+      assert.equal(
+        inventory.tools
+          .filter((tool) =>
+            (
+              (tool._meta?.ui as { visibility?: string[] })?.visibility ?? [
+                "model",
+              ]
+            ).includes("model"),
+          )
+          .some((tool) => tool.name === "approve_workspace_access"),
+        false,
+      );
+      assert.deepEqual(
+        Object.keys(approval!.inputSchema.properties as object).sort(),
+        ["decision", "request_id"],
+      );
+      assert.equal(approval!.inputSchema.additionalProperties, false);
+    });
+  }
+});
+
+test("conversation authorization preflight creates no worktree and inherits source grants", async (t) => {
+  const context = await fixture(t, {
+    git: true,
+    conversationAuthorization: true,
+  });
+  const call = async (
+    name: string,
+    args: Record<string, unknown>,
+    scope = "chat",
+  ) =>
+    structuredContent(
+      await context.client.callTool({
+        name,
+        arguments: args,
+        _meta: { "openai/session": scope },
+      }),
+    );
+  const nestedPath = join(context.project, "nested");
+  await mkdir(nestedPath);
+  const request = await call("open_workspace", {
+    path: nestedPath,
+    mode: "worktree",
+  });
+  assert.equal(
+    authorizationRequest(request).workspace,
+    await realpath(context.project),
+  );
+  assert.equal(authorizationRequest(request).requested_access, "modify");
+  assert.equal(
+    context.store
+      .listStaleManagedWorktrees(new Date(Date.now() + 1000))
+      .unwrap().length,
+    0,
+  );
+  await assert.rejects(access(join(context.root, ".worktrees")));
+  await call("approve_workspace_access", {
+    request_id: authorizationRequest(request).request_id,
+    decision: "inspect",
+  });
+  assert.equal(
+    (await call("open_workspace", { path: context.project, mode: "worktree" }))
+      .error?.code,
+    "WORKSPACE_AUTHORIZATION_REQUIRED",
+  );
+  const modify = await call("open_workspace", {
+    path: context.project,
+    mode: "worktree",
+  });
+  await call("approve_workspace_access", {
+    request_id: authorizationRequest(modify).request_id,
+    decision: "modify",
+  });
+  const opened = await call("open_workspace", {
+    path: context.project,
+    mode: "worktree",
+  });
+  assert.equal(opened.status, "opened");
+  assert.equal(
+    (
+      await call("read", {
+        workspace_id: opened.workspace_id,
+        path: "AGENTS.md",
+      })
+    ).status,
+    "read",
+  );
+  assert.equal(
+    (
+      await call(
+        "read",
+        { workspace_id: opened.workspace_id, path: "AGENTS.md" },
+        "other",
+      )
+    ).error?.code,
+    "WORKSPACE_AUTHORIZATION_REQUIRED",
+  );
+  const b = await call("open_workspace", { path: context.project }, "other");
+  await call(
+    "approve_workspace_access",
+    { request_id: authorizationRequest(b).request_id, decision: "inspect" },
+    "other",
+  );
+  assert.equal(
+    (
+      await call(
+        "read",
+        { workspace_id: opened.workspace_id, path: "AGENTS.md" },
+        "other",
+      )
+    ).status,
+    "read",
+  );
+  await git(context.project, [
+    "worktree",
+    "remove",
+    "--force",
+    opened.root as string,
+  ]);
+  context.store.markSessionPruned(opened.workspace_id as string).unwrap();
+  assert.equal(
+    (
+      await call(
+        "read",
+        { workspace_id: opened.workspace_id, path: "AGENTS.md" },
+        "other",
+      )
+    ).error?.code,
+    "WORKSPACE_AUTHORIZATION_REQUIRED",
+  );
+  await assert.rejects(access(opened.root as string));
+  assert.equal(
+    context.store.getSession(opened.workspace_id as string)?.status,
+    "pruned",
+  );
+  assert.equal(
+    (
+      await call("read", {
+        workspace_id: opened.workspace_id,
+        path: "AGENTS.md",
+      })
+    ).status,
+    "read",
+  );
+  assert.equal(
+    context.store.getSession(opened.workspace_id as string)?.status,
+    "active",
+  );
+});
+
+test("conversation authorization precedes all bootstrap and resolves aliases canonically", async (t) => {
+  let bootstraps = 0;
+  const memory: MemoryClient = {
+    enabled: true,
+    call: async () => {
+      throw new Error("Memory should not be called during preflight");
+    },
+    bootstrapProjectContext: async () => {
+      bootstraps++;
+      throw new Error("test bootstrap unavailable");
+    },
+  };
+  const context = await fixture(t, {
+    conversationAuthorization: true,
+    memoryClient: memory,
+    projectRegistration: { name: "Canonical", aliases: ["Alias"] },
+  });
+  const initial = structuredContent(
+    await callOpen(context.client, "Alias", "scope"),
+  );
+  assert.equal(bootstraps, 0);
+  assert.equal(initial.write_ownership, undefined);
+  assert.equal(
+    context.store
+      .listStaleCheckoutSessions(new Date(Date.now() + 1000))
+      .unwrap().length,
+    0,
+  );
+  const id = authorizationRequest(initial).request_id;
+  const rewrite = await context.client.callTool({
+    name: "approve_workspace_access",
+    arguments: { request_id: id, decision: "inspect", target: context.root },
+    _meta: { "openai/session": "scope" },
+  });
+  assert.equal(rewrite.isError, true);
+  await context.client.callTool({
+    name: "approve_workspace_access",
+    arguments: { request_id: id, decision: "inspect" },
+    _meta: { "openai/session": "scope" },
+  });
+  const opened = structuredContent(
+    await callOpen(context.client, "Canonical", "scope"),
+  );
+  assert.equal(opened.status, "opened");
+  assert.equal(bootstraps, 1);
+  assert.equal(
+    structuredContent(await callOpen(context.client, context.project, "scope"))
+      .workspace_id,
+    opened.workspace_id,
+  );
+  assert.equal(bootstraps, 1);
+  const outside = structuredContent(
+    await callOpen(context.client, "/", "scope"),
+  );
+  assert.equal(outside.error?.code, "PATH_SCOPE_VIOLATION");
+  assert.equal(outside.authorization_request, undefined);
+});
+
+test("conversation authorization grants survive independent modern MCP requests", async (t) => {
+  const { root, localBaseUrl, accessToken } = await httpServerFixture(
+    t,
+    "devspace-auth-http-",
+    undefined,
+    true,
+  );
+  const call = async (
+    name: string,
+    args: Record<string, unknown>,
+    scope = "a",
+  ) => {
+    const response = await postModernMcp(
+      localBaseUrl,
+      accessToken,
+      "tools/call",
+      { name, arguments: args, _meta: { "openai/session": scope } },
+    );
+    assert.equal(response.status, 200, await response.clone().text());
+    const body = (await response.json()) as {
+      result?: {
+        isError?: boolean;
+        structuredContent?: Record<string, unknown>;
+      };
+    };
+    assert.notEqual(body.result?.isError, true, JSON.stringify(body));
+    assert.ok(body.result?.structuredContent);
+    return body.result.structuredContent;
+  };
+  const pending = await call("open_workspace", { path: root });
+  assert.equal(
+    (
+      await call("approve_workspace_access", {
+        request_id: authorizationRequest(pending).request_id,
+        decision: "inspect",
+      })
+    ).status,
+    "approved",
+  );
+  const opened = await call("open_workspace", { path: root });
+  assert.equal(opened.status, "opened");
+  assert.equal(
+    (await call("open_workspace", { path: root })).workspace_id,
+    opened.workspace_id,
+  );
+  const denied = await call(
+    "show_changes",
+    { workspace_id: opened.workspace_id },
+    "b",
+  );
+  assert.equal(
+    (denied.error as ToolErrorPayload).code,
+    "WORKSPACE_AUTHORIZATION_REQUIRED",
+  );
+});
+
+function authorizationRequest(
+  result: Record<string, unknown>,
+): WorkspaceAuthorizationRequest {
+  assert.ok(result.authorization_request);
+  return result.authorization_request as WorkspaceAuthorizationRequest;
+}
 
 test("Host ownership coordinates same-checkout workspaces without restricting reads", async (t) => {
   for (const toolMode of ["codex", "claude"] as const) {
@@ -2865,6 +3323,7 @@ test("memory bootstrap failures do not prevent coding workspace entry", async (t
 });
 
 interface ServerFixture {
+  store: SqliteWorkspaceStore;
   client: Client;
   project: string;
   root: string;
@@ -2908,6 +3367,7 @@ async function httpServerFixture(
   t: TestContext,
   prefix: string,
   memoryClient?: MemoryClient,
+  conversationAuthorization = false,
 ): Promise<HttpServerFixture> {
   const root = await mkdtemp(join(tmpdir(), prefix));
   const ownerToken = "test-owner-token-that-is-long-enough";
@@ -2918,6 +3378,7 @@ async function httpServerFixture(
     },
     workspaces: {
       allowedRoots: [root],
+      conversationAuthorization,
       worktreeRoot: join(root, ".worktrees"),
     },
     storage: { stateDir: join(root, ".state") },
@@ -2954,6 +3415,7 @@ async function fixture(
     subagents?: SubagentsConfig;
     toolMode?: ToolMode;
     uiEnabled?: boolean;
+    conversationAuthorization?: boolean;
     memoryClient?: MemoryClient;
     projectRegistration?: { name: string; aliases?: string[] };
     extraAllowedRoot?: string;
@@ -3006,6 +3468,7 @@ async function fixture(
     ...loadedConfig,
     toolMode: options.toolMode ?? loadedConfig.toolMode,
     uiEnabled: options.uiEnabled ?? loadedConfig.uiEnabled,
+    conversationAuthorizationEnabled: options.conversationAuthorization ?? false,
   };
   const config: ServerConfig = options.localAgentProviders
     ? {
@@ -3075,6 +3538,7 @@ async function fixture(
 
   return {
     client,
+    store,
     project,
     root,
     patchRecovery,

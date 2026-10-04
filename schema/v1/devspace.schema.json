@@ -68,6 +68,10 @@
             "minLength": 1
           }
         },
+        "conversationAuthorization": {
+          "default": false,
+          "type": "boolean"
+        },
         "worktreeRoot": {
           "default": "~/.devspace/worktrees",
           "type": "string",

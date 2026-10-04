@@ -50,6 +50,26 @@ body {
   --tool-accent: color-mix(in srgb, var(--color-text-primary, #f5f5f6) 28%, #d99742 72%);
 }
 
+.authorization-card {
+  padding: 16px;
+  overflow-wrap: anywhere;
+}
+
+.authorization-card button {
+  margin: 4px 8px 4px 0;
+  padding: 8px 14px;
+  border: 1px solid var(--tool-card-border);
+  border-radius: 6px;
+  color: inherit;
+  background: var(--tool-card-body-bg);
+  cursor: pointer;
+}
+
+.authorization-card button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 @supports selector(::-webkit-scrollbar) {
   .pretty-scrollbar::-webkit-scrollbar {
     width: 12px;

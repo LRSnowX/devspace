@@ -20,6 +20,7 @@ try {
   assert.deepEqual(defaults.allowedHosts, ["localhost", "127.0.0.1", "::1"]);
   assert.equal(defaults.toolMode, "codex");
   assert.equal(defaults.uiEnabled, true);
+  assert.equal(defaults.conversationAuthorizationEnabled, false);
   assert.equal(defaults.skillsEnabled, true);
   assert.equal(defaults.artifactsEnabled, false);
   assert.equal(defaults.memory.enabled, false);
@@ -53,6 +54,7 @@ try {
     workspaces: {
       allowedRoots: ["~/work"],
       worktreeRoot: "~/trees",
+      conversationAuthorization: true,
     },
     storage: { stateDir: "~/state" },
     tools: { mode: "claude" },
@@ -98,6 +100,7 @@ try {
   ]);
   assert.equal(configured.toolMode, "claude");
   assert.equal(configured.uiEnabled, false);
+  assert.equal(configured.conversationAuthorizationEnabled, true);
   assert.equal(configured.stateDir, resolve(homedir(), "state"));
   assert.equal(configured.worktreeRoot, resolve(homedir(), "trees"));
   assert.equal(configured.artifactsEnabled, true);

@@ -16,6 +16,7 @@ export interface ServerConfig {
   port: number;
   oauth: OAuthConfig;
   allowedRoots: string[];
+  conversationAuthorizationEnabled: boolean;
   allowedHosts: string[];
   publicBaseUrl: string;
   toolMode: ToolMode;
@@ -81,6 +82,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       allowedRedirectHosts: stored.oauth.allowedRedirectHosts,
     },
     allowedRoots: normalizePaths(stored.workspaces.allowedRoots, [process.cwd()]),
+    conversationAuthorizationEnabled: stored.workspaces.conversationAuthorization,
     allowedHosts: normalizeAllowedHosts(derivedAllowedHosts),
     publicBaseUrl,
     toolMode: stored.tools.mode,

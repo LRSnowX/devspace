@@ -6,6 +6,7 @@ import { basename, join, relative, resolve } from "node:path";
 import { Result, TaggedError, type Result as BetterResult } from "better-result";
 import type { ServerConfig } from "./config.js";
 import { WriteOwnership, WriteOwnershipError } from "./write-ownership.js";
+import { ToolOperationError } from "./tool-errors.js";
 import {
   assertAllowedPath,
   isPathInsideRoot,
@@ -85,6 +86,7 @@ export async function createManagedWorktree(input: {
   sourcePath: string;
   baseRef?: string;
   config: ServerConfig;
+  expectedAuthorizationTarget?: string;
 }): Promise<ManagedWorktree> {
   const sourcePath = assertAllowedPath(input.sourcePath, input.config.allowedRoots);
 
@@ -105,6 +107,13 @@ export async function createManagedWorktree(input: {
   }
 
   const sourceRoot = await resolveGitRoot(sourcePath, input.config.allowedRoots);
+  if (input.expectedAuthorizationTarget !== undefined
+    && await realpath(sourceRoot) !== input.expectedAuthorizationTarget) {
+    throw new ToolOperationError({
+      code: "WORKSPACE_AUTHORIZATION_REQUIRED", category: "scope", retryable: true,
+      message: "Worktree source changed after authorization preflight. Retry open_workspace.",
+    });
+  }
   const baseRef = input.baseRef ?? "HEAD";
   const baseSha = await resolveBaseCommit(sourceRoot, baseRef);
   const dirtySource = (await git(["status", "--porcelain=v1"], sourceRoot)).trim().length > 0;
@@ -611,7 +620,7 @@ async function assertCleanupSourceRootAllowed(sourceRoot: string, allowedRoots: 
   throw new Error(`Stored managed worktree source resolves outside allowed roots: ${sourceRoot}`);
 }
 
-async function resolveGitRoot(path: string, allowedRoots: string[]): Promise<string> {
+export async function resolveGitRoot(path: string, allowedRoots: string[]): Promise<string> {
   try {
     const output = await git(["rev-parse", "--show-toplevel"], path);
     return await assertGitRootAllowed(output.trim(), allowedRoots);

@@ -49,6 +49,7 @@ import {
 } from "./mcp-modern-server.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { WriteOwnership } from "./write-ownership.js";
+import { WorkspaceAuthorization } from "./workspace-authorization.js";
 import {
   ownershipSnapshot,
   writeOwnershipSnapshotSchema,
@@ -1044,9 +1045,13 @@ function registerMcpSurface(
   memoryThreadAuthorizations = new MemoryThreadAuthorizationStore(),
   patchRecovery?: PatchRecoveryManager,
 ): void {
-  const registrationTarget = trackToolActivity
+  const trackedTarget = trackToolActivity
     ? withTrackedToolHandlers(server, trackToolActivity)
     : server;
+  const authorization = new WorkspaceAuthorization();
+  const registrationTarget = config.conversationAuthorizationEnabled
+    ? withWorkspaceAuthorization(trackedTarget, workspaces, authorization)
+    : trackedTarget;
   const toolSurface = getToolSurface(config.toolMode);
   const memory = memoryClient ?? new MemoryAdapter(config.memory);
   const projects = new ProjectRegistry(config.projectRegistryPath, config.allowedRoots);
@@ -1091,6 +1096,38 @@ function registerMcpSurface(
     },
   );
 
+  if (config.conversationAuthorizationEnabled) {
+    registerAppTool(registrationTarget, "approve_workspace_access", {
+      title: "Decide workspace access",
+      description: "User-only workspace authorization decision from the workspace App.",
+      inputSchema: z.object({
+        request_id: z.string().regex(/^[a-f0-9]{64}$/),
+        decision: z.enum(["inspect", "modify", "deny"]),
+      }).strict(),
+      outputSchema: resultOutputSchema({
+        status: z.enum(["approved", "denied", "error"]),
+        error: toolErrorPayloadSchema.optional(),
+      }),
+      _meta: { ui: { resourceUri: WORKSPACE_APP_URI, visibility: ["app"] } },
+      annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    }, async ({ request_id, decision }, { _meta }) => {
+      try {
+        authorization.decide(request_id, authorization.scope(_meta), decision);
+        const result = decision === "deny"
+          ? "Workspace access denied. No grant was created."
+          : "Workspace access approved. Retry open_workspace to continue.";
+        return {
+          content: [textBlock(result)],
+          structuredContent: { status: decision === "deny" ? "denied" : "approved", result },
+        };
+      } catch (error) {
+        const payload = toolErrorPayload(error);
+        if (!payload) throw error;
+        return toolErrorResponse(payload);
+      }
+    });
+  }
+
   registerAppTool(
     registrationTarget,
     "open_workspace",
@@ -1104,6 +1141,11 @@ function registerMcpSurface(
           .describe(
             "Absolute or ~/ path, canonical project name, registered alias, or unique top-level directory name under an allowed root.",
           ),
+        ...(config.conversationAuthorizationEnabled ? {
+          access: z.enum(["inspect", "modify"]).optional().describe(
+            "Request user access through the App when needed. Defaults to inspect; mutation work requires modify. This is a request, not a grant.",
+          ),
+        } : {}),
         mode: z
           .enum(["checkout", "worktree"])
           .optional()
@@ -1117,6 +1159,14 @@ function registerMcpSurface(
       },
       outputSchema: {
         status: z.enum(["opened", "error"]),
+        ...(config.conversationAuthorizationEnabled ? {
+          authorization_request: z.object({
+            request_id: z.string(),
+            workspace: z.string(),
+            requested_access: z.enum(["inspect", "modify"]),
+            expires_at: z.string(),
+          }).optional(),
+        } : {}),
         workspace_id: z.string().optional(),
         root: z.string().optional(),
         mode: z.enum(["checkout", "worktree"]).optional(),
@@ -1156,12 +1206,13 @@ function registerMcpSurface(
       ...workspaceAppDescriptorMeta(config),
       annotations: { readOnlyHint: true },
     },
-    async ({ path, mode, base_ref }, { _meta }) => {
+    async ({ path, mode, base_ref, access }, { _meta }) => {
       const startedAt = performance.now();
       const baseRef = base_ref;
       let resolvedPath = path;
       let projectName: string;
       let workspaceContext;
+      let expectedAuthorizationTarget: string | undefined;
       try {
         if (isAbsolute(path) || path === "~" || path.startsWith("~/") || path.startsWith("~\\")) {
           resolvedPath = expandHomePath(path);
@@ -1190,8 +1241,26 @@ function registerMcpSurface(
           resolvedPath = lookup.resolution.project.path;
           projectName = lookup.resolution.project.name;
         }
+        const scope = config.conversationAuthorizationEnabled ? authorization.scope(_meta) : undefined;
+        if (scope) {
+          const target = await workspaces.authorizationTargetForPath(resolvedPath, mode);
+          const requiredAccess = mode === "worktree" ? "modify" : access ?? "inspect";
+          if (!authorization.allows(scope, target, requiredAccess)) {
+            const request = authorization.request(scope, target, target, requiredAccess);
+            const response = toolErrorResponse({
+              code: "WORKSPACE_AUTHORIZATION_REQUIRED", category: "scope", retryable: true,
+              message: `User ${requiredAccess} authorization is required. Approve the workspace App card, then retry open_workspace.`,
+            });
+            return {
+              ...response,
+              structuredContent: { ...response.structuredContent, authorization_request: request },
+              _meta: { card: { authorization: request } },
+            };
+          }
+          expectedAuthorizationTarget = target;
+        }
         workspaceContext = await workspaces.openWorkspace(
-          { path: resolvedPath, mode, baseRef },
+          { path: resolvedPath, mode, baseRef, expectedAuthorizationTarget },
           { conversationScopeId: conversationScopeIdFromRequestMeta(_meta) },
         );
       } catch (error) {
@@ -1821,6 +1890,78 @@ function registerMcpSurface(
       incomingArtifactAdapters,
     });
   }
+}
+
+function withWorkspaceAuthorization(
+  server: McpRegistrationTarget,
+  workspaces: WorkspaceRegistry,
+  authorization: WorkspaceAuthorization,
+): McpRegistrationTarget {
+  return {
+    registerTool: ((
+      name: string,
+      definition: {
+        inputSchema?: z.ZodRawShape | z.ZodObject;
+        outputSchema?: z.ZodRawShape | z.ZodObject;
+        annotations?: { readOnlyHint?: boolean };
+      },
+      handler: (
+        input: Record<string, unknown>,
+        extra: { _meta?: unknown },
+      ) => unknown,
+    ) => {
+      const inputShape =
+        definition.inputSchema instanceof z.ZodObject
+          ? definition.inputSchema.shape
+          : definition.inputSchema;
+      if (!inputShape?.workspace_id)
+        return server.registerTool(name, definition, handler as never);
+      let outputSchema = definition.outputSchema;
+      const outputShape =
+        outputSchema instanceof z.ZodObject ? outputSchema.shape : outputSchema;
+      if (outputShape) {
+        // Apps require an object envelope, not a union. Keep success fields but
+        // allow the common authorization error without fabricating workspace data.
+        outputSchema = {
+          ...Object.fromEntries(
+            Object.entries(outputShape).map(([key, value]) => [
+              key,
+              key === "result" ? value : value.optional(),
+            ]),
+          ),
+          status: outputShape.status
+            ? z.union([outputShape.status, z.literal("error")])
+            : z.literal("error").optional(),
+          error: toolErrorPayloadSchema.optional(),
+        };
+      }
+      return server.registerTool(name, { ...definition, outputSchema }, (async (
+        input: Record<string, unknown>,
+        extra: { _meta?: unknown },
+      ) => {
+        const scope = authorization.scope(extra._meta);
+        if (scope) {
+          try {
+            const { target, requiresModify } =
+              await workspaces.authorizationTargetForWorkspace(
+                input.workspace_id as string,
+              );
+            const access =
+              definition.annotations?.readOnlyHint === true && !requiresModify
+                ? "inspect"
+                : "modify";
+            authorization.require(scope, target, access);
+          } catch (error) {
+            const payload = toolErrorPayload(error);
+            if (!payload) throw error;
+            return toolErrorResponse(payload);
+          }
+        }
+        return handler(input, extra);
+      }) as never);
+    }) as McpRegistrationTarget["registerTool"],
+    registerResource: server.registerResource.bind(server),
+  };
 }
 
 function withTrackedToolHandlers(
