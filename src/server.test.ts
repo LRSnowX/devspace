@@ -2679,7 +2679,12 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.match(memoryInstructions, /configured CHIM\/chat-history adapter/);
   assert.match(memoryInstructions, /source_health.state != aligned/);
   assert.match(memoryInstructions, /last provider observation only/);
-  assert.match(memoryInstructions, /later G-B protocol/);
+  assert.match(memoryInstructions, /preferring conversation identity over fuzzy title similarity/);
+  assert.match(memoryInstructions, /inspect CHIM source_health and continuation_proof/);
+  assert.match(memoryInstructions, /unverified content only as partial historical evidence/);
+  assert.match(memoryInstructions, /reconcile recovered state with live repository state and authoritative project files/);
+  assert.match(memoryInstructions, /continuation_proof.state is verified AND current project state has been reconciled/);
+  assert.match(memoryInstructions, /bounded historical tail alone is not proof/);
   assert.equal(opened.project_name, "LEMonX");
   assert.ok(Buffer.byteLength(JSON.stringify(bootstrap), "utf8") <= 12_288);
   assert.equal(bootstrap.byte_budget, 12_288);
@@ -2829,6 +2834,7 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.equal(structuredContent(latestThread).message_limit, 8);
   assert.equal(structuredContent(latestThread).tail, true);
   assert.deepEqual(structuredContent(latestThread).thread, {
+    continuation_proof: { state: "unverified", reason: "Missing/malformed continuation proof" },
     source_health: {
       state: "blocked",
       indexed_revision: 43,
@@ -2873,6 +2879,46 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
     retryable: true,
     conversation_id: "LEMonX-search-evidence",
   });
+});
+
+test("MCP bootstrap and authorized thread expansion share CHIM continuation proof", async (t) => {
+  const health = { state: "aligned" as const, indexed_revision: 43, provider_revision: 43,
+    provider_status: "idle", observed_at: 51, reason: null };
+  const proof = { state: "verified" as const, indexed_revision: 43, provider_revision: 43,
+    observed_at: 51, total_messages: 7, final_message_id: "m6", final_turn_index: 6,
+    reason: "Eligible alignment at last observation; range reaches canonical end", method: "ordered-canonical-prefix-v1" };
+  const memory = fakeMemory();
+  const context = await fixture(t, { memoryClient: {
+    ...memory,
+    async bootstrapProjectContext(project, options) {
+      const bootstrap = await memory.bootstrapProjectContext(project, options);
+      bootstrap.continuations[0]!.sourceHealth = health;
+      bootstrap.continuations[0]!.continuationProof = proof;
+      return bootstrap;
+    },
+    async call(name, args) {
+      if (name !== "memory_get_thread") return memory.call(name, args);
+      const offset = typeof args.message_offset === "number" ? args.message_offset : 6;
+      return { content: [], structuredContent: { total_messages: 7, message_offset: offset, returned_messages: 1,
+        thread: { source_health: health, continuation_proof: proof,
+          messages: [{ message_id: `m${offset}`, turn_index: offset, text: "complete indexed message" }] } } };
+    },
+  } });
+  const opened = structuredContent(await callOpen(context.client, context.project));
+  const packet = opened.memory_context as { continuations: Array<{ continuation_proof: unknown }> };
+  assert.deepEqual(packet.continuations[0]!.continuation_proof, proof);
+  const tail = structuredContent(await context.client.callTool({ name: "memory_get_thread", arguments: {
+    workspace_id: opened.workspace_id, conversation_id: "project-continuation",
+  } }));
+  assert.deepEqual((tail.thread as { continuation_proof: unknown }).continuation_proof, proof);
+  const older = structuredContent(await context.client.callTool({ name: "memory_get_thread", arguments: {
+    workspace_id: opened.workspace_id, conversation_id: "project-continuation", message_offset: 0,
+  } }));
+  assert.equal((older.thread as { continuation_proof: { state: string } }).continuation_proof.state, "unverified");
+  const foreign = structuredContent(await context.client.callTool({ name: "memory_get_thread", arguments: {
+    workspace_id: opened.workspace_id, conversation_id: "foreign",
+  } }));
+  assert.equal((foreign.error as { code: string }).code, "MEMORY_THREAD_NOT_AUTHORIZED");
 });
 
 test("ChatGPT-first empty working memory never implies a model bootstrap", async (t) => {

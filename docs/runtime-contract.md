@@ -454,8 +454,21 @@ When Memory is configured:
   absence of a separately visible CHIM plugin is not evidence of disconnection.
   Non-aligned evidence must not be presented as a complete/latest predecessor.
   Aligned means alignment at the last provider observation only, not unchanged
-  provider state or a fully restored prior conversation. Verified continuation
-  remains outside G-A (the later G-B protocol).
+  provider state or a fully restored prior conversation.
+- Checkpoint G-B adds CHIM-owned `continuation_proof` to thread expansion and
+  bootstrap continuations: `verified | unverified`, canonical/provider revisions,
+  observation time, canonical message count and final message ID/turn, reason,
+  and method. DevSpace validates and bounds this metadata but never promotes
+  an unverified claim. Missing/malformed proof becomes explicit `unverified`.
+  Proof and source-health anchors precede optional prose within the existing
+  byte budgets. A clipped preview or a range no longer reaching the canonical
+  end is downgraded, including after final wire-size trimming.
+  For a named predecessor, the Host resolves exact conversation identity,
+  checks health and proof, treats unverified content as partial history, and
+  reconciles it with the live repository and authoritative project files.
+  Only a verified proof **and** reconciled current project state permit a
+  complete/verified handoff claim. A bounded tail alone is not such proof.
+  The Host remains the orchestrator; no hidden continuation workflow runs.
 - An expansion outside that authorization boundary returns the structured
   `MEMORY_THREAD_NOT_AUTHORIZED` scope error without exposing thread contents.
 - Provenance references attached to working-memory items do not automatically

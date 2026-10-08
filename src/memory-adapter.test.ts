@@ -7,6 +7,8 @@ import {
   MemoryThreadAuthorizationStore,
   compactMemoryBootstrapContext,
   compactMirroredMemoryResult,
+  compactContinuationProof,
+  compactMemoryThreadResult,
   normalizeMemoryThreadSourceHealth,
   memoryBootstrapSourceCounts,
   memoryContinuationByteBudget,
@@ -86,6 +88,73 @@ test("old or malformed continuation health is explicit unknown, never silently a
     const context = compactMemoryBootstrapContext(raw, "Jack", 12_288);
     assert.equal(context.continuations[0]!.sourceHealth!.state, "unknown");
     assert.equal(modelMemoryContext(context, 12_288)!.continuations[0]!.source_health.state, "unknown");
+  }
+});
+
+const alignedProofHealth = {
+  state: "aligned" as const, indexed_revision: 42, provider_revision: 42,
+  provider_status: "idle", observed_at: 45, reason: null,
+};
+const verifiedProof = {
+  state: "verified" as const, indexed_revision: 42, provider_revision: 42,
+  observed_at: 45, total_messages: 2, final_message_id: "final-1", final_turn_index: 1,
+  reason: "Aligned at last observation; returned range reaches canonical end",
+  method: "ordered-canonical-prefix-v1",
+};
+
+test("CHIM continuation proof is bounded and can only be downgraded", () => {
+  assert.deepEqual(compactContinuationProof(verifiedProof, alignedProofHealth, 2, true), verifiedProof);
+  for (const proof of [undefined, {}, { ...verifiedProof, state: "future" },
+    { ...verifiedProof, total_messages: 3 }, { ...verifiedProof, final_message_id: "x".repeat(257) },
+    { ...verifiedProof, observed_at: Number.NaN }]) {
+    assert.equal(compactContinuationProof(proof, alignedProofHealth, 2, true).state, "unverified");
+  }
+  for (const state of ["blocked", "pending", "stale", "unknown"] as const) {
+    assert.equal(compactContinuationProof(verifiedProof, { ...alignedProofHealth, state }, 2, true).state, "unverified");
+  }
+  assert.equal(compactContinuationProof(verifiedProof, alignedProofHealth, 2, false).state, "unverified");
+  assert.equal(compactContinuationProof({ ...verifiedProof, state: "unverified" }, alignedProofHealth, 2, true).state, "unverified");
+  assert.equal(compactContinuationProof({ ...verifiedProof, reason: "x".repeat(20_000) }, alignedProofHealth, 2, true).reason.length, 240);
+  assert.equal(compactContinuationProof({ ...verifiedProof, provider_revision: 43 }, alignedProofHealth, 2, true).state, "unverified");
+});
+
+test("thread expansion preserves valid proof and source health; older ranges fail closed", () => {
+  const wire = { message_offset: 1, returned_messages: 1, total_messages: 2,
+    thread: { source_health: alignedProofHealth, continuation_proof: verifiedProof,
+      messages: [{ turn_index: 1, text: "complete tail" }] } };
+  const normalized = compactMemoryThreadResult({ content: [{ type: "text", text: JSON.stringify(wire) }], structuredContent: wire });
+  const thread = normalized.structuredContent!.thread as typeof wire.thread;
+  assert.deepEqual(thread.continuation_proof, verifiedProof);
+  assert.deepEqual(thread.source_health, alignedProofHealth);
+  assert.equal(normalized.content.length, 0, "no contradictory mirrored proof survives normalization");
+  const older = compactMemoryThreadResult({ content: [], structuredContent: { ...wire, message_offset: 0 } });
+  assert.equal((older.structuredContent!.thread as typeof wire.thread).continuation_proof.state, "unverified");
+});
+
+test("bootstrap budgets reserve proof/health anchors and downgrade clipped or evicted tails", () => {
+  for (const textSize of [80, 20_000]) {
+    const raw = staleHandoffContext();
+    raw.structuredContent.working_memory = { project: "Jack", items: [] };
+    const base = (raw.structuredContent.continuations as Array<Record<string, unknown>>)[0]!;
+    raw.structuredContent.continuations = ["first", "second"].map((conversation_id) => ({
+      ...base, conversation_id, source_health: alignedProofHealth, continuation_proof: verifiedProof,
+      message_offset: 1, total_messages: 2,
+      messages: [{ role: "assistant", turn_index: 1, text: "x".repeat(textSize) }],
+    }));
+    const context = compactMemoryBootstrapContext(raw, "Jack", 12_288);
+    const packet = modelMemoryContext(context, 12_288)!;
+    assert.equal(packet.continuations.length, 2, "first prose cannot evict second proof anchor");
+    for (const continuation of packet.continuations) {
+      assert.deepEqual(continuation.source_health, alignedProofHealth);
+      assert.equal(continuation.continuation_proof.state, textSize > 2_400 ? "unverified" : "verified");
+      assert.equal(continuation.continuation_proof.final_message_id, "final-1");
+    }
+    assert.ok(Buffer.byteLength(JSON.stringify(packet), "utf8") <= 12_288);
+    const evicted = modelMemoryContext(context, 2_048)!;
+    for (const continuation of evicted.continuations) {
+      if (continuation.returned_messages === 0) assert.equal(continuation.continuation_proof.state, "unverified");
+    }
+    assert.ok(evicted.bytes_used <= 2_048);
   }
 });
 

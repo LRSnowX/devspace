@@ -45,6 +45,85 @@ export interface MemoryBootstrapContinuation {
   totalMessages: number;
   messages: MemoryBootstrapMessage[];
   sourceHealth?: MemorySourceHealth;
+  continuationProof?: MemoryContinuationProof;
+  messagesClipped?: boolean;
+}
+
+export interface MemoryContinuationProof {
+  state: "verified" | "unverified";
+  indexed_revision?: number | null;
+  provider_revision?: number | null;
+  observed_at?: number | null;
+  total_messages?: number;
+  final_message_id?: string | null;
+  final_turn_index?: number | null;
+  reason: string;
+  method?: string;
+}
+
+export function compactContinuationProof(
+  value: unknown,
+  health: MemorySourceHealth,
+  total: number,
+  reachesEnd: boolean,
+): MemoryContinuationProof {
+  const proof = record(value);
+  const nullableNumber = (v: unknown) => v === null || (typeof v === "number" && Number.isFinite(v));
+  const valid = proof && ["verified", "unverified"].includes(String(proof.state))
+    && nullableNumber(proof.indexed_revision) && nullableNumber(proof.provider_revision) && nullableNumber(proof.observed_at)
+    && Number.isSafeInteger(proof.total_messages) && proof.total_messages === total && total >= 0
+    && (proof.final_message_id === null || (typeof proof.final_message_id === "string" && proof.final_message_id.length > 0 && Buffer.byteLength(proof.final_message_id, "utf8") <= 256))
+    && (proof.final_turn_index === null || (Number.isSafeInteger(proof.final_turn_index) && proof.final_turn_index === total - 1))
+    && typeof proof.reason === "string" && typeof proof.method === "string" && proof.method.length > 0 && proof.method.length <= 80;
+  if (!valid) return { state: "unverified", reason: "Missing/malformed continuation proof" };
+  // Only downward validation: never infer verified from health or timestamps.
+  const verified = proof.state === "verified"
+    && reachesEnd && health.state === "aligned" && health.provider_status === "idle"
+    && proof.indexed_revision === health.indexed_revision
+    && proof.provider_revision === health.provider_revision
+    && proof.observed_at === health.observed_at
+    && proof.indexed_revision === proof.provider_revision
+    && typeof proof.indexed_revision === "number" && typeof proof.provider_revision === "number" && typeof proof.observed_at === "number"
+    && proof.final_message_id !== null && proof.final_turn_index === total - 1;
+  return {
+    state: verified ? "verified" : "unverified",
+    indexed_revision: proof.indexed_revision as number | null,
+    provider_revision: proof.provider_revision as number | null,
+    observed_at: proof.observed_at as number | null,
+    total_messages: total,
+    final_message_id: proof.final_message_id as string | null,
+    final_turn_index: proof.final_turn_index as number | null,
+    reason: proof.state === "verified" && !verified ? "Contradictory or partial continuation proof" : clip(proof.reason as string, 240),
+    method: proof.method as string,
+  };
+}
+
+export function compactMemoryThreadResult(result: CallToolResult): CallToolResult {
+  const compact = compactMirroredMemoryResult(result);
+  const wire = compact.structuredContent;
+  const thread = record(wire?.thread);
+  if (!wire || !thread) return compact;
+  const total = typeof wire.total_messages === "number" ? wire.total_messages : 0;
+  const offset = typeof wire.message_offset === "number" ? wire.message_offset : -1;
+  const returned = typeof wire.returned_messages === "number" ? wire.returned_messages : 0;
+  return {
+    ...compact,
+    structuredContent: {
+      ...wire,
+      thread: {
+        ...thread,
+        continuation_proof: compactContinuationProof(
+          thread.continuation_proof,
+          compactMemorySourceHealth(thread.source_health),
+          total,
+          Number.isSafeInteger(offset) && offset >= 0
+            && Number.isSafeInteger(returned) && returned > 0
+            && Array.isArray(thread.messages) && thread.messages.length === returned
+            && offset + returned === total,
+        ),
+      },
+    },
+  };
 }
 
 /** CHIM-owned source integrity; DevSpace only validates and bounds the wire data. */
@@ -92,6 +171,13 @@ export function memoryContinuationWire(continuation: MemoryBootstrapContinuation
     returned_messages: continuation.messages.length,
     total_messages: continuation.totalMessages,
     source_health: compactMemorySourceHealth(continuation.sourceHealth),
+    continuation_proof: compactContinuationProof(
+      continuation.continuationProof,
+      compactMemorySourceHealth(continuation.sourceHealth),
+      continuation.totalMessages,
+      !continuation.messagesClipped && continuation.messages.length > 0
+        && continuation.messageOffset + continuation.messages.length === continuation.totalMessages,
+    ),
     messages: continuation.messages.map((message) => ({
       role: message.role, create_time: message.createTime,
       turn_index: message.turnIndex, text: message.text,
@@ -714,7 +800,10 @@ export function compactMemoryBootstrapContext(
           }
         }
         if (fittingText === undefined) continuation.messages.shift();
-        else boundedMessage.text = fittingText;
+        else {
+          boundedMessage.text = fittingText;
+          continuation.messagesClipped = true;
+        }
         context.truncated = true;
         break;
       }
@@ -840,6 +929,12 @@ function compactContinuation(value: unknown): MemoryBootstrapContinuation {
     messageOffset: continuation.message_offset,
     totalMessages: continuation.total_messages,
     sourceHealth: compactMemorySourceHealth(continuation.source_health),
+    continuationProof: compactContinuationProof(continuation.continuation_proof, compactMemorySourceHealth(continuation.source_health), continuation.total_messages,
+      continuation.messages.length > 0 && continuation.message_offset + continuation.messages.length === continuation.total_messages),
+    messagesClipped: continuation.messages.some((value) => {
+      const message = record(value);
+      return typeof message?.text === "string" && message.text.length > 2_400;
+    }),
     messages: continuation.messages.map(compactMessage),
   };
 }
