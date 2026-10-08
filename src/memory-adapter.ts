@@ -44,6 +44,59 @@ export interface MemoryBootstrapContinuation {
   messageOffset: number;
   totalMessages: number;
   messages: MemoryBootstrapMessage[];
+  sourceHealth?: MemorySourceHealth;
+}
+
+/** CHIM-owned source integrity; DevSpace only validates and bounds the wire data. */
+export interface MemorySourceHealth {
+  state: "aligned" | "pending" | "blocked" | "stale" | "unknown";
+  indexed_revision: number | null;
+  provider_revision: number | null;
+  provider_status: string | null;
+  observed_at: number | null;
+  reason: string | null;
+}
+
+export function compactMemorySourceHealth(value: unknown): MemorySourceHealth {
+  const health = record(value);
+  const revision = (value: unknown) => value === null || (typeof value === "number" && Number.isFinite(value));
+  if (
+    !health || !["aligned", "pending", "blocked", "stale", "unknown"].includes(String(health.state))
+    || !revision(health.indexed_revision) || !revision(health.provider_revision) || !revision(health.observed_at)
+    || !(health.provider_status === null || typeof health.provider_status === "string")
+    || !(health.reason === null || typeof health.reason === "string")
+  ) {
+    return {
+      state: "unknown", indexed_revision: null, provider_revision: null,
+      provider_status: null, observed_at: null,
+      reason: "Missing/malformed source health",
+    };
+  }
+  return {
+    state: health.state as MemorySourceHealth["state"],
+    indexed_revision: health.indexed_revision as number | null,
+    provider_revision: health.provider_revision as number | null,
+    observed_at: health.observed_at as number | null,
+    provider_status: health.provider_status === null ? null : clip(health.provider_status, 64),
+    reason: health.reason === null ? null : clip(health.reason, 240),
+  };
+}
+
+export function memoryContinuationWire(continuation: MemoryBootstrapContinuation) {
+  return {
+    conversation_id: continuation.conversationId,
+    source: continuation.source,
+    title: continuation.title,
+    update_time: continuation.updateTime,
+    message_offset: continuation.messageOffset,
+    returned_messages: continuation.messages.length,
+    total_messages: continuation.totalMessages,
+    source_health: compactMemorySourceHealth(continuation.sourceHealth),
+    messages: continuation.messages.map((message) => ({
+      role: message.role, create_time: message.createTime,
+      turn_index: message.turnIndex, text: message.text,
+    })),
+  };
 }
 
 export interface MemoryBootstrapEvidence {
@@ -427,7 +480,10 @@ export class MemoryAdapter {
         CallToolResultSchema,
         options.timeoutMs ? { timeout: options.timeoutMs } : undefined,
       );
-      return compactMirroredMemoryResult(CallToolResultSchema.parse(rawResult));
+      const compacted = compactMirroredMemoryResult(CallToolResultSchema.parse(rawResult));
+      return toolName === "memory_get_thread"
+        ? normalizeMemoryThreadSourceHealth(compacted)
+        : compacted;
     } finally {
       await client.close().catch(() => undefined);
     }
@@ -615,6 +671,11 @@ export function compactMemoryBootstrapContext(
   context.truncated ||= context.pendingMemory.items.length < pendingMemoryCandidate.items.length;
 
   const continuationBudget = memoryContinuationByteBudget(byteBudget);
+  const continuationsFit = () =>
+    byteLength(context.continuations) <= continuationBudget
+    && byteLength(context.continuations.map(memoryContinuationWire)) <= continuationBudget
+    && byteLength(context) <= byteBudget;
+  // Reserve health/revision anchors for all continuations before optional prose.
   for (const candidate of continuationCandidates) {
     const continuation: MemoryBootstrapContinuation = {
       ...candidate,
@@ -622,20 +683,38 @@ export function compactMemoryBootstrapContext(
     };
     context.continuations.push(continuation);
     if (
-      byteLength(context.continuations) > continuationBudget
-      || byteLength(context) > byteBudget
+      !continuationsFit()
     ) {
       context.continuations.pop();
       context.truncated = true;
       break;
     }
+  }
+  for (const [index, continuation] of context.continuations.entries()) {
+    const candidate = continuationCandidates[index]!;
     for (const message of [...candidate.messages].reverse()) {
-      continuation.messages.unshift(message);
+      const boundedMessage = { ...message };
+      continuation.messages.unshift(boundedMessage);
       if (
-        byteLength(context.continuations) > continuationBudget
-        || byteLength(context) > byteBudget
+        !continuationsFit()
       ) {
-        continuation.messages.shift();
+        // Keep a marked preview of the most recent message when health metadata
+        // leaves insufficient space for its full text. Never clip the health.
+        let fittingText: string | undefined;
+        if (continuation.messages.length === 1 && message.text.length > 128) {
+          let low = 128;
+          let high = message.text.length - 1;
+          while (low <= high) {
+            const middle = Math.floor((low + high) / 2);
+            boundedMessage.text = clipContinuationMessage(message.text, middle);
+            if (continuationsFit()) {
+              fittingText = boundedMessage.text;
+              low = middle + 1;
+            } else high = middle - 1;
+          }
+        }
+        if (fittingText === undefined) continuation.messages.shift();
+        else boundedMessage.text = fittingText;
         context.truncated = true;
         break;
       }
@@ -720,6 +799,24 @@ export function compactMirroredMemoryResult(result: CallToolResult): CallToolRes
   };
 }
 
+export function normalizeMemoryThreadSourceHealth(
+  result: CallToolResult,
+): CallToolResult {
+  const structured = record(result.structuredContent);
+  const thread = record(structured?.thread);
+  if (!structured || !thread) return result;
+  return {
+    ...result,
+    structuredContent: {
+      ...structured,
+      thread: {
+        ...thread,
+        source_health: compactMemorySourceHealth(thread.source_health),
+      },
+    },
+  };
+}
+
 function compactContinuation(value: unknown): MemoryBootstrapContinuation {
   const continuation = record(value);
   if (
@@ -742,6 +839,7 @@ function compactContinuation(value: unknown): MemoryBootstrapContinuation {
       : {}),
     messageOffset: continuation.message_offset,
     totalMessages: continuation.total_messages,
+    sourceHealth: compactMemorySourceHealth(continuation.source_health),
     messages: continuation.messages.map(compactMessage),
   };
 }

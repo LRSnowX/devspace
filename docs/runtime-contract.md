@@ -442,6 +442,20 @@ When Memory is configured:
   process-local, and reset by server restart. The model-facing surface returns
   the latest eight messages by default, caps one request at sixteen messages,
   and uses explicit offsets for older pagination.
+- Thread expansion passes through CHIM's `thread.source_health`. Bootstrap
+  continuations preserve CHIM's `source_health` state (`aligned`, `pending`,
+  `blocked`, `stale`, or `unknown`), nullable provider/index revisions, provider
+  status, observation time, and bounded reason. Health/revision anchors are
+  allocated before optional continuation prose; trimming never removes health
+  from a retained continuation. Older/malformed bootstrap or thread-expansion
+  health becomes explicit `unknown`, not assumed alignment. DevSpace does not independently
+  derive provider health or maintain a second conversation-history store.
+  All memory tools and bootstrap use the configured CHIM/chat-history adapter;
+  absence of a separately visible CHIM plugin is not evidence of disconnection.
+  Non-aligned evidence must not be presented as a complete/latest predecessor.
+  Aligned means alignment at the last provider observation only, not unchanged
+  provider state or a fully restored prior conversation. Verified continuation
+  remains outside G-A (the later G-B protocol).
 - An expansion outside that authorization boundary returns the structured
   `MEMORY_THREAD_NOT_AUTHORIZED` scope error without exposing thread contents.
 - Provenance references attached to working-memory items do not automatically

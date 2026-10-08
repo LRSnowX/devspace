@@ -7,6 +7,7 @@ import {
   MemoryThreadAuthorizationStore,
   compactMemoryBootstrapContext,
   compactMirroredMemoryResult,
+  normalizeMemoryThreadSourceHealth,
   memoryBootstrapSourceCounts,
   memoryContinuationByteBudget,
   memoryEvidenceIdsFromBootstrapContext,
@@ -51,6 +52,41 @@ test("memory bootstrap rejects malformed responses", () => {
     () => compactMemoryBootstrapContext({ structuredContent: { project: "Jack" } }, "Jack", 12_288),
     /Malformed memory project context response/,
   );
+});
+
+test("continuation health survives parsing and both budget stages before optional prose", () => {
+  for (const state of ["aligned", "pending", "blocked", "stale", "unknown"]) {
+    const raw = staleHandoffContext();
+    raw.structuredContent.working_memory = { project: "Jack", items: [] };
+    const source_health = {
+      state, indexed_revision: 10, provider_revision: state === "aligned" ? 10 : 20,
+      provider_status: "idle", observed_at: 30, reason: "incomplete provider transcript",
+    };
+    const base = (raw.structuredContent.continuations as Array<Record<string, unknown>>)[0]!;
+    raw.structuredContent.continuations = [
+      { ...base, source_health, messages: [{ role: "assistant", turn_index: 9, text: "x".repeat(20_000) }] },
+      { ...base, conversation_id: "second-anchor", source_health, messages: [] },
+    ];
+    const context = compactMemoryBootstrapContext(raw, "Jack", 8_192);
+    assert.equal(context.continuations.length, 2, "first prose must not crowd out second health anchor");
+    assert.deepEqual(context.continuations[0]!.sourceHealth, source_health);
+    for (const budget of [8_192, 4_096]) {
+      const packet = modelMemoryContext(context, budget)!;
+      assert.ok(packet.continuations.length > 0, "health verification must not be vacuous after trimming");
+      assert.ok(Buffer.byteLength(JSON.stringify(packet), "utf8") <= budget);
+      for (const continuation of packet.continuations) assert.deepEqual(continuation.source_health, source_health);
+    }
+  }
+});
+
+test("old or malformed continuation health is explicit unknown, never silently aligned", () => {
+  for (const source_health of [undefined, { state: "aligned" }, { state: "future_state" }]) {
+    const raw = staleHandoffContext();
+    (raw.structuredContent.continuations as Array<Record<string, unknown>>)[0]!.source_health = source_health;
+    const context = compactMemoryBootstrapContext(raw, "Jack", 12_288);
+    assert.equal(context.continuations[0]!.sourceHealth!.state, "unknown");
+    assert.equal(modelMemoryContext(context, 12_288)!.continuations[0]!.source_health.state, "unknown");
+  }
 });
 
 function staleHandoffContext() {
@@ -136,16 +172,26 @@ test("Host downgrades and every non-current source state lose protected budget b
       verification: Array<{ state: string }>;
     };
     for (const verification of working.verification) verification.state = source;
-    const context = compactMemoryBootstrapContext(raw, "Jack", 3_072, undefined, repository);
-    const packet = modelMemoryContext(context, 3_072, repository);
-    assert.equal(packet.continuations[0]?.messages.at(-1)?.turn_index, 1, source);
-    assert.ok(packet.working_memory.items.length > 0, source);
-    assert.equal(packet.working_memory.verification[0]?.source_state, source);
-    assert.equal(packet.working_memory.verification[0]?.host_state, host);
-    assert.equal(packet.bytes_used, Buffer.byteLength(JSON.stringify(packet), "utf8"));
-    assert.ok(packet.bytes_used <= 3_072);
-    assert.equal(packet.working_memory.verification.length, packet.working_memory.items.length);
-    assert.equal(packet.working_memory.confirmation.length, packet.working_memory.items.length);
+    for (const budget of [3_072, 4_096]) {
+      const context = compactMemoryBootstrapContext(raw, "Jack", budget, undefined, repository);
+      const packet = modelMemoryContext(context, budget, repository);
+      assert.equal(packet.continuations[0]?.messages.at(-1)?.turn_index, 1, source);
+      assert.ok(context.workingMemory.items.length > 0, "non-current memory stays eligible continuity");
+      if (packet.working_memory.items.length > 0) {
+        assert.equal(packet.working_memory.verification[0]?.source_state, source);
+        assert.equal(packet.working_memory.verification[0]?.host_state, host);
+      } else {
+        // Health anchors add wire bytes; ordinary shared-budget truncation may
+        // omit deferred items, but freshness alone must not exclude them.
+        assert.equal(budget, 3_072);
+        assert.equal(packet.sections.working_memory.truncated, true);
+      }
+      if (budget === 4_096) assert.ok(packet.working_memory.items.length > 0, source);
+      assert.equal(packet.bytes_used, Buffer.byteLength(JSON.stringify(packet), "utf8"));
+      assert.ok(packet.bytes_used <= budget);
+      assert.equal(packet.working_memory.verification.length, packet.working_memory.items.length);
+      assert.equal(packet.working_memory.confirmation.length, packet.working_memory.items.length);
+    }
   }
 });
 
@@ -387,7 +433,8 @@ test("memory bootstrap preserves recent continuation tails within a dedicated se
   });
   assert.ok(context.continuations.length >= 1);
   assert.equal(context.continuations[0]?.conversationId, "continuation-1");
-  assert.equal(context.continuations[0]?.messages.length, 3);
+  assert.ok((context.continuations[0]?.messages.length ?? 0) >= 1);
+  assert.equal(context.continuations[0]?.messages.at(-1)?.turnIndex, 2);
   if (context.continuations[1]) {
     assert.equal(context.continuations[1].conversationId, "continuation-2");
     assert.ok(context.continuations[1].messageOffset >= 10);
@@ -818,6 +865,58 @@ test("memory adapter removes rmcp mirrored JSON text when structured content is 
     structuredContent,
   });
   assert.equal(nonMirrored.content[0]?.type, "text");
+});
+
+test("memory thread expansion preserves valid CHIM health and fails closed on missing or malformed health", () => {
+  const valid = normalizeMemoryThreadSourceHealth({
+    content: [],
+    structuredContent: {
+      total_messages: 10,
+      thread: {
+        title: "Arcos",
+        source_health: {
+          state: "blocked",
+          indexed_revision: 20,
+          provider_revision: 30,
+          provider_status: "idle",
+          observed_at: 40,
+          reason: "Provider transcript incomplete",
+        },
+      },
+    },
+  });
+  assert.deepEqual(
+    (valid.structuredContent as { thread: { source_health: unknown } }).thread.source_health,
+    {
+      state: "blocked",
+      indexed_revision: 20,
+      provider_revision: 30,
+      provider_status: "idle",
+      observed_at: 40,
+      reason: "Provider transcript incomplete",
+    },
+  );
+
+  for (const sourceHealth of [undefined, { state: "blocked" }, { state: "future" }]) {
+    const normalized = normalizeMemoryThreadSourceHealth({
+      content: [],
+      structuredContent: {
+        total_messages: 10,
+        thread: { title: "Arcos", source_health: sourceHealth },
+      },
+    });
+    assert.deepEqual(
+      (normalized.structuredContent as { thread: { source_health: unknown } }).thread.source_health,
+      {
+        state: "unknown",
+        indexed_revision: null,
+        provider_revision: null,
+        provider_status: null,
+        observed_at: null,
+        reason: "Missing/malformed source health",
+      },
+    );
+  }
 });
 
 test("memory evidence ids include bootstrap and search evidence anchors", () => {

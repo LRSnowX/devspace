@@ -2434,6 +2434,10 @@ function fakeMemory(
             conversationId: `${project}-continuation`,
             source: "chatgpt",
             title: "Latest project conversation",
+            sourceHealth: {
+              state: "stale", indexed_revision: 43, provider_revision: 50,
+              provider_status: "idle", observed_at: 51, reason: "Newer provider revision",
+            },
             updateTime: 43,
             messageOffset: 5,
             totalMessages: 7,
@@ -2501,6 +2505,14 @@ function fakeMemory(
           message_limit: args.message_limit,
           tail: args.tail,
           returned_messages: 1,
+          thread: { source_health: {
+            state: "blocked",
+            indexed_revision: 43,
+            provider_revision: 50,
+            provider_status: "idle",
+            observed_at: 51,
+            reason: "Provider transcript incomplete",
+          } },
         } };
       }
       throw new Error(`Unexpected CHIM tool: ${toolName}`);
@@ -2663,6 +2675,11 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   const opened = structuredContent(await callOpen(context.client, "Lemon", "memory-session"));
   const workspaceId = opened.workspace_id as string;
   const bootstrap = opened.memory_context as Record<string, unknown>;
+  const memoryInstructions = context.client.getInstructions() ?? "";
+  assert.match(memoryInstructions, /configured CHIM\/chat-history adapter/);
+  assert.match(memoryInstructions, /source_health.state != aligned/);
+  assert.match(memoryInstructions, /last provider observation only/);
+  assert.match(memoryInstructions, /later G-B protocol/);
   assert.equal(opened.project_name, "LEMonX");
   assert.ok(Buffer.byteLength(JSON.stringify(bootstrap), "utf8") <= 12_288);
   assert.equal(bootstrap.byte_budget, 12_288);
@@ -2735,6 +2752,10 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.equal(continuations.length, 2);
   assert.equal(continuations[0]?.conversation_id, "LEMonX-continuation");
   assert.equal(continuations[0]?.returned_messages, 2);
+  assert.deepEqual(continuations[0]?.source_health, {
+    state: "stale", indexed_revision: 43, provider_revision: 50,
+    provider_status: "idle", observed_at: 51, reason: "Newer provider revision",
+  });
   assert.ok(Array.isArray(continuations[0]?.messages));
   assert.equal(continuations[1]?.conversation_id, "LEMonX-previous");
   const denied = await context.client.callTool({
@@ -2807,6 +2828,16 @@ test("memory surface is bounded, fail-open and progressive", async (t) => {
   assert.notEqual(latestThread.isError, true);
   assert.equal(structuredContent(latestThread).message_limit, 8);
   assert.equal(structuredContent(latestThread).tail, true);
+  assert.deepEqual(structuredContent(latestThread).thread, {
+    source_health: {
+      state: "blocked",
+      indexed_revision: 43,
+      provider_revision: 50,
+      provider_status: "idle",
+      observed_at: 51,
+      reason: "Provider transcript incomplete",
+    },
+  }, "thread expansion must preserve CHIM health without reclassification");
   assert.equal(structuredContent(latestThread).message_offset, undefined);
   const previousThread = await context.client.callTool({
     name: "memory_get_thread",
